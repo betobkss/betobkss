@@ -1,0 +1,23 @@
+{
+  "//": "Habilita o arquivo de instrucoes do projeto e aponta os de referencia.",
+  "//_1": "O copilot-instructions.md e injetado em TODA requisicao do Copilot Chat.",
+  "//_2": "Os de referencia so entram quando o Copilot precisa - mantem o custo baixo.",
+
+  "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+
+  "chat.instructionsFilesLocations": {
+    ".github/instructions": true
+  },
+
+  "github.copilot.chat.codeGeneration.instructions": [
+    { "file": ".github/copilot-instructions.md" }
+  ],
+
+  "//_3": "Evita que o Copilot proponha executar os scripts que travam no prompt de senha.",
+  "github.copilot.chat.agent.terminal.allowList": {},
+
+  "files.associations": {
+    "*.md.modelo": "markdown",
+    "*.txt.modelo": "plaintext"
+  }
+}
