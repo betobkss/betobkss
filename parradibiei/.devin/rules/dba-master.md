@@ -63,6 +63,8 @@ vier depois.
    resolve sem tocar na app e com rollback trivial. Mata a sessao errada e a
    tempestade continua.
 
+So depois disso vale medir sintoma.
+
 ## O erro que mais se repete: evidencia PARCIAL tratada como conclusiva
 
 Consolidacao de 30/09/2026, sobre 12 casos. Meus erros da semana tinham todos a
