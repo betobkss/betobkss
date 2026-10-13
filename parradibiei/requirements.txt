@@ -1,0 +1,15 @@
+# Ambiente pinado do Framework de Troubleshooting (versoes em uso no .venv).
+# Instalar:  .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Versao minima/portavel (2 pacotes): requirements-troubleshoot.txt
+
+oracledb==4.0.2          # coleta read-only, modo thin (sem Oracle Client)
+python-pptx==1.0.2       # PPTX do relatorio (dispensavel com --no-pptx)
+
+# transitivas do python-pptx
+lxml==6.1.0
+pillow==12.2.0
+XlsxWriter==3.2.9
+typing_extensions==4.15.0
+
+# desenvolvimento/testes
+pytest==9.1.1

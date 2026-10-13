@@ -1,0 +1,1972 @@
+{
+  "version": "1.0",
+  "meta": {
+    "name": "oracle-troubleshooting-mcp",
+    "description": "Catalogo hibrido (offline + online) de checks READ-ONLY de diagnostico e tuning Oracle. Fonte unica de verdade das consultas, thresholds e recomendacoes.",
+    "methodology": [
+      "Method R (Millsap): Response Time = Service + Wait",
+      "USE (Utilization/Saturation/Errors)",
+      "Oracle MAA",
+      "Oracle Tuning Guide"
+    ],
+    "safety": "Todos os checks sao SELECT/consulta de dicionario. Nenhum DML/DDL/PLSQL destrutivo. Sessao deve ser aberta como READ ONLY.",
+    "default_port": 1529,
+    "recommended_user": "dbaread (SELECT_CATALOG_ROLE / SELECT ANY DICTIONARY)"
+  },
+  "categories": {
+    "waits": "Perfil de esperas e tempo (ASH/wait classes)",
+    "sql": "SQL problematico e planos",
+    "space": "Espaco: tablespaces, ASM, undo, temp, FRA",
+    "ha_dg": "Alta disponibilidade / Data Guard",
+    "backup": "RMAN / backups",
+    "rac": "RAC / Global Cache",
+    "sessions": "Sessoes, bloqueios e concorrencia",
+    "stats": "Estatisticas do otimizador",
+    "config": "Configuracao e saude da instancia",
+    "security": "Contas, objetos invalidos e higiene",
+    "exadata": "Exadata: celulas, smart scan e offload",
+    "goldengate": "GoldenGate / replicacao integrada",
+    "integridade": "Integridade do dado: corrupcao e datafiles",
+    "recuperabilidade": "Recuperabilidade: archive e RPO real do backup",
+    "conformidade": "Praticas recomendadas Oracle (estilo ORAchk/MAA) x configuracao real",
+    "jobs": "Jobs e tarefas automaticas do banco",
+    "infra": "Infraestrutura: recursos do host (USE)"
+  },
+  "checks": [
+    {
+      "id": "ash_wait_classes",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Top wait classes (ASH 60min)",
+      "purpose": "Perfil de esperas recente para orientar por Method R (onde o tempo esta indo).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "ash.txt",
+      "analyzer": "ash",
+      "subtitle": "TOP WAIT CLASSES (ASH 60min)",
+      "thresholds": {
+        "non_cpu_wait_pct": {
+          "warn": 30,
+          "crit": 50
+        }
+      },
+      "references": [
+        "Millsap - Method R",
+        "Oracle ASH"
+      ],
+      "sql": "SELECT NVL(wait_class,'CPU') AS wait_class, COUNT(*) AS samples FROM gv$active_session_history WHERE sample_time > SYSDATE - 1/24 GROUP BY NVL(wait_class,'CPU') ORDER BY samples DESC"
+    },
+    {
+      "id": "ash_top_events",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Top wait events (ASH 60min)",
+      "purpose": "Eventos de espera dominantes para direcionar a investigacao.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "ash.txt",
+      "analyzer": "ash",
+      "subtitle": "TOP EVENTS (ASH 60min)",
+      "references": [
+        "Oracle ASH"
+      ],
+      "sql": "SELECT * FROM (SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples FROM gv$active_session_history WHERE sample_time > SYSDATE - 1/24 GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "top_sql_dbtime",
+      "category": "sql",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Top SQL por DB time (ASH 2h)",
+      "purpose": "Ranquear SQL_IDs por tempo de banco para priorizar tuning (Method R).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "topsql.txt",
+      "analyzer": "generic",
+      "recommendation": "Priorizar tuning pelos SQL_IDs do topo (maior DB time). Obter o plano com DBMS_XPLAN.DISPLAY_CURSOR/DISPLAY_AWR e avaliar indices, estatisticas e volume lido.",
+      "subtitle": "TOP SQL POR DB TIME (ASH 2h)",
+      "references": [
+        "Millsap - Method R"
+      ],
+      "sql": "SELECT * FROM (SELECT sql_id, COUNT(*) AS db_time_samples, ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct FROM gv$active_session_history WHERE sample_time > SYSDATE - 1/12 AND sql_id IS NOT NULL GROUP BY sql_id ORDER BY db_time_samples DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "sqlmon_top",
+      "category": "sql",
+      "requires_pack": "TUNING",
+      "title": "SQL Monitor do SQL mais custoso",
+      "purpose": "Relatorio detalhado (plano + atividade) do SQL monitorado com maior elapsed.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "sqlmon.txt",
+      "analyzer": "sql",
+      "subtitle": null,
+      "special": "sqlmon",
+      "references": [
+        "Oracle Real-Time SQL Monitoring"
+      ],
+      "sql": "SELECT DBMS_SQLTUNE.REPORT_SQL_MONITOR(sql_id => :sql_id, type => 'TEXT', report_level => 'ALL') FROM dual"
+    },
+    {
+      "id": "addm_latest",
+      "category": "sql",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "ADDM (task mais recente)",
+      "purpose": "Findings e recomendacoes automaticas do ADDM da ultima analise.",
+      "read_only": true,
+      "min_privs": [
+        "ADVISOR",
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "addm.txt",
+      "analyzer": "addm",
+      "special": "addm",
+      "references": [
+        "Oracle ADDM"
+      ],
+      "sql": "SELECT DBMS_ADVISOR.GET_TASK_REPORT(task_name) AS report FROM (SELECT task_name FROM dba_advisor_tasks WHERE advisor_name = 'ADDM' ORDER BY created DESC) WHERE ROWNUM = 1"
+    },
+    {
+      "id": "blocking_chain",
+      "category": "sessions",
+      "title": "Arvore de bloqueios (agora)",
+      "purpose": "Cadeia de bloqueio como ARVORE (CONNECT BY): a coluna ARVORE indenta cada nivel, entao o bloqueador RAIZ aparece no topo sem NIVEL 1 esperando ninguem. Em lista de pares nao se descobre quem originou a cadeia A->B->C sem cruzar linhas na mao. Traz STATUS e IDLE_MIN do bloqueador porque raiz INACTIVE com muitos minutos ociosa e transacao aberta sem commit - a causa mais comum. Usa NOCYCLE: um deadlock forma ciclo e derrubaria a query com ORA-01436 (deadlock em si e auto-resolvido pelo Oracle e sai no alert log como ORA-00060). Restringe a TYPE='USER': o LGWR aparece bloqueando seus proprios workers em 'log file parallel write' e viraria falso positivo permanente, em todo health check, com IDLE_MIN de dias porque processo de background nunca faz call. Exige WAIT_CLASS <> 'Idle' na VITIMA (condicao sem PRIOR no CONNECT BY, logo aplicada a linha filha): parallel query preenche BLOCKING_SESSION entre o coordenador e seus escravos em 'PX Deq: Execute Reply' / 'PX Deq: Execution Msg', ambos classe Idle - sem esse filtro a propria coleta paralela aparece como bloqueio. Quem espera em evento Idle nao esta bloqueado; a RAIZ continua podendo estar Idle ('SQL*Net message from client' e exatamente o sintoma da transacao aberta sem commit).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "locks.txt",
+      "analyzer": "locks",
+      "subtitle": "ARVORE DE BLOQUEIO (AGORA)",
+      "thresholds": {
+        "seconds_in_wait": {
+          "warn": 60,
+          "crit": 300
+        }
+      },
+      "references": [
+        "Oracle Concurrency"
+      ],
+      "sql": "SELECT t.arvore, t.nivel, t.sid, t.serial, t.username, t.status, t.blocker, t.event, t.secs, t.idle_min, NVL2(o.object_id, o.owner||'.'||o.object_name, '-') AS objeto, t.sql_id FROM (SELECT LPAD(' ',2*(LEVEL-1))||s.inst_id||':'||s.sid AS arvore, LEVEL AS nivel, s.sid, s.serial, s.username, s.status, s.blocking_session AS blocker, s.event, s.seconds_in_wait AS secs, ROUND(s.last_call_et/60,1) AS idle_min, s.objid, s.sql_id, ROWNUM AS ord FROM (SELECT inst_id, sid, serial# AS serial, username, status, blocking_session, blocking_instance, event, wait_class, seconds_in_wait, last_call_et, row_wait_obj# AS objid, sql_id FROM gv$session WHERE type = 'USER') s START WITH s.blocking_session IS NULL AND (s.inst_id, s.sid) IN (SELECT NVL(blocking_instance, inst_id), blocking_session FROM gv$session WHERE blocking_session IS NOT NULL AND type = 'USER' AND wait_class <> 'Idle') CONNECT BY NOCYCLE PRIOR s.sid = s.blocking_session AND PRIOR s.inst_id = NVL(s.blocking_instance, s.inst_id) AND s.wait_class <> 'Idle' ORDER SIBLINGS BY s.seconds_in_wait DESC) t LEFT JOIN dba_objects o ON o.object_id = t.objid AND t.objid > 0 ORDER BY t.ord"
+    },
+    {
+      "id": "blocking_history",
+      "category": "sessions",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Bloqueios no historico (ASH, 7d)",
+      "purpose": "Tempo bloqueado por JANELA DE HORA nos ultimos 7 dias. A arvore de bloqueio so ve o instante da coleta: um health check das 8h nao enxerga a tempestade de locks das 2h, e bloqueio e por natureza transitorio. Cada amostra do DBA_HIST_ASH vale ~10s, entao COUNT(*)*10 estima o tempo bloqueado acumulado. Filtra por WAIT_CLASS em Application (enq: TX/TM row lock) e Concurrency (library cache, buffer busy) - as duas classes que o Oracle usa para contencao real. Sem esse recorte entram 'log file sync' (classe Commit, latencia de LGWR) e 'read by other session' (classe User I/O), que tem BLOCKING_SESSION preenchido mas nao sao lock e mascaram o sinal.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "locks_hist.txt",
+      "analyzer": "locks",
+      "subtitle": "BLOQUEIOS POR HORA (ASH, 7d)",
+      "optional": true,
+      "thresholds": {
+        "segs_bloqueado": {
+          "warn": 300,
+          "crit": 3600
+        }
+      },
+      "references": [
+        "DBA_HIST_ACTIVE_SESS_HISTORY.BLOCKING_SESSION",
+        "Oracle: cada amostra do AWR ASH representa 10 segundos"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(TRUNC(h.sample_time,'HH'),'YYYY-MM-DD HH24') AS janela, h.event, NVL2(o.object_id, o.owner||'.'||o.object_name, '-') AS objeto, COUNT(*)*10 AS segs_bloqueado, COUNT(DISTINCT h.session_id) AS vitimas, COUNT(DISTINCT h.blocking_session) AS bloqueadores FROM dba_hist_active_sess_history h LEFT JOIN dba_objects o ON o.object_id = h.current_obj# AND h.current_obj# > 0 WHERE h.sample_time > SYSDATE - 7 AND h.blocking_session IS NOT NULL AND h.wait_class IN ('Application','Concurrency') GROUP BY TO_CHAR(TRUNC(h.sample_time,'HH'),'YYYY-MM-DD HH24'), h.event, NVL2(o.object_id, o.owner||'.'||o.object_name, '-') ORDER BY 4 DESC) WHERE ROWNUM <= 25"
+    },
+    {
+      "id": "blocking_top_blockers",
+      "category": "sessions",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Top bloqueadores por modulo (ASH, 7d)",
+      "purpose": "QUEM causou o bloqueio, nao quem sofreu. Auto-join do ASH na mesma amostra (SAMPLE_ID) ligando a vitima ao bloqueador para recuperar MODULE/PROGRAM/SQL_ID de quem segurava o lock - sem isso sobra apenas um SID que ja nao existe mais e nao da para acionar ninguem. Cruza instancia via BLOCKING_INST_ID para funcionar em RAC. Mesmo recorte de WAIT_CLASS da visao por hora, para as duas secoes falarem do mesmo fenomeno.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "locks_hist.txt",
+      "analyzer": "locks",
+      "subtitle": "TOP BLOQUEADORES POR MODULO (ASH, 7d)",
+      "optional": true,
+      "references": [
+        "DBA_HIST_ACTIVE_SESS_HISTORY (auto-join por SAMPLE_ID)"
+      ],
+      "sql": "SELECT * FROM (SELECT NVL(b.module,'(sem modulo)') AS modulo, NVL(SUBSTR(b.program,1,30),'-') AS programa, NVL(b.sql_id,'-') AS sql_id_bloqueador, COUNT(*)*10 AS segs_causados, COUNT(DISTINCT w.session_id) AS vitimas FROM dba_hist_active_sess_history w JOIN dba_hist_active_sess_history b ON b.dbid = w.dbid AND b.snap_id = w.snap_id AND b.sample_id = w.sample_id AND b.session_id = w.blocking_session AND b.instance_number = NVL(w.blocking_inst_id, w.instance_number) WHERE w.sample_time > SYSDATE - 7 AND b.sample_time > SYSDATE - 7 AND w.blocking_session IS NOT NULL AND w.wait_class IN ('Application','Concurrency') GROUP BY NVL(b.module,'(sem modulo)'), NVL(SUBSTR(b.program,1,30),'-'), NVL(b.sql_id,'-') ORDER BY 4 DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "top_active_sessions",
+      "category": "sessions",
+      "title": "Top sessoes ativas por espera",
+      "purpose": "Sessoes ativas com maior tempo em espera.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "sessions.txt",
+      "analyzer": "sessions",
+      "subtitle": "TOP SESSOES ATIVAS",
+      "thresholds": {
+        "seconds_in_wait": {
+          "warn": 120,
+          "crit": 600
+        }
+      },
+      "sql": "SELECT * FROM (SELECT s.inst_id AS inst, s.sid||','||s.serial# AS sid, s.username, s.status, s.event, s.seconds_in_wait AS secs, s.sql_id FROM gv$session s WHERE s.type='USER' AND s.status='ACTIVE' AND s.username IS NOT NULL ORDER BY s.seconds_in_wait DESC) WHERE ROWNUM <= 20",
+      "references": [
+        "Millsap - Method R (priorizar pelo tempo em espera, nao pela lista)",
+        "Oracle Database Reference - GV$SESSION (SECONDS_IN_WAIT)"
+      ]
+    },
+    {
+      "id": "io_filestat",
+      "category": "waits",
+      "title": "Latencia de I/O por datafile",
+      "purpose": "Identificar arquivos com alta latencia de leitura (storage/ASM).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "iostat.txt",
+      "analyzer": "io",
+      "subtitle": "IO POR ARQUIVO",
+      "thresholds": {
+        "avg_read_ms": {
+          "warn": 20,
+          "crit": 40
+        }
+      },
+      "references": [
+        "USE method - Saturation"
+      ],
+      "sql": "SELECT * FROM (SELECT fs.inst_id AS inst, df.tablespace_name AS tablespace, SUBSTR(df.file_name,-40) AS file_name, fs.phyrds, fs.phywrts, ROUND(fs.readtim*10/GREATEST(fs.phyrds,1),2) AS avg_read_ms, ROUND(fs.writetim*10/GREATEST(fs.phywrts,1),2) AS avg_write_ms FROM gv$filestat fs JOIN dba_data_files df ON df.file_id = fs.file# ORDER BY avg_read_ms DESC) WHERE ROWNUM <= 20"
+    },
+    {
+      "id": "tablespaces",
+      "category": "space",
+      "title": "Uso de tablespaces",
+      "purpose": "Percentual de uso por tablespace (capacidade).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "space.txt",
+      "analyzer": "space",
+      "subtitle": "TABLESPACES",
+      "thresholds": {
+        "pct_used": {
+          "warn": 80,
+          "crit": 90
+        }
+      },
+      "sql": "SELECT df.tablespace_name, ROUND(SUM(df.bytes)/1048576) AS alloc_mb, ROUND(SUM(df.bytes-NVL(fs.free,0))/1048576) AS used_mb, ROUND(SUM(CASE WHEN df.autoextensible='YES' THEN GREATEST(df.maxbytes,df.bytes) ELSE df.bytes END)/1048576) AS max_mb, ROUND(100*(1-SUM(NVL(fs.free,0))/SUM(df.bytes)),1) AS pct_alloc, ROUND(100*SUM(df.bytes-NVL(fs.free,0))/SUM(CASE WHEN df.autoextensible='YES' THEN GREATEST(df.maxbytes,df.bytes) ELSE df.bytes END),1) AS pct_used, MIN(df.autoextensible) AS autoext FROM dba_data_files df LEFT JOIN (SELECT file_id, SUM(bytes) free FROM dba_free_space GROUP BY file_id) fs ON df.file_id = fs.file_id GROUP BY df.tablespace_name ORDER BY pct_used DESC",
+      "references": [
+        "Oracle Database Administrator's Guide - Managing Tablespace Alerts (limiares padrao 85% warning / 97% critical)",
+        "Oracle Database Reference - DBA_TABLESPACE_USAGE_METRICS"
+      ]
+    },
+    {
+      "id": "tablespace_forecast",
+      "category": "space",
+      "title": "Previsao de capacidade (dias ate encher)",
+      "purpose": "Projetar quando cada tablespace atinge o tamanho maximo, por regressao linear sobre 30 dias de historico.",
+      "read_only": true,
+      "requires_pack": "DIAGNOSTIC",
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "forecast.txt",
+      "analyzer": "forecast",
+      "subtitle": "PREVISAO DE CAPACIDADE (30d)",
+      "optional": true,
+      "thresholds": {
+        "dias_p_encher": {
+          "warn": 90,
+          "crit": 30
+        }
+      },
+      "references": [
+        "Capacity planning - tendencia de uso (Foglight/Datadog predictive)"
+      ],
+      "sql": "WITH snaps AS (SELECT snap_id, dbid, MIN(end_interval_time) AS dt FROM dba_hist_snapshot WHERE end_interval_time > SYSDATE - 30 GROUP BY snap_id, dbid), dia AS (SELECT u.tablespace_id AS tsid, TRUNC(s.dt) AS d, MAX(u.tablespace_usedsize) AS used_blk, MAX(u.tablespace_maxsize) AS max_blk FROM dba_hist_tbspc_space_usage u JOIN snaps s ON s.snap_id = u.snap_id AND s.dbid = u.dbid GROUP BY u.tablespace_id, TRUNC(s.dt)), reg AS (SELECT tsid, COUNT(*) AS dias_hist, REGR_SLOPE(used_blk, d - TRUNC(SYSDATE)) AS slope, MAX(used_blk) KEEP (DENSE_RANK LAST ORDER BY d) AS used_blk, MAX(max_blk) KEEP (DENSE_RANK LAST ORDER BY d) AS max_blk FROM dia GROUP BY tsid) SELECT * FROM (SELECT t.name AS tablespace_name, ROUND(100*r.used_blk/GREATEST(r.max_blk,1),1) AS pct_used, ROUND(r.used_blk*ts.block_size/1048576) AS used_mb, ROUND(r.max_blk*ts.block_size/1048576) AS max_mb, ROUND(r.slope*ts.block_size/1048576,1) AS growth_mb_dia, CASE WHEN r.slope > 0 THEN ROUND((r.max_blk - r.used_blk)/r.slope) END AS dias_p_encher, r.dias_hist FROM reg r JOIN v$tablespace t ON t.ts# = r.tsid JOIN dba_tablespaces ts ON ts.tablespace_name = t.name ORDER BY CASE WHEN r.slope > 0 THEN (r.max_blk - r.used_blk)/r.slope END NULLS LAST) WHERE ROWNUM <= 20"
+    },
+    {
+      "id": "asm_diskgroups",
+      "category": "space",
+      "title": "Uso de ASM diskgroups",
+      "purpose": "Percentual de uso por diskgroup ASM.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "asm.txt",
+      "analyzer": "space",
+      "subtitle": "ASM DISKGROUPS",
+      "optional": true,
+      "thresholds": {
+        "pct_used": {
+          "warn": 80,
+          "crit": 90
+        }
+      },
+      "sql": "SELECT name, state, type, total_mb, free_mb, ROUND(100*(1-free_mb/GREATEST(total_mb,1)),1) AS pct_used FROM v$asm_diskgroup ORDER BY pct_used DESC",
+      "requires_topology": [
+        "asm"
+      ],
+      "references": [
+        "Oracle Automatic Storage Management Administrator's Guide - Managing Disk Group Space (USABLE_FILE_MB e o espaco que sobra apos perder uma falha de grupo)",
+        "Oracle Database Reference - V$ASM_DISKGROUP"
+      ]
+    },
+    {
+      "id": "undo_usage",
+      "category": "space",
+      "title": "Uso de UNDO e retencao",
+      "purpose": "Espaco de undo e retencao efetiva (evitar ORA-01555).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "undo.txt",
+      "analyzer": "saude",
+      "recommendation": "UNDO alto: identificar transacao longa (V$TRANSACTION + V$SESSION) antes de expandir. Se houver risco de ORA-01555, revisar UNDO_RETENTION e o tamanho da tablespace de undo.",
+      "subtitle": "UNDO USAGE (7 dias)",
+      "optional": true,
+      "references": [
+        "Oracle Undo Management"
+      ],
+      "sql": "SELECT begin_time, tuned_undoretention, maxquerylen, ssolderrcnt AS snap_too_old, nospaceerrcnt AS no_space FROM v$undostat WHERE begin_time > SYSDATE - 7 ORDER BY begin_time DESC FETCH FIRST 24 ROWS ONLY"
+    },
+    {
+      "id": "temp_usage",
+      "category": "space",
+      "title": "Uso de TEMP por sessao",
+      "purpose": "Sessoes consumindo temporario (sorts/hash grandes).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "temp.txt",
+      "analyzer": "saude",
+      "thresholds": {
+        "sessao_temp_gb": {
+          "warn": 10,
+          "crit": 50
+        }
+      },
+      "recommendation": "TEMP alto: achar o SQL que derrama (V$SQL_WORKAREA_ACTIVE / V$TEMPSEG_USAGE). Normalmente e sort/hash sem indice ou PGA insuficiente - tunar o SQL antes de aumentar a TEMP.",
+      "subtitle": "TEMP USAGE POR SESSAO",
+      "optional": true,
+      "sql": "SELECT * FROM (SELECT s.inst_id, s.sid, s.username, u.tablespace, ROUND(u.blocks*t.block_size/1048576) AS temp_mb, s.sql_id FROM gv$sort_usage u JOIN gv$session s ON s.saddr = u.session_addr AND s.inst_id = u.inst_id JOIN dba_tablespaces t ON t.tablespace_name = u.tablespace ORDER BY temp_mb DESC) WHERE ROWNUM <= 15",
+      "references": [
+        "Oracle Database Administrator's Guide - Managing Temporary Tablespaces",
+        "Oracle Database Reference - V$TEMPSEG_USAGE (sessao que sozinha consome dezenas de GB indica plano com sort/hash em disco)"
+      ]
+    },
+    {
+      "id": "fra_usage",
+      "category": "space",
+      "title": "Uso da FRA (Fast Recovery Area)",
+      "purpose": "Ocupacao da FRA (risco de ORA-19809/archiver travado).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "fra.txt",
+      "analyzer": "saude",
+      "recommendation": "FRA cheia PARA o banco (archiver stuck). Validar backup/expurgo de archives no RMAN (DELETE ARCHIVELOG) e, se necessario, aumentar DB_RECOVERY_FILE_DEST_SIZE. Verificar tambem se o Data Guard esta aplicando.",
+      "subtitle": "FRA USAGE",
+      "optional": true,
+      "thresholds": {
+        "pct_used": {
+          "warn": 80,
+          "crit": 90
+        }
+      },
+      "references": [
+        "Oracle Backup and Recovery"
+      ],
+      "sql": "SELECT file_type, ROUND(percent_space_used,1) AS pct_used, ROUND(percent_space_reclaimable,1) AS pct_reclaimable, number_of_files FROM v$flash_recovery_area_usage ORDER BY pct_used DESC"
+    },
+    {
+      "id": "dataguard_lag",
+      "category": "ha_dg",
+      "title": "Data Guard lag",
+      "purpose": "Transport e apply lag (RPO/RTO).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "dataguard.txt",
+      "analyzer": "dataguard",
+      "subtitle": "DATAGUARD STATS",
+      "optional": true,
+      "thresholds": {
+        "lag_seconds": {
+          "warn": 900,
+          "crit": 3600
+        }
+      },
+      "references": [
+        "Oracle MAA / Data Guard"
+      ],
+      "sql": "SELECT name, value, TO_CHAR(time_computed) AS time_computed FROM gv$dataguard_stats WHERE name IN ('transport lag','apply lag')",
+      "requires_topology": [
+        "dataguard"
+      ]
+    },
+    {
+      "id": "dataguard_standby",
+      "category": "ha_dg",
+      "title": "Managed standby (processos)",
+      "purpose": "Processos MRP/RFS/ARCH do standby (apply em execucao?).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "dataguard.txt",
+      "analyzer": "dataguard",
+      "subtitle": "MANAGED STANDBY",
+      "optional": true,
+      "references": [
+        "Oracle MAA / Data Guard"
+      ],
+      "sql": "SELECT inst_id, process, status, thread#, sequence#, block# FROM gv$managed_standby WHERE process LIKE 'MRP%' OR process LIKE 'RFS%' OR status <> 'IDLE' ORDER BY inst_id, process",
+      "requires_topology": [
+        "dataguard"
+      ]
+    },
+    {
+      "id": "rman_jobs",
+      "category": "backup",
+      "title": "Jobs de backup RMAN (7 dias)",
+      "purpose": "Status e recencia de backups (RPO).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rman.txt",
+      "analyzer": "rman",
+      "subtitle": "RMAN JOBS (7 dias)",
+      "optional": true,
+      "references": [
+        "Oracle Backup and Recovery"
+      ],
+      "sql": "SELECT input_type, status, TO_CHAR(start_time,'YYYY-MM-DD HH24:MI') AS start_time, TO_CHAR(end_time,'YYYY-MM-DD HH24:MI') AS end_time, ROUND(input_bytes/1073741824,1) AS input_gb, ROUND(output_bytes/1073741824,1) AS output_gb, time_taken_display AS elapsed FROM v$rman_backup_job_details WHERE start_time > SYSDATE-7 ORDER BY start_time DESC"
+    },
+    {
+      "id": "rac_gc",
+      "category": "rac",
+      "title": "Global Cache (RAC)",
+      "purpose": "Esperas de global cache/interconnect (contencao entre nos).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rac.txt",
+      "analyzer": "rac",
+      "subtitle": "GLOBAL CACHE WAITS",
+      "optional": true,
+      "thresholds": {
+        "avg_ms": {
+          "warn": 5,
+          "crit": 15
+        }
+      },
+      "references": [
+        "Oracle RAC Performance"
+      ],
+      "sql": "SELECT inst_id, event, total_waits, ROUND(time_waited_micro/1000/GREATEST(total_waits,1),2) AS avg_ms FROM gv$system_event WHERE event LIKE 'gc %' AND total_waits > 0 ORDER BY avg_ms DESC FETCH FIRST 15 ROWS ONLY",
+      "requires_topology": [
+        "rac"
+      ]
+    },
+    {
+      "id": "alertlog_errors",
+      "category": "config",
+      "title": "Erros ORA- no alert log (24h)",
+      "purpose": "Erros criticos recentes (ORA-600/7445/4031/257 etc.).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "alert.log",
+      "analyzer": "alertlog",
+      "subtitle": "ALERT LOG - ORA- (24h)",
+      "optional": true,
+      "references": [
+        "Oracle Diagnostics (ADR)"
+      ],
+      "sql": "SELECT TO_CHAR(originating_timestamp,'YYYY-MM-DD\"T\"HH24:MI:SS')||'  '||message_text AS alert_line FROM v$diag_alert_ext WHERE originating_timestamp > SYSTIMESTAMP - INTERVAL '24' HOUR AND message_text LIKE '%ORA-%' ORDER BY originating_timestamp"
+    },
+    {
+      "id": "stale_stats",
+      "category": "stats",
+      "title": "Estatisticas STALE/antigas",
+      "purpose": "Tabelas com estatisticas desatualizadas (planos ruins).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "stats.txt",
+      "analyzer": "stats",
+      "subtitle": "ESTATISTICAS STALE/ANTIGAS",
+      "references": [
+        "Oracle Optimizer Statistics"
+      ],
+      "sql": "SELECT * FROM (SELECT owner||'.'||table_name AS table_name, TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') AS last_analyzed, stale_stats, num_rows FROM dba_tab_statistics WHERE owner NOT IN ('SYS','SYSTEM','XDB','MDSYS','CTXSYS','DBSNMP') AND (stale_stats='YES' OR last_analyzed < SYSDATE-7 OR last_analyzed IS NULL) ORDER BY last_analyzed NULLS FIRST) WHERE ROWNUM <= 30"
+    },
+    {
+      "id": "invalid_objects",
+      "category": "security",
+      "title": "Objetos invalidos",
+      "purpose": "Objetos INVALID (packages/views/triggers) por schema.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "invalid.txt",
+      "analyzer": "saude",
+      "recommendation": "Recompilar os objetos invalidos (UTL_RECOMP.RECOMP_PARALLEL ou ALTER ... COMPILE). Objeto invalido pode falhar em runtime; verificar se surgiu apos deploy/patch.",
+      "subtitle": "OBJETOS INVALIDOS",
+      "optional": true,
+      "sql": "SELECT owner, object_type, COUNT(*) AS qtd FROM dba_objects WHERE status = 'INVALID' GROUP BY owner, object_type ORDER BY qtd DESC FETCH FIRST 20 ROWS ONLY"
+    },
+    {
+      "id": "sga_pga",
+      "category": "config",
+      "title": "Memoria SGA/PGA e advisors",
+      "purpose": "Alocacao de memoria e recomendacao de advisors.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "memory.txt",
+      "analyzer": "generic",
+      "recommendation": "Comparar SGA/PGA alocado x advisors (V$SGA_TARGET_ADVICE, V$PGA_TARGET_ADVICE) antes de mudar. PGA baixa causa derrame em TEMP; SGA baixa aumenta I/O fisico.",
+      "subtitle": "MEMORIA (SGA/PGA)",
+      "optional": true,
+      "sql": "SELECT name, ROUND(TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)/1048576) AS mb FROM v$parameter WHERE name IN ('sga_target','sga_max_size','pga_aggregate_target','pga_aggregate_limit','memory_target','memory_max_target') AND TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR) > 0 ORDER BY name"
+    },
+    {
+      "id": "instance_health",
+      "category": "config",
+      "title": "Saude da instancia",
+      "purpose": "Status, uptime, versao, RAC e log mode por instancia.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "instance.txt",
+      "analyzer": "saude",
+      "thresholds": {
+        "uptime_dias": {
+          "info": 7
+        }
+      },
+      "recommendation": "Confirmar status/uptime das instancias e se todas do cluster estao OPEN. Uptime baixo indica restart recente - correlacionar com o alert log.",
+      "subtitle": "SAUDE DA INSTANCIA",
+      "sql": "SELECT i.inst_id, i.instance_name, i.host_name, i.version, i.status, TO_CHAR(i.startup_time,'YYYY-MM-DD HH24:MI') AS startup, d.log_mode, d.open_mode, d.database_role FROM gv$instance i CROSS JOIN v$database d ORDER BY i.inst_id",
+      "references": [
+        "Oracle Database Reference - V$INSTANCE (STARTUP_TIME): uptime curto explica cache frio e plano recem-escolhido"
+      ]
+    },
+    {
+      "id": "resource_limits",
+      "category": "config",
+      "title": "Limites de processes/sessions",
+      "purpose": "Uso corrente x maximo x limite de processes e sessions (com status).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "resource_limits.txt",
+      "analyzer": "generic",
+      "recommendation": "Perto do limite de PROCESSES/SESSIONS o banco recusa conexao (ORA-00020). Avaliar leak de conexao no pool da aplicacao ANTES de aumentar o parametro (exige restart).",
+      "subtitle": "LIMITES (PROCESSES/SESSIONS)",
+      "thresholds": {
+        "pct_used": {
+          "warn": 80,
+          "crit": 90
+        }
+      },
+      "sql": "SELECT inst_id, resource_name, current_utilization AS atual, max_utilization AS pico, limit_value AS limite, CASE WHEN limit_value='UNLIMITED' THEN NULL ELSE ROUND(current_utilization/NULLIF(TO_NUMBER(limit_value),0)*100,1) END AS pct_used, CASE WHEN limit_value='UNLIMITED' THEN 'OK' WHEN current_utilization/NULLIF(TO_NUMBER(limit_value),0)*100 > 90 THEN 'CRITICAL' WHEN current_utilization/NULLIF(TO_NUMBER(limit_value),0)*100 > 80 THEN 'WARNING' ELSE 'OK' END AS status FROM gv$resource_limit WHERE resource_name IN ('processes','sessions') ORDER BY inst_id, resource_name",
+      "references": [
+        "Oracle Database Reference - V$RESOURCE_LIMIT",
+        "Oracle Database Error Messages - ORA-00020 (maximum number of processes exceeded): encostar no limite e indisponibilidade, nao lentidao"
+      ]
+    },
+    {
+      "id": "buffer_hit_ratio",
+      "category": "config",
+      "title": "Buffer cache hit ratio",
+      "purpose": "Hit ratio do buffer cache (indicador de I/O logico x fisico).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "hitratio.txt",
+      "analyzer": "generic",
+      "recommendation": "INFORMATIVO apenas. Hit ratio nao mede tempo de resposta (Method R/Millsap): nao tunar por este numero - priorize por DB time e wait class.",
+      "subtitle": "BUFFER CACHE HIT RATIO",
+      "optional": true,
+      "thresholds": {
+        "hit_ratio_pct": {
+          "info": 90
+        }
+      },
+      "sql": "SELECT ROUND((1-(phy.value/NULLIF(db.value+cons.value,0)))*100,2) AS hit_ratio_pct, CASE WHEN (1-(phy.value/NULLIF(db.value+cons.value,0)))*100 < 90 THEN 'INFO' ELSE 'OK' END AS status FROM (SELECT SUM(value) value FROM gv$sysstat WHERE name='physical reads') phy, (SELECT SUM(value) value FROM gv$sysstat WHERE name='db block gets') db, (SELECT SUM(value) value FROM gv$sysstat WHERE name='consistent gets') cons",
+      "references": [
+        "Oracle Database Performance Tuning Guide - Interpreting Cache Hit Ratios (nao usar como meta isolada)",
+        "Millsap - Optimizing Oracle Performance (por que hit ratio alto conviva com banco lento)"
+      ]
+    },
+    {
+      "id": "sga_components",
+      "category": "config",
+      "title": "Componentes dinamicos da SGA",
+      "purpose": "Tamanho dos componentes da SGA e quantidade de redimensionamentos (OPER_COUNT). Muito resize = memoria em thrashing entre pools; CURRENT=MAX apenas indica que o componente esta no pico historico (normal).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "sgacomp.txt",
+      "analyzer": "generic",
+      "recommendation": "Muitos RESIZES = memoria em thrashing entre pools (custo de latch/CPU). Fixar minimos (DB_CACHE_SIZE, SHARED_POOL_SIZE, STREAMS_POOL_SIZE) ou aumentar SGA_TARGET; conferir V$SGA_RESIZE_OPS.",
+      "subtitle": "SGA DYNAMIC COMPONENTS",
+      "optional": true,
+      "thresholds": {
+        "oper_count": {
+          "warn": 100,
+          "info": 20
+        }
+      },
+      "sql": "SELECT inst_id, component, ROUND(current_size/1048576) AS current_mb, ROUND(min_size/1048576) AS min_mb, ROUND(max_size/1048576) AS max_mb, oper_count AS resizes, CASE WHEN oper_count > 100 THEN 'WARNING' WHEN oper_count > 20 THEN 'INFO' ELSE 'OK' END AS status FROM gv$sga_dynamic_components WHERE current_size > 0 ORDER BY inst_id, current_size DESC",
+      "references": [
+        "Oracle Database Performance Tuning Guide - Automatic Shared Memory Management",
+        "Oracle Database Reference - V$SGA_RESIZE_OPS (resize frequente indica memoria apertada, nao ajuste saudavel)"
+      ]
+    },
+    {
+      "id": "indexes_unusable",
+      "category": "security",
+      "title": "Indices UNUSABLE",
+      "purpose": "Indices em estado UNUSABLE (impacto direto em planos/DML).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "idx_unusable.txt",
+      "analyzer": "generic",
+      "recommendation": "Indice UNUSABLE degrada plano e pode quebrar DML. Rebuild (ALTER INDEX ... REBUILD [ONLINE]) - avaliar janela e impacto. Comum apos move/truncate de particao.",
+      "subtitle": "INDICES UNUSABLE",
+      "optional": true,
+      "sql": "SELECT owner, index_name, table_name, tablespace_name, 'WARNING' AS status FROM dba_indexes WHERE status='UNUSABLE' AND owner NOT IN ('SYS','SYSTEM','XDB','MDSYS','ORDSYS','WMSYS') FETCH FIRST 30 ROWS ONLY"
+    },
+    {
+      "id": "redo_switches",
+      "category": "config",
+      "title": "Redo log switches (24h)",
+      "purpose": "Frequencia de troca de redo por hora (excesso => redo pequeno).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "redo.txt",
+      "analyzer": "saude",
+      "thresholds": {
+        "switches_per_hour": {
+          "warn": 12,
+          "crit": 30
+        }
+      },
+      "recommendation": "Meta: no maximo ~4-6 switches/hora. Excesso indica redo log pequeno para a carga (log file switch waits) - avaliar aumentar o tamanho dos grupos, nao a quantidade.",
+      "subtitle": "REDO LOG SWITCHES (24h)",
+      "optional": true,
+      "sql": "SELECT * FROM (SELECT thread#, TO_CHAR(first_time,'YYYY-MM-DD HH24') AS hora, COUNT(*) AS switches FROM v$log_history WHERE first_time > SYSDATE-1 GROUP BY thread#, TO_CHAR(first_time,'YYYY-MM-DD HH24') ORDER BY hora DESC) WHERE ROWNUM <= 30",
+      "references": [
+        "Oracle Database Administrator's Guide - Managing the Redo Log (dimensionar para poucas trocas por hora)",
+        "Oracle Database Reference - V$LOG_HISTORY"
+      ]
+    },
+    {
+      "id": "datafiles_noautoext",
+      "category": "space",
+      "title": "Datafiles com AUTOEXTEND OFF",
+      "purpose": "Datafiles sem autoextend (risco de ORA-01653 ao encher).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "df_noautoext.txt",
+      "analyzer": "saude",
+      "recommendation": "Datafile sem AUTOEXTEND causa ORA-01653 sem aviso. Habilitar autoextend com MAXSIZE definido (nunca UNLIMITED) ou incluir no controle de capacidade.",
+      "subtitle": "DATAFILES AUTOEXTEND OFF",
+      "optional": true,
+      "sql": "SELECT * FROM (SELECT tablespace_name, SUBSTR(file_name,-45) AS file_name, ROUND(bytes/1048576) AS size_mb, autoextensible FROM dba_data_files WHERE autoextensible='NO' ORDER BY bytes DESC) WHERE ROWNUM <= 30"
+    },
+    {
+      "id": "top_segments",
+      "category": "space",
+      "title": "Top 10 segmentos",
+      "purpose": "Maiores segmentos por tamanho (capacidade/expurgo).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "segments.txt",
+      "analyzer": "generic",
+      "recommendation": "Base para capacity: confirmar se o crescimento e esperado. Avaliar expurgo/particionamento/compressao nos maiores segmentos antes de solicitar disco.",
+      "subtitle": "TOP 10 SEGMENTOS",
+      "optional": true,
+      "sql": "SELECT * FROM (SELECT owner, segment_name, segment_type, tablespace_name, ROUND(bytes/1048576) AS size_mb FROM dba_segments WHERE owner NOT IN ('SYS','SYSTEM','XDB','MDSYS','ORDSYS','WMSYS') ORDER BY bytes DESC) WHERE ROWNUM <= 10"
+    },
+    {
+      "id": "compare_period",
+      "category": "sql",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Compare Period (regressao de plano/tempo)",
+      "purpose": "Compara janela RECENTE (24h) x BASELINE (7d) por SQL para flagrar regressao de plano (plan_hash mudou) e aumento de elapsed/exec, priorizado por IMPACTO em segundos de DB time (elapsed/exec x execucoes da janela recente) - nao por percentual.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "compare_period.txt",
+      "analyzer": "baseline",
+      "subtitle": "COMPARE PERIOD (regressao de plano/tempo)",
+      "optional": true,
+      "thresholds": {
+        "impacto_s": {
+          "warn": 60,
+          "crit": 300
+        },
+        "var_pct": {
+          "warn": 50,
+          "crit": 100
+        },
+        "min_avg_s": 0.05,
+        "min_delta_s": 0.05
+      },
+      "references": [
+        "SolarWinds DPA",
+        "Oracle AWR compare period"
+      ],
+      "sql": "SELECT sql_id, plano_base, plano_rec, avg_s_base, avg_s_rec, execs_rec, ROUND((avg_s_rec-avg_s_base)*execs_rec,1) AS impacto_s, ROUND((avg_s_rec-avg_s_base)/NULLIF(avg_s_base,0)*100) AS var_pct, CASE WHEN (avg_s_rec-avg_s_base)*execs_rec >= 300 THEN 'CRITICAL' WHEN plano_mudou=1 AND (avg_s_rec-avg_s_base)*execs_rec >= 60 THEN 'CRITICAL' WHEN (avg_s_rec-avg_s_base)*execs_rec >= 60 THEN 'WARNING' ELSE 'OK' END AS status FROM (SELECT sql_id, plano_base, plano_rec, avg_s_base, avg_s_rec, execs_rec, CASE WHEN NVL(plano_base,0)<>0 AND NVL(plano_rec,0)<>0 AND plano_base<>plano_rec THEN 1 ELSE 0 END AS plano_mudou FROM (SELECT sql_id, MAX(CASE WHEN periodo='BASE' THEN phv END) AS plano_base, MAX(CASE WHEN periodo='REC' THEN phv END) AS plano_rec, ROUND(SUM(CASE WHEN periodo='BASE' THEN elapsed END)/1000000/NULLIF(SUM(CASE WHEN periodo='BASE' THEN execs END),0),3) AS avg_s_base, ROUND(SUM(CASE WHEN periodo='REC' THEN elapsed END)/1000000/NULLIF(SUM(CASE WHEN periodo='REC' THEN execs END),0),3) AS avg_s_rec, SUM(CASE WHEN periodo='REC' THEN execs END) AS execs_rec FROM (SELECT ss.sql_id, ss.plan_hash_value AS phv, CASE WHEN sn.begin_interval_time > SYSDATE-1 THEN 'REC' ELSE 'BASE' END AS periodo, ss.executions_delta AS execs, ss.elapsed_time_delta AS elapsed FROM dba_hist_sqlstat ss JOIN dba_hist_snapshot sn ON ss.snap_id=sn.snap_id AND ss.instance_number=sn.instance_number WHERE sn.begin_interval_time > SYSDATE-7 AND ss.executions_delta > 0) GROUP BY sql_id HAVING SUM(CASE WHEN periodo='REC' THEN execs END) > 0 AND SUM(CASE WHEN periodo='BASE' THEN execs END) > 0)) WHERE avg_s_base IS NOT NULL AND avg_s_rec IS NOT NULL AND avg_s_rec >= 0.05 AND avg_s_rec-avg_s_base >= 0.05 AND (avg_s_rec > avg_s_base*1.3 OR plano_mudou=1) ORDER BY impacto_s DESC FETCH FIRST 20 ROWS ONLY"
+    },
+    {
+      "id": "workload_trend",
+      "category": "config",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Tendencia de carga (metricas do sistema)",
+      "purpose": "Compara metricas de carga (AAS, CPU, execucoes/s, logons/s, user calls/s, I/O, redo, transacoes/s) da janela RECENTE (24h) x BASELINE (7d) para flagrar aumento de utilizacao dos recursos.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "workload_trend.txt",
+      "analyzer": "workload",
+      "subtitle": "TENDENCIA DE CARGA (metricas)",
+      "optional": true,
+      "thresholds": {
+        "var_pct": {
+          "warn": 50,
+          "crit": 100
+        }
+      },
+      "references": [
+        "SolarWinds DPA",
+        "Datadog DBM",
+        "Oracle AWR Load Profile"
+      ],
+      "sql": "SELECT metrica, avg_base, avg_rec, ROUND((avg_rec-avg_base)/NULLIF(avg_base,0)*100) AS var_pct, CASE WHEN avg_rec > avg_base*2 THEN 'CRITICAL' WHEN avg_rec > avg_base*1.5 THEN 'WARNING' ELSE 'OK' END AS status FROM (SELECT metric_name AS metrica, ROUND(AVG(CASE WHEN periodo='BASE' THEN average END),2) AS avg_base, ROUND(AVG(CASE WHEN periodo='REC' THEN average END),2) AS avg_rec FROM (SELECT m.metric_name, m.average, CASE WHEN sn.begin_interval_time > SYSDATE-1 THEN 'REC' ELSE 'BASE' END AS periodo FROM dba_hist_sysmetric_summary m JOIN dba_hist_snapshot sn ON m.snap_id=sn.snap_id AND m.instance_number=sn.instance_number AND m.dbid=sn.dbid WHERE sn.begin_interval_time > SYSDATE-8 AND m.metric_name IN ('Host CPU Utilization (%)','Executions Per Sec','Logons Per Sec','User Calls Per Sec','Physical Reads Per Sec','User Transaction Per Sec','Redo Generated Per Sec') UNION ALL SELECT 'Average Active Sessions', ROUND(COUNT(*)*10/(CASE periodo WHEN 'REC' THEN 86400 ELSE 7*86400 END),4), periodo FROM (SELECT CASE WHEN sample_time > SYSDATE-1 THEN 'REC' ELSE 'BASE' END AS periodo FROM dba_hist_active_sess_history WHERE sample_time > SYSDATE-8) GROUP BY periodo) GROUP BY metric_name) WHERE avg_base IS NOT NULL AND avg_rec IS NOT NULL AND avg_rec > avg_base*1.3 ORDER BY var_pct DESC"
+    },
+    {
+      "id": "workload_module",
+      "category": "config",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Aumento de carga por modulo/aplicacao",
+      "purpose": "Compara atividade (amostras ASH) por MODULE entre RECENTE (24h) x BASELINE (7d), normalizada por dia, para identificar qual aplicacao aumentou o uso do banco (possivel mudanca nao avisada ao DBA).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "workload_module.txt",
+      "analyzer": "workload",
+      "subtitle": "AUMENTO DE CARGA POR MODULO",
+      "optional": true,
+      "thresholds": {
+        "var_pct": {
+          "warn": 50,
+          "crit": 100
+        }
+      },
+      "references": [
+        "SolarWinds DPA (per-application)",
+        "Datadog DBM"
+      ],
+      "sql": "SELECT modulo, base_dia, rec_dia, ROUND((rec_dia-base_dia)/NULLIF(base_dia,0)*100) AS var_pct, CASE WHEN rec_dia > base_dia*2 THEN 'CRITICAL' WHEN rec_dia > base_dia*1.5 THEN 'WARNING' ELSE 'OK' END AS status FROM (SELECT NVL(module,'(sem modulo)') AS modulo, ROUND(SUM(CASE WHEN periodo='BASE' THEN 1 ELSE 0 END)/7,1) AS base_dia, ROUND(SUM(CASE WHEN periodo='REC' THEN 1 ELSE 0 END),1) AS rec_dia FROM (SELECT h.module, CASE WHEN h.sample_time > SYSDATE-1 THEN 'REC' ELSE 'BASE' END AS periodo FROM dba_hist_active_sess_history h WHERE h.sample_time > SYSDATE-8 AND NVL(h.module,'-') NOT LIKE 'TROUBLESHOOT-%') GROUP BY NVL(module,'(sem modulo)')) WHERE base_dia > 0 AND rec_dia > base_dia*1.3 ORDER BY var_pct DESC FETCH FIRST 20 ROWS ONLY"
+    },
+    {
+      "id": "workload_daily",
+      "category": "config",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Carga - serie diaria por metrica (14d)",
+      "purpose": "Serie diaria (14 dias) das metricas de carga para ver o DIA EXATO em que a carga saltou (casar com data de deploy).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "workload_daily.txt",
+      "analyzer": "workload",
+      "subtitle": "CARGA - SERIE DIARIA POR METRICA (14d)",
+      "optional": true,
+      "references": [
+        "SolarWinds DPA (trends)",
+        "Datadog DBM"
+      ],
+      "sql": "SELECT dia, metrica, valor FROM (SELECT TO_CHAR(TRUNC(sn.begin_interval_time),'YYYY-MM-DD') AS dia, m.metric_name AS metrica, ROUND(AVG(m.average),2) AS valor FROM dba_hist_sysmetric_summary m JOIN dba_hist_snapshot sn ON m.snap_id=sn.snap_id AND m.instance_number=sn.instance_number AND m.dbid=sn.dbid WHERE sn.begin_interval_time > SYSDATE-14 AND m.metric_name IN ('Host CPU Utilization (%)','Executions Per Sec','User Calls Per Sec','User Transaction Per Sec') GROUP BY TO_CHAR(TRUNC(sn.begin_interval_time),'YYYY-MM-DD'), m.metric_name UNION ALL SELECT TO_CHAR(TRUNC(h.sample_time),'YYYY-MM-DD') AS dia, 'Average Active Sessions' AS metrica, ROUND(COUNT(*)*10/86400,2) AS valor FROM dba_hist_active_sess_history h WHERE h.sample_time > SYSDATE-14 GROUP BY TO_CHAR(TRUNC(h.sample_time),'YYYY-MM-DD')) ORDER BY metrica, dia"
+    },
+    {
+      "id": "workload_module_daily",
+      "category": "config",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Carga por modulo - serie diaria (14d)",
+      "purpose": "Serie diaria (14 dias) de atividade por MODULE (top 6) para localizar o DIA em que uma aplicacao aumentou o uso do banco.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "workload_module_daily.txt",
+      "analyzer": "workload",
+      "subtitle": "CARGA POR MODULO - SERIE DIARIA (14d)",
+      "optional": true,
+      "references": [
+        "SolarWinds DPA (per-application trends)"
+      ],
+      "sql": "SELECT dia, modulo, samples FROM (SELECT TO_CHAR(TRUNC(h.sample_time),'YYYY-MM-DD') AS dia, NVL(h.module,'(sem modulo)') AS modulo, COUNT(*) AS samples FROM dba_hist_active_sess_history h WHERE h.sample_time > SYSDATE-14 AND NVL(h.module,'-') NOT LIKE 'TROUBLESHOOT-%' GROUP BY TO_CHAR(TRUNC(h.sample_time),'YYYY-MM-DD'), NVL(h.module,'(sem modulo)')) d WHERE d.modulo IN (SELECT modulo FROM (SELECT NVL(module,'(sem modulo)') AS modulo, COUNT(*) c FROM dba_hist_active_sess_history WHERE sample_time > SYSDATE-14 AND NVL(module,'-') NOT LIKE 'TROUBLESHOOT-%' GROUP BY NVL(module,'(sem modulo)') ORDER BY c DESC) WHERE ROWNUM <= 6) ORDER BY modulo, dia"
+    },
+    {
+      "id": "changes_restart",
+      "category": "changes",
+      "title": "Mudancas: restart de instancia",
+      "purpose": "Data do ultimo startup de cada instancia - um restart no dia do salto de carga muda toda a interpretacao (cache frio, parametro novo do spfile, failover).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes.txt",
+      "analyzer": "changes",
+      "subtitle": "RESTART DE INSTANCIA",
+      "optional": true,
+      "references": [
+        "Foglight change tracking"
+      ],
+      "sql": "SELECT TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') AS quando, 'RESTART' AS tipo, 'instancia '||instance_name AS objeto, 'startup - no ar ha '||ROUND(SYSDATE-startup_time,1)||' dia(s)' AS detalhe FROM gv$instance ORDER BY inst_id"
+    },
+    {
+      "id": "changes_ddl",
+      "category": "changes",
+      "title": "Mudancas: DDL recente (30d)",
+      "purpose": "Objetos de aplicacao com LAST_DDL_TIME nos ultimos 30 dias - deploy, index novo, recompilacao. Responde 'o que mudou?' na data do incidente. Exclui sinonimos PUBLIC: os sinonimos de audit trail sao recriados por job diario e afogariam a cronologia.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes.txt",
+      "analyzer": "changes",
+      "subtitle": "DDL RECENTE (30d)",
+      "optional": true,
+      "references": [
+        "Foglight change tracking",
+        "DBA_OBJECTS.LAST_DDL_TIME"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(o.last_ddl_time,'YYYY-MM-DD HH24:MI') AS quando, 'DDL' AS tipo, o.owner||'.'||o.object_name AS objeto, o.object_type||' ('||o.status||')' AS detalhe FROM dba_objects o WHERE o.last_ddl_time > SYSDATE - 30 AND o.owner NOT IN ('SYS','SYSTEM','XDB','WMSYS','MDSYS','CTXSYS','DBSNMP','OUTLN','ORDSYS','ORDDATA','ORDPLUGINS','OLAPSYS','APPQOSSYS','AUDSYS','LBACSYS','DVSYS','OJVMSYS','GSMADMIN_INTERNAL','ORACLE_OCM','SYSBACKUP','SYSDG','SYSKM','SYSRAC','GGSYS','DIP','ANONYMOUS','EXFSYS','SYSMAN','TSMSYS','MDDATA','FLOWS_FILES','REMOTE_SCHEDULER_AGENT','SI_INFORMTN_SCHEMA','SPATIAL_CSW_ADMIN_USR','SPATIAL_WFS_ADMIN_USR','XS$NULL','PDBADMIN') AND NOT (o.owner = 'PUBLIC' AND o.object_type = 'SYNONYM') AND o.object_type NOT IN ('LOB','LOB PARTITION','TABLE PARTITION','INDEX PARTITION','TABLE SUBPARTITION','INDEX SUBPARTITION') ORDER BY o.last_ddl_time DESC) WHERE ROWNUM <= 40"
+    },
+    {
+      "id": "changes_stats",
+      "category": "changes",
+      "title": "Mudancas: coleta de estatisticas (30d)",
+      "purpose": "Operacoes de coleta de estatisticas do otimizador nos ultimos 30 dias. Coleta nova muda plano - e a causa classica de regressao sem deploy.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes.txt",
+      "analyzer": "changes",
+      "subtitle": "COLETA DE ESTATISTICAS (30d)",
+      "optional": true,
+      "references": [
+        "DBA_OPTSTAT_OPERATIONS (sem pack)"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(start_time,'YYYY-MM-DD HH24:MI') AS quando, 'STATS' AS tipo, NVL(target,'(global)') AS objeto, operation||' - '||ROUND((CAST(end_time AS DATE)-CAST(start_time AS DATE))*1440,1)||' min' AS detalhe FROM dba_optstat_operations WHERE start_time > SYSTIMESTAMP - 30 ORDER BY start_time DESC) WHERE ROWNUM <= 30"
+    },
+    {
+      "id": "changes_parameters",
+      "category": "changes",
+      "title": "Mudancas: parametros alterados (30d)",
+      "purpose": "Parametros cujo valor mudou entre snapshots do AWR nos ultimos 30 dias, com valor de origem e destino - identifica mudanca de parametro datada. Particiona por CON_ID: em CDB o mesmo parametro tem valor distinto no root e em cada PDB, e sem isso a comparacao alterna entre containers e inventa mudancas que nunca houveram. Ignora o resource_manager_plan definido pelo SCHEDULER (a janela de manutencao automatica liga e desliga o plano toda noite e ocuparia a lista inteira) e diferencas apenas de caixa (o proprio Oracle normaliza valores como 'metadata'/'METADATA' apos o startup).",
+      "read_only": true,
+      "requires_pack": "DIAGNOSTIC",
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes_params.txt",
+      "analyzer": "changes",
+      "subtitle": "PARAMETROS ALTERADOS (30d)",
+      "optional": true,
+      "references": [
+        "DBA_HIST_PARAMETER"
+      ],
+      "sql": "WITH snaps AS (SELECT snap_id, instance_number, MIN(end_interval_time) AS dt FROM dba_hist_snapshot WHERE end_interval_time > SYSDATE - 30 AND dbid = (SELECT dbid FROM v$database) GROUP BY snap_id, instance_number), p AS (SELECT hp.snap_id, hp.instance_number, hp.con_id, hp.parameter_name, hp.value, LAG(hp.value) OVER (PARTITION BY hp.instance_number, hp.con_id, hp.parameter_name ORDER BY hp.snap_id) AS val_ant FROM dba_hist_parameter hp WHERE hp.dbid = (SELECT dbid FROM v$database) AND hp.snap_id IN (SELECT snap_id FROM snaps) AND (hp.instance_number, hp.con_id, hp.parameter_name) IN (SELECT instance_number, con_id, parameter_name FROM dba_hist_parameter WHERE dbid = (SELECT dbid FROM v$database) AND snap_id IN (SELECT snap_id FROM snaps) GROUP BY instance_number, con_id, parameter_name HAVING COUNT(DISTINCT NVL(value,'~')) > 1)) SELECT * FROM (SELECT TO_CHAR(s.dt,'YYYY-MM-DD HH24:MI') AS quando, 'PARAMETRO' AS tipo, p.parameter_name AS objeto, 'inst '||p.instance_number||' con '||p.con_id||': '||SUBSTR(NVL(p.val_ant,'(vazio)'),1,20)||' -> '||SUBSTR(NVL(p.value,'(vazio)'),1,20) AS detalhe FROM p JOIN snaps s ON s.snap_id = p.snap_id AND s.instance_number = p.instance_number WHERE p.val_ant IS NOT NULL AND UPPER(NVL(p.value,'~')) <> UPPER(NVL(p.val_ant,'~')) AND NOT (p.parameter_name = 'resource_manager_plan' AND (NVL(p.val_ant,'x') LIKE 'SCHEDULER[%' OR NVL(p.value,'x') LIKE 'SCHEDULER[%')) ORDER BY p.snap_id DESC) WHERE ROWNUM <= 25"
+    },
+    {
+      "id": "changes_params_modified",
+      "category": "changes",
+      "title": "Mudancas: parametros fora do padrao da instancia",
+      "purpose": "Parametros modificados por ALTER SYSTEM na instancia corrente (V$SYSTEM_PARAMETER.ISMODIFIED). Nao tem data propria - serve para bases sem Diagnostics Pack, onde o historico de parametros nao esta disponivel.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes.txt",
+      "analyzer": "changes",
+      "subtitle": "PARAMETROS MODIFICADOS NA INSTANCIA (sem data)",
+      "optional": true,
+      "references": [
+        "V$SYSTEM_PARAMETER.ISMODIFIED"
+      ],
+      "sql": "SELECT '(sem data)' AS quando, 'PARAM_MODIF' AS tipo, name AS objeto, ismodified||' - valor atual: '||SUBSTR(NVL(value,'(vazio)'),1,40) AS detalhe FROM v$system_parameter WHERE ismodified <> 'FALSE' ORDER BY name"
+    },
+    {
+      "id": "changes_patches",
+      "category": "changes",
+      "title": "Mudancas: patches aplicados (SQLPATCH)",
+      "purpose": "Patches aplicados nos ultimos 90 dias (12c+). Patch e a mudanca mais facil de esquecer na cronologia de um incidente. A janela e maior que a dos outros blocos porque a cadencia de Release Update e trimestral.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "changes.txt",
+      "analyzer": "changes",
+      "subtitle": "PATCHES (SQLPATCH)",
+      "optional": true,
+      "references": [
+        "DBA_REGISTRY_SQLPATCH (nao existe em 11g)"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(action_time,'YYYY-MM-DD HH24:MI') AS quando, 'PATCH' AS tipo, TO_CHAR(patch_id) AS objeto, action||' '||status||' - '||SUBSTR(NVL(description,'(sem descricao)'),1,45) AS detalhe FROM dba_registry_sqlpatch WHERE action_time > SYSTIMESTAMP - 90 ORDER BY action_time DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "load_profile",
+      "category": "config",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Load Profile (AWR, ultima hora)",
+      "purpose": "Perfil de carga por segundo/transacao (AAS, DB CPU ratio, execucoes/s, user calls/s, transacoes/s, logons/s, hard parse/s, physical reads/s, redo/s) - equivalente ao Load Profile do AWR.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "load_profile.txt",
+      "analyzer": "generic",
+      "recommendation": "Comparar o perfil de carga com a janela normal do banco. Variacao forte sem mudanca de negocio sugere deploy, job novo ou plano ruim - correlacionar com compare_period.",
+      "subtitle": "LOAD PROFILE (AWR - ultima hora)",
+      "optional": true,
+      "references": [
+        "Oracle AWR Load Profile"
+      ],
+      "sql": "SELECT metrica, valor, unidade FROM (SELECT metrica, ROUND(AVG(average),2) AS valor, MAX(metric_unit) AS unidade FROM (SELECT m.metric_name AS metrica, m.average, m.metric_unit FROM dba_hist_sysmetric_summary m JOIN dba_hist_snapshot sn ON m.snap_id=sn.snap_id AND m.instance_number=sn.instance_number AND m.dbid=sn.dbid WHERE sn.begin_interval_time > SYSDATE - 1/24 AND m.metric_name IN ('Database CPU Time Ratio','Host CPU Utilization (%)','Executions Per Sec','User Calls Per Sec','User Transaction Per Sec','Logons Per Sec','Hard Parse Count Per Sec','Physical Reads Per Sec','Redo Generated Per Sec')) GROUP BY metrica UNION ALL SELECT 'Average Active Sessions' AS metrica, ROUND(COUNT(*)*10/3600,2) AS valor, 'Sessions' AS unidade FROM dba_hist_active_sess_history h WHERE h.sample_time > SYSDATE - 1/24) ORDER BY metrica"
+    },
+    {
+      "id": "activity_by_user",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Atividade por usuario (ASH 60min)",
+      "purpose": "Distribuicao da atividade (ASH) por usuario do banco - dimensao 'by user' do DPA.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "activity_user.txt",
+      "analyzer": "generic",
+      "recommendation": "Identifica QUEM consome DB time. Se um usuario/servico domina, alinhar com o time responsavel; avaliar Resource Manager para proteger a carga critica.",
+      "subtitle": "ATIVIDADE POR USUARIO (ASH 60min)",
+      "optional": true,
+      "references": [
+        "SolarWinds DPA (by user)"
+      ],
+      "sql": "SELECT * FROM (SELECT NVL(u.username,'('||ash.user_id||')') AS usuario, COUNT(*) AS samples, ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS activity_pct FROM gv$active_session_history ash LEFT JOIN dba_users u ON u.user_id=ash.user_id WHERE ash.sample_time > SYSDATE - 1/24 GROUP BY NVL(u.username,'('||ash.user_id||')') ORDER BY samples DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "activity_by_object",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Atividade por objeto (ASH 60min)",
+      "purpose": "Objetos (segmentos) mais 'quentes' por atividade (ASH) - dimensao 'by object' do DPA.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "activity_object.txt",
+      "analyzer": "generic",
+      "recommendation": "Objeto mais esperado no ASH indica hot spot: revisar indices, contencao de bloco (ITL/buffer busy) e full scans nas tabelas do topo.",
+      "subtitle": "ATIVIDADE POR OBJETO (ASH 60min)",
+      "optional": true,
+      "references": [
+        "SolarWinds DPA (by object)"
+      ],
+      "sql": "SELECT * FROM (SELECT o.owner||'.'||o.object_name AS objeto, o.object_type AS tipo, COUNT(*) AS samples, ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS activity_pct FROM gv$active_session_history ash JOIN dba_objects o ON o.object_id=ash.current_obj# WHERE ash.sample_time > SYSDATE - 1/24 AND ash.current_obj# > 0 GROUP BY o.owner, o.object_name, o.object_type ORDER BY samples DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "activity_by_machine",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Atividade por maquina (ASH 60min)",
+      "purpose": "Distribuicao da atividade (ASH) por maquina cliente - dimensao 'by machine' do DPA.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "activity_machine.txt",
+      "analyzer": "generic",
+      "recommendation": "Concentracao de DB time em uma maquina/app server aponta a origem da carga. Util para provar ao time de aplicacao de onde vem o consumo.",
+      "subtitle": "ATIVIDADE POR MAQUINA (ASH 60min)",
+      "optional": true,
+      "references": [
+        "SolarWinds DPA (by machine)"
+      ],
+      "sql": "SELECT * FROM (SELECT machine, COUNT(*) AS samples, ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS activity_pct FROM gv$active_session_history WHERE sample_time > SYSDATE - 1/24 AND machine IS NOT NULL GROUP BY machine ORDER BY samples DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "topologia",
+      "category": "config",
+      "requires_pack": "NONE",
+      "title": "Topologia do ambiente",
+      "purpose": "Identifica standalone/RAC/RAC One Node/Exadata/CDB/DG/GG antes de decidir checks e limiares.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "topology.txt",
+      "analyzer": "topologia",
+      "optional": true,
+      "subtitle": "TOPOLOGIA DO AMBIENTE",
+      "recommendation": "Conferir se a topologia detectada bate com o esperado para o servico. Divergencia (no fora do ar, standby inativo) e o primeiro suspeito.",
+      "thresholds": {
+        "nos_fora_do_ar": {
+          "warn": 1,
+          "crit": 1
+        }
+      },
+      "references": [
+        "Oracle RAC Admin",
+        "Oracle MAA"
+      ],
+      "sql": "SELECT i.inst_id, i.instance_name, i.host_name, i.status, TO_CHAR(i.startup_time,'YYYY-MM-DD HH24:MI') AS startup FROM gv$instance i ORDER BY i.inst_id",
+      "special": "topologia"
+    },
+    {
+      "id": "rac_sessions_por_no",
+      "category": "rac",
+      "requires_pack": "NONE",
+      "title": "Distribuicao de sessoes entre os nos (RAC)",
+      "purpose": "Detecta skew de carga: um no com muito mais sessoes que os outros indica servico/listener mal balanceado.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rac_nodes.txt",
+      "analyzer": "topologia",
+      "optional": true,
+      "requires_topology": [
+        "rac"
+      ],
+      "subtitle": "SESSOES POR INSTANCIA",
+      "recommendation": "Se um no concentra a carga, revisar CLB/RLB do servico, TNS (LOAD_BALANCE) e se o servico esta preferencial em uma instancia.",
+      "thresholds": {
+        "skew_pct": {
+          "warn": 60,
+          "crit": 80
+        }
+      },
+      "references": [
+        "Oracle RAC Load Balancing"
+      ],
+      "sql": "SELECT inst_id, COUNT(*) AS sessoes, SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) AS ativas FROM gv$session WHERE type='USER' GROUP BY inst_id ORDER BY inst_id"
+    },
+    {
+      "id": "rac_servicos",
+      "category": "rac",
+      "requires_pack": "NONE",
+      "title": "Servicos ativos por instancia",
+      "purpose": "Mostra onde cada servico esta rodando - em RAC One Node revela relocacao em curso.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rac_nodes.txt",
+      "analyzer": "topologia",
+      "optional": true,
+      "requires_topology": [
+        "cluster"
+      ],
+      "subtitle": "SERVICOS ATIVOS",
+      "recommendation": "Confirmar que os servicos estao nas instancias preferenciais definidas no srvctl.",
+      "references": [
+        "Oracle RAC Services"
+      ],
+      "sql": "SELECT inst_id, name AS servico FROM gv$active_services WHERE name NOT LIKE 'SYS$%' ORDER BY name, inst_id"
+    },
+    {
+      "id": "rac_interconnect",
+      "category": "rac",
+      "requires_pack": "NONE",
+      "title": "Blocos perdidos no interconnect (RAC)",
+      "purpose": "'gc blocks lost' diferente de zero e sinal direto de problema de rede/interconnect - causa comum de evicao (ORA-29740).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rac_nodes.txt",
+      "analyzer": "topologia",
+      "optional": true,
+      "requires_topology": [
+        "rac"
+      ],
+      "subtitle": "INTERCONNECT (BLOCOS PERDIDOS)",
+      "recommendation": "Blocos perdidos: checar MTU/jumbo frames, erros na NIC do interconnect, HAIP e saturacao da rede privada.",
+      "thresholds": {
+        "blocks_lost": {
+          "warn": 1,
+          "crit": 100
+        }
+      },
+      "references": [
+        "Oracle Note RAC Interconnect",
+        "Oracle RAC Performance"
+      ],
+      "sql": "SELECT inst_id, name, value FROM gv$sysstat WHERE name IN ('gc blocks lost','gc blocks corrupt','gc cr block lost','gc current block lost') AND value > 0 ORDER BY inst_id, name"
+    },
+    {
+      "id": "ash_por_instancia",
+      "category": "waits",
+      "requires_pack": "DIAGNOSTIC",
+      "title": "Wait classes por instancia (ASH 60min)",
+      "purpose": "Em cluster, o agregado esconde um no doente. Quebra o perfil de espera por no.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "ash_por_no.txt",
+      "analyzer": "ash",
+      "optional": true,
+      "requires_topology": [
+        "rac"
+      ],
+      "subtitle": "WAIT CLASSES POR INSTANCIA (ASH 60min)",
+      "recommendation": "Comparar o perfil entre os nos: divergencia forte aponta problema local (CPU, IO, interconnect) em vez de global.",
+      "references": [
+        "Millsap - Method R"
+      ],
+      "sql": "SELECT inst_id, NVL(wait_class,'CPU') AS wait_class, COUNT(*) AS samples FROM gv$active_session_history WHERE sample_time > SYSDATE - 1/24 GROUP BY inst_id, NVL(wait_class,'CPU') ORDER BY inst_id, samples DESC"
+    },
+    {
+      "id": "exadata_offload",
+      "category": "exadata",
+      "requires_pack": "NONE",
+      "title": "Eficiencia de offload / smart scan (Exadata)",
+      "purpose": "Em Exadata o ganho vem do offload. Pouco offload sobre muito IO elegivel significa que o plano nao esta usando smart scan.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "exadata.txt",
+      "analyzer": "exadata",
+      "optional": true,
+      "requires_topology": [
+        "exadata"
+      ],
+      "subtitle": "OFFLOAD / SMART SCAN",
+      "recommendation": "Offload baixo: verificar se ha predicados nao offloadaveis, indices forcando acesso por rowid, ou hints impedindo full scan. Storage index e flash cache tambem caem quando o plano muda.",
+      "thresholds": {
+        "offload_pct": {
+          "warn": 50,
+          "crit": 20
+        }
+      },
+      "references": [
+        "Oracle Exadata Best Practices"
+      ],
+      "sql": "SELECT inst_id, name, value FROM gv$sysstat WHERE name IN ('cell physical IO bytes eligible for predicate offload','cell physical IO interconnect bytes returned by smart scan','cell physical IO bytes saved by storage index','cell flash cache read hits','physical read total bytes') ORDER BY inst_id, name"
+    },
+    {
+      "id": "exadata_cell_waits",
+      "category": "exadata",
+      "requires_pack": "NONE",
+      "title": "Esperas de celula (Exadata)",
+      "purpose": "Eventos 'cell %' medem o IO real das celulas; em flash o esperado e sub-milissegundo.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "exadata.txt",
+      "analyzer": "exadata",
+      "optional": true,
+      "requires_topology": [
+        "exadata"
+      ],
+      "subtitle": "ESPERAS DE CELULA",
+      "recommendation": "avg_ms alto em 'cell single block physical read' aponta celula lenta ou flash cache sem espaco; correlacionar com o no.",
+      "thresholds": {
+        "cell_read_ms": {
+          "warn": 5,
+          "crit": 15
+        }
+      },
+      "references": [
+        "Oracle Exadata Best Practices"
+      ],
+      "sql": "SELECT inst_id, event, total_waits, ROUND(time_waited_micro/1000/GREATEST(total_waits,1),2) AS avg_ms FROM gv$system_event WHERE event LIKE 'cell %' AND total_waits > 0 ORDER BY avg_ms DESC FETCH FIRST 15 ROWS ONLY"
+    },
+    {
+      "id": "gg_capture",
+      "category": "goldengate",
+      "requires_pack": "NONE",
+      "title": "Processos de capture (GoldenGate integrado)",
+      "purpose": "Capture ABORTED ou com erro para a replicacao - e a falha mais comum de GG integrado.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "goldengate.txt",
+      "analyzer": "goldengate",
+      "optional": true,
+      "requires_topology": [
+        "goldengate"
+      ],
+      "subtitle": "CAPTURE",
+      "recommendation": "Capture parado: verificar ERROR_MESSAGE, espaco no streams pool, retencao de archive (capture precisa dos redos) e ENABLE_GOLDENGATE_REPLICATION.",
+      "references": [
+        "Oracle GoldenGate Integrated Capture"
+      ],
+      "sql": "SELECT capture_name, status, capture_type, error_number, error_message FROM dba_capture ORDER BY capture_name"
+    },
+    {
+      "id": "gg_apply",
+      "category": "goldengate",
+      "requires_pack": "NONE",
+      "title": "Processos de apply (GoldenGate integrado)",
+      "purpose": "Apply parado acumula lag no destino sem alarme no banco de origem.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "goldengate.txt",
+      "analyzer": "goldengate",
+      "optional": true,
+      "requires_topology": [
+        "goldengate"
+      ],
+      "subtitle": "APPLY",
+      "recommendation": "Apply parado ou com erro: checar DBA_APPLY_ERROR, conflitos de chave e se o handler de conflito esta definido.",
+      "references": [
+        "Oracle GoldenGate Integrated Apply"
+      ],
+      "sql": "SELECT apply_name, status, apply_captured, error_number, error_message FROM dba_apply ORDER BY apply_name"
+    },
+    {
+      "id": "gg_lag",
+      "category": "goldengate",
+      "requires_pack": "NONE",
+      "title": "Lag de apply (GoldenGate integrado)",
+      "purpose": "Mede o atraso da replicacao pela idade da ultima mensagem aplicada.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "goldengate.txt",
+      "analyzer": "goldengate",
+      "optional": true,
+      "requires_topology": [
+        "goldengate"
+      ],
+      "subtitle": "LAG DE APPLY",
+      "recommendation": "Lag crescente: comparar throughput do apply com o volume do capture; avaliar paralelismo (APPLY_SERVERS) e contencao no destino.",
+      "thresholds": {
+        "lag_min": {
+          "warn": 15,
+          "crit": 60
+        }
+      },
+      "references": [
+        "Oracle GoldenGate Monitoring"
+      ],
+      "sql": "SELECT apply_name, TO_CHAR(applied_message_create_time,'YYYY-MM-DD HH24:MI:SS') AS ultima_mensagem, ROUND((SYSDATE - applied_message_create_time)*1440,1) AS lag_min FROM dba_apply_progress ORDER BY lag_min DESC"
+    },
+    {
+      "id": "session_sampling",
+      "category": "waits",
+      "requires_pack": "NONE",
+      "special": "amostragem",
+      "title": "Perfil de esperas por amostragem (sem Diagnostics Pack)",
+      "purpose": "ASH e um historico de v$session. Amostrando gv$session em alta frequencia obtem-se o perfil de esperas sem licenca de pack - a diferenca entre diagnosticar e chutar num banco sem Diagnostics Pack.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "amostragem.txt",
+      "analyzer": "amostragem",
+      "subtitle": "AMOSTRAGEM DE SESSOES (SEM DIAGNOSTICS PACK)",
+      "optional": true,
+      "thresholds": {
+        "espera_pct": {
+          "warn": 50,
+          "crit": 75
+        },
+        "sql_dominante_pct": {
+          "warn": 30
+        },
+        "amostras_bloqueadas_pct": {
+          "warn": 20,
+          "crit": 50
+        }
+      },
+      "recommendation": "Trate primeiro a classe de espera dominante (Method R). A amostra cobre a janela da coleta: para sintoma intermitente, colete durante a janela do problema.",
+      "references": [
+        "Tanel Poder - Snapper (amostra gv$session, dispensa Diagnostics Pack)",
+        "YaASHs - simulacao de ASH por amostragem de V$SESSION",
+        "Millsap - Method R"
+      ],
+      "sql": "SELECT CASE WHEN state = 'WAITING' AND wait_class <> 'Idle' THEN wait_class ELSE 'CPU' END AS wait_class, CASE WHEN state = 'WAITING' AND wait_class <> 'Idle' THEN event ELSE 'ON CPU' END AS event, COUNT(*) AS amostras FROM gv$session WHERE status = 'ACTIVE' AND type = 'USER' AND (state <> 'WAITING' OR wait_class <> 'Idle') GROUP BY CASE WHEN state = 'WAITING' AND wait_class <> 'Idle' THEN wait_class ELSE 'CPU' END, CASE WHEN state = 'WAITING' AND wait_class <> 'Idle' THEN event ELSE 'ON CPU' END ORDER BY amostras DESC"
+    },
+    {
+      "id": "block_corruption",
+      "category": "integridade",
+      "requires_pack": "NONE",
+      "title": "Blocos corrompidos conhecidos",
+      "purpose": "Corrupcao ja detectada pelo banco ou por RMAN VALIDATE. Perda de dado silenciosa: nao aparece em wait event nem em Health Score de performance.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "corruption.txt",
+      "analyzer": "integridade",
+      "subtitle": "BLOCOS CORROMPIDOS",
+      "optional": true,
+      "recommendation": "Qualquer linha aqui e critica. Identifique o objeto (dba_extents por file#/block#) e recupere: RMAN BLOCKRECOVER, ou restore do datafile. CORRUPTION_TYPE=LOGICAL costuma indicar bug ou erro de I/O do storage - abra chamado com o time de infraestrutura e busque a nota no MOS.",
+      "references": [
+        "Oracle Backup and Recovery Guide - Block Media Recovery",
+        "MOS 836658.1 - Handling Oracle Block Corruptions"
+      ],
+      "sql": "SELECT file# AS file_id, block# AS block_id, blocks, corruption_change# AS change_num, corruption_type FROM v$database_block_corruption ORDER BY file#, block#"
+    },
+    {
+      "id": "datafile_recover",
+      "category": "integridade",
+      "requires_pack": "NONE",
+      "title": "Datafiles precisando de recuperacao ou fora de ONLINE",
+      "purpose": "Arquivo em RECOVER/OFFLINE deixa parte do banco inacessivel; e falha de disponibilidade, nao de performance.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "datafile_status.txt",
+      "analyzer": "integridade",
+      "subtitle": "DATAFILES FORA DE ONLINE",
+      "optional": true,
+      "recommendation": "Datafile em RECOVER exige RECOVER DATAFILE seguido de ALTER DATABASE DATAFILE ... ONLINE. Confirme antes se o archivelog necessario existe (v$archived_log) - sem ele, so restore.",
+      "references": [
+        "Oracle Backup and Recovery Guide - Performing Media Recovery",
+        "Oracle Reference - V$RECOVER_FILE"
+      ],
+      "sql": "SELECT d.file# AS file_id, d.status AS file_status, h.status AS header_status, NVL(r.error,'-') AS erro, SUBSTR(d.name,1,60) AS arquivo FROM v$datafile d JOIN v$datafile_header h ON h.file# = d.file# LEFT JOIN v$recover_file r ON r.file# = d.file# WHERE d.status NOT IN ('ONLINE','SYSTEM') OR h.status <> 'ONLINE' OR r.file# IS NOT NULL ORDER BY d.file#"
+    },
+    {
+      "id": "archive_dest_status",
+      "category": "recuperabilidade",
+      "requires_pack": "NONE",
+      "title": "Destinos de archive com erro",
+      "purpose": "Destino de archive com erro para o banco inteiro com ORA-00257 em minutos. E a falha mais previsivel e mais fatal do Oracle.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "archive_dest.txt",
+      "analyzer": "integridade",
+      "subtitle": "ARCHIVE DEST STATUS",
+      "optional": true,
+      "recommendation": "Destino com ERROR: libere espaco no destino ou corrija o caminho e rode ALTER SYSTEM ARCHIVE LOG ALL. Enquanto houver erro, o redo nao arquiva e o banco congela ao dar a volta nos grupos.",
+      "references": [
+        "Oracle Reference - V$ARCHIVE_DEST_STATUS",
+        "Oracle Administrator's Guide - Managing Archived Redo Log Files"
+      ],
+      "sql": "SELECT dest_id, dest_name, status, type, NVL(SUBSTR(error,1,60),'-') AS erro, archived_seq# AS ultimo_seq FROM v$archive_dest_status WHERE status <> 'INACTIVE' ORDER BY dest_id"
+    },
+    {
+      "id": "backup_age",
+      "category": "recuperabilidade",
+      "requires_pack": "NONE",
+      "title": "Idade do ultimo backup por datafile (RPO real)",
+      "purpose": "Job de RMAN com status COMPLETED nao garante que TODO datafile foi copiado. O RPO real e o do arquivo mais desatualizado.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "backup_age.txt",
+      "analyzer": "integridade",
+      "subtitle": "IDADE DO BACKUP POR DATAFILE",
+      "optional": true,
+      "thresholds": {
+        "dias_sem_backup": {
+          "warn": 2,
+          "crit": 7
+        }
+      },
+      "recommendation": "Datafile sem backup nao e recuperavel sem perda. Inclua o tablespace no script de backup e rode BACKUP DATABASE. Tablespace READ ONLY pode ficar de fora legitimamente - confirme a politica antes de agir.",
+      "references": [
+        "Oracle Backup and Recovery Guide - Reporting on RMAN Operations",
+        "Oracle Reference - V$BACKUP_DATAFILE"
+      ],
+      "sql": "SELECT d.file# AS file_id, SUBSTR(t.name,1,30) AS tablespace_name, NVL(TO_CHAR(b.ultimo,'YYYY-MM-DD HH24:MI'),'NUNCA') AS ultimo_backup, ROUND(SYSDATE - b.ultimo,1) AS dias FROM v$datafile d JOIN v$tablespace t ON t.ts# = d.ts# LEFT JOIN (SELECT file#, MAX(completion_time) AS ultimo FROM v$backup_datafile GROUP BY file#) b ON b.file# = d.file# ORDER BY dias DESC NULLS FIRST"
+    },
+    {
+      "id": "archive_gap",
+      "category": "ha_dg",
+      "requires_pack": "NONE",
+      "title": "Gap de archivelog para o standby",
+      "purpose": "Sequencia que o standby nunca recebeu. Enquanto o gap existir, o RPO anunciado e ficcao.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "archive_gap.txt",
+      "analyzer": "integridade",
+      "subtitle": "ARCHIVE GAP (STANDBY)",
+      "optional": true,
+      "requires_topology": [
+        "dataguard"
+      ],
+      "recommendation": "Gap aberto: confirme transporte (v$archive_dest_status) e reenvie o intervalo. Se o archivelog ja foi apagado na primaria, e preciso incremental backup a partir da SCN do standby.",
+      "references": [
+        "Oracle Data Guard Concepts - Managing Archive Gaps",
+        "MOS 1537316.1 - Resolving Archive Gaps"
+      ],
+      "sql": "SELECT thread# AS thread_num, low_sequence# AS seq_inicial, high_sequence# AS seq_final FROM v$archive_gap ORDER BY thread#"
+    },
+    {
+      "id": "accounts_expiring",
+      "category": "security",
+      "requires_pack": "NONE",
+      "title": "Contas expirando ou bloqueadas",
+      "purpose": "ORA-28001 (senha expirada) derruba a aplicacao inteira e e 100% previsivel: a data esta no dicionario.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "accounts.txt",
+      "analyzer": "operacao",
+      "subtitle": "CONTAS EXPIRANDO",
+      "optional": true,
+      "thresholds": {
+        "dias_para_expirar": {
+          "warn": 30,
+          "crit": 7
+        }
+      },
+      "recommendation": "Conta de aplicacao nunca deve depender de expiracao: mova para um profile com PASSWORD_LIFE_TIME UNLIMITED (decisao de seguranca, registre) ou troque a senha antes da data. Trocar depois do ORA-28001 e incidente; trocar antes e manutencao.",
+      "references": [
+        "Oracle Security Guide - Password Management Policy",
+        "Oracle Reference - DBA_USERS"
+      ],
+      "sql": "SELECT username, account_status, profile, TO_CHAR(expiry_date,'YYYY-MM-DD') AS expira_em, ROUND(expiry_date - SYSDATE) AS dias FROM dba_users WHERE (expiry_date IS NOT NULL AND expiry_date < SYSDATE + 60) OR account_status LIKE '%LOCKED%' OR account_status LIKE '%EXPIRED%' ORDER BY expiry_date NULLS LAST"
+    },
+    {
+      "id": "alert_recent",
+      "category": "integridade",
+      "requires_pack": "NONE",
+      "title": "Alert log recente (7 dias)",
+      "purpose": "Le o alert log direto do banco (V$DIAG_ALERT_EXT), sem depender de acesso ao sistema de arquivos nem de alguem colar o arquivo. E onde o ORA-00600, o ORA-00257 e a queda de instancia aparecem primeiro.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "alert_recent.txt",
+      "analyzer": "alertlog",
+      "subtitle": "ALERT LOG RECENTE (7 dias)",
+      "optional": true,
+      "recommendation": "Cada codigo ORA- e traduzido pelo dicionario mcp/erros_ora.json (causa, acao e nota MOS). Erro interno ou corrupcao: colete o trace citado na mensagem antes de qualquer restart.",
+      "references": [
+        "Oracle Reference - V$DIAG_ALERT_EXT",
+        "Oracle Autonomous Health Framework - Trace File Analyzer"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(originating_timestamp,'YYYY-MM-DD HH24:MI:SS') AS quando, message_level AS nivel, SUBSTR(TRIM(REPLACE(REPLACE(message_text, CHR(10), ' '), CHR(13), ' ')),1,110) AS mensagem FROM v$diag_alert_ext WHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(7,'DAY') AND (REGEXP_LIKE(message_text,'ORA-[0-9]{4,5}') OR message_level <= 2) ORDER BY originating_timestamp DESC) WHERE ROWNUM <= 40"
+    },
+    {
+      "id": "patch_level",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Versao e idade do ultimo patch",
+      "purpose": "Banco sem Release Update ha muito tempo esta exposto a bugs ja corrigidos e a vulnerabilidades publicadas. Saber a idade do patch muda a conversa com a Oracle quando aparece um ORA-00600.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "patches.txt",
+      "analyzer": "bugs",
+      "subtitle": "VERSAO E PATCH",
+      "optional": true,
+      "thresholds": {
+        "dias_desde_patch": {
+          "warn": 270,
+          "crit": 540
+        }
+      },
+      "recommendation": "Antes de abrir SR por erro interno, confira se o RU atual ja corrige o bug. Planeje a aplicacao de RU em janela, com o standby atualizado primeiro quando houver Data Guard.",
+      "references": [
+        "MOS 2118136.2 - Release Update Introduction and FAQ",
+        "Oracle Critical Patch Update Advisory"
+      ],
+      "sql": "SELECT 'versao' AS item, CAST((SELECT version FROM v$instance) AS VARCHAR2(80)) AS valor, '-' AS quando FROM dual UNION ALL SELECT 'ultimo_patch', CAST(SUBSTR(descricao,1,60) AS VARCHAR2(80)), TO_CHAR(quando,'YYYY-MM-DD') FROM (SELECT description AS descricao, action_time AS quando FROM dba_registry_sqlpatch ORDER BY action_time DESC) WHERE ROWNUM = 1 UNION ALL SELECT 'dias_desde_patch', CAST(TO_CHAR(ROUND(SYSDATE - (SELECT CAST(MAX(action_time) AS DATE) FROM dba_registry_sqlpatch))) AS VARCHAR2(80)), '-' FROM dual"
+    },
+    {
+      "id": "dict_health",
+      "category": "integridade",
+      "requires_pack": "NONE",
+      "title": "Integridade do dicionario de dados",
+      "purpose": "Componente do banco invalido ou objeto de SYS/SYSTEM quebrado costuma ser sobra de upgrade/patch mal terminado - e vira erro aleatorio dificil de rastrear meses depois.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "dict_health.txt",
+      "analyzer": "bugs",
+      "subtitle": "INTEGRIDADE DO DICIONARIO",
+      "optional": true,
+      "recommendation": "Objeto invalido de SYS/SYSTEM: rode @?/rdbms/admin/utlrp.sql em janela. Componente do DBA_REGISTRY invalido: e recuperacao de upgrade, trate com a nota da Oracle do componente antes de qualquer outra coisa.",
+      "references": [
+        "Oracle Database Upgrade Guide - Post-Upgrade Status",
+        "MOS 1088020.1 - Troubleshooting Invalid Objects"
+      ],
+      "sql": "SELECT 'componente_invalido' AS tipo, comp_id AS objeto, status AS detalhe FROM dba_registry WHERE status NOT IN ('VALID','OPTION OFF','REMOVED') UNION ALL SELECT 'objeto_sys_invalido', owner||'.'||object_name, object_type FROM dba_objects WHERE owner IN ('SYS','SYSTEM') AND status = 'INVALID' AND ROWNUM <= 30"
+    },
+    {
+      "id": "rman_failures",
+      "category": "recuperabilidade",
+      "requires_pack": "NONE",
+      "title": "Falhas de backup RMAN (7 dias)",
+      "purpose": "Backup que falha em silencio e o pior tipo de problema: so se descobre na hora do restore. Complementa a idade do backup mostrando a TENTATIVA que falhou.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "rman_fail.txt",
+      "analyzer": "bugs",
+      "subtitle": "FALHAS DE BACKUP (RMAN)",
+      "optional": true,
+      "recommendation": "Veja o erro no log do job de backup e em V$RMAN_OUTPUT. Falha repetida no mesmo horario aponta para janela concorrente ou destino cheio; falha isolada costuma ser indisponibilidade do storage/fita.",
+      "references": [
+        "Oracle Backup and Recovery Reference - V$RMAN_STATUS"
+      ],
+      "sql": "SELECT operation, status, TO_CHAR(start_time,'YYYY-MM-DD HH24:MI') AS inicio, ROUND(mbytes_processed/1024) AS gb, object_type FROM v$rman_status WHERE status LIKE '%FAILED%' AND start_time > SYSDATE - 7 ORDER BY start_time DESC"
+    },
+    {
+      "id": "bp_parameters",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Parametros x recomendado (best practice)",
+      "purpose": "Compara os parametros de instancia com o recomendado pela Oracle (estilo ORAchk). Boa parte dos incidentes graves nasce de um parametro que ninguem revisou desde a instalacao.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_params.txt",
+      "analyzer": "conformidade",
+      "subtitle": "PARAMETROS X RECOMENDADO",
+      "optional": true,
+      "recommendation": "Trate primeiro o que cega o diagnostico (statistics_level, timed_statistics, max_dump_file_size) e o que protege o dado (db_block_checksum, db_lost_write_protect). Parametro com 'exige restart' entra em janela.",
+      "references": [
+        "Oracle AHF - ORAchk best practice checks",
+        "Oracle Reference - Initialization Parameters",
+        "MOS 2312911.1 - Optimizer Adaptive Features"
+      ],
+      "sql": "SELECT name, SUBSTR(NVL(value,'(nulo)'),1,60) AS valor, isdefault FROM v$parameter WHERE name IN ('db_block_checksum','db_block_checking','db_lost_write_protect','use_large_pages','filesystemio_options','disk_asynch_io','fast_start_mttr_target','undo_retention','open_cursors','session_cached_cursors','cursor_sharing','optimizer_adaptive_statistics','statistics_level','timed_statistics','max_dump_file_size','control_file_record_keep_time','log_checkpoints_to_alert','resource_limit','remote_os_authent','audit_trail') ORDER BY name"
+    },
+    {
+      "id": "bp_database",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Configuracao do banco x recomendado",
+      "purpose": "Archivelog, force logging, block change tracking e autobackup do controlfile: as decisoes que definem se o banco e recuperavel. Coleta junto os fatos que condicionam a regra (papel do banco, standby configurado).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_database.txt",
+      "analyzer": "conformidade",
+      "subtitle": "CONFIGURACAO X RECOMENDADO",
+      "optional": true,
+      "recommendation": "FORCE LOGGING e obrigatorio quando existe standby - sem ele o failover pode abrir com bloco ilegivel. Autobackup do controlfile transforma restore complexo em trivial.",
+      "references": [
+        "Oracle MAA Best Practices",
+        "Oracle Backup and Recovery Guide"
+      ],
+      "sql": "SELECT 'log_mode' AS item, CAST(log_mode AS VARCHAR2(60)) AS valor FROM v$database UNION ALL SELECT 'force_logging', CAST(force_logging AS VARCHAR2(60)) FROM v$database UNION ALL SELECT 'flashback_on', CAST(flashback_on AS VARCHAR2(60)) FROM v$database UNION ALL SELECT 'database_role', CAST(database_role AS VARCHAR2(60)) FROM v$database UNION ALL SELECT 'block_change_tracking', CAST(NVL((SELECT status FROM v$block_change_tracking),'DISABLED') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'standby_configurado', CAST(NVL2((SELECT MAX(dest_id) FROM v$archive_dest WHERE target='STANDBY' AND destination IS NOT NULL),'SIM','NAO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'rman_'||LOWER(REPLACE(name,' ','_')), CAST(SUBSTR(value,1,60) AS VARCHAR2(60)) FROM v$rman_configuration"
+    },
+    {
+      "id": "bp_multiplex",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Multiplexacao de controlfile e redo",
+      "purpose": "Controlfile unico ou grupo de redo com um membro so e ponto unico de falha - o tipo de problema que so aparece no dia em que ja e tarde.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_multiplex.txt",
+      "analyzer": "conformidade",
+      "subtitle": "MULTIPLEXACAO",
+      "optional": true,
+      "recommendation": "Adicionar membro de redo e online e sem impacto. Controlfile exige restart, mas e o arquivo que nao pode faltar.",
+      "references": [
+        "Oracle Administrator's Guide - Managing Control Files",
+        "Oracle Administrator's Guide - Managing Redo Log Files"
+      ],
+      "sql": "SELECT 'controlfiles' AS item, TO_CHAR(COUNT(*)) AS qtd, '-' AS detalhe FROM v$controlfile UNION ALL SELECT 'redo_grupo_'||TO_CHAR(l.group#), TO_CHAR(COUNT(f.member)), TO_CHAR(ROUND(MAX(l.bytes)/1024/1024))||' MB' FROM v$log l JOIN v$logfile f ON f.group# = l.group# GROUP BY l.group# UNION ALL SELECT 'standby_redo', TO_CHAR(COUNT(*)), '-' FROM v$standby_log"
+    },
+    {
+      "id": "bp_instalacao",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Configuracao de instalacao x recomendado",
+      "purpose": "O que ficou como veio da instalacao e nunca mais foi revisto: banco subindo por pfile, COMPATIBLE parado numa versao antiga, upgrade de timezone pela metade, parametro underscore de um SR esquecido e as tarefas automaticas de estatistica desligadas.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_instalacao.txt",
+      "analyzer": "conformidade",
+      "subtitle": "CONFIGURACAO DE INSTALACAO",
+      "optional": true,
+      "recommendation": "Trate primeiro o que muda comportamento sem aviso: pfile (o ajuste some no restart), DST pendente (hora errada em TIMESTAMP WITH TIME ZONE) e coleta automatica de estatisticas desligada. COMPATIBLE so sobe com homologacao - nao tem volta sem restore.",
+      "references": [
+        "Oracle AHF - ORAchk best practice checks",
+        "MOS 1585343.1 - Applying the DSTv Update",
+        "Oracle Optimizer Blog - Best Practices for Gathering Optimizer Statistics"
+      ],
+      "sql": "SELECT 'spfile_em_uso' AS item, CAST(NVL2((SELECT value FROM v$parameter WHERE name='spfile'),'SIM','NAO') AS VARCHAR2(60)) AS valor FROM dual UNION ALL SELECT 'compatible', CAST(SUBSTR((SELECT value FROM v$parameter WHERE name='compatible'),1,60) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'versao_banco', CAST(version AS VARCHAR2(60)) FROM v$instance UNION ALL SELECT 'compatible_alinhado', CAST(CASE WHEN SUBSTR(c.value,1,INSTR(c.value||'.','.',1,2)-1) = SUBSTR(i.version,1,INSTR(i.version||'.','.',1,2)-1) THEN 'SIM' ELSE 'NAO' END AS VARCHAR2(60)) FROM (SELECT value FROM v$parameter WHERE name='compatible') c, v$instance i UNION ALL SELECT 'dst_upgrade_pendente', CAST(NVL((SELECT CASE WHEN property_value='NONE' THEN 'NAO' ELSE 'SIM' END FROM database_properties WHERE property_name='DST_UPGRADE_STATE'),'NAO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'underscore_parametros_setados', CAST(TO_CHAR((SELECT COUNT(*) FROM v$spparameter WHERE name LIKE '\\_%' ESCAPE '\\' AND isspecified='TRUE')) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'autotask_stats', CAST(NVL((SELECT MAX(status) FROM dba_autotask_client WHERE client_name='auto optimizer stats collection'),'DESCONHECIDO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'autotask_space', CAST(NVL((SELECT MAX(status) FROM dba_autotask_client WHERE client_name='auto space advisor'),'DESCONHECIDO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'stats_estimate_percent', CAST(SUBSTR(DBMS_STATS.GET_PREFS('ESTIMATE_PERCENT'),1,60) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'stats_method_opt', CAST(SUBSTR(DBMS_STATS.GET_PREFS('METHOD_OPT'),1,60) AS VARCHAR2(60)) FROM dual"
+    },
+    {
+      "id": "bp_ha",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Recuperabilidade e HA x recomendado",
+      "purpose": "As decisoes que so cobram a conta no dia do failover: transporte de redo, standby file management, janela de flashback, undo sem autoextend e tablespace padrao apontando para SYSTEM.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_ha.txt",
+      "analyzer": "conformidade",
+      "subtitle": "RECUPERABILIDADE E HA",
+      "optional": true,
+      "recommendation": "STANDBY_FILE_MANAGEMENT=MANUAL para o apply no primeiro datafile novo - trate como critico onde ha Data Guard. Temporaria padrao em SYSTEM e undo sem autoextend derrubam a carga em pico, nao no failover.",
+      "references": [
+        "Oracle MAA Best Practices - Redo Transport e Data Guard",
+        "Oracle Administrator's Guide - Managing Undo / Temporary Tablespaces"
+      ],
+      "sql": "SELECT LOWER(name) AS item, CAST(SUBSTR(NVL(value,'(nulo)'),1,60) AS VARCHAR2(60)) AS valor FROM v$parameter WHERE name IN ('standby_file_management','log_archive_config','archive_lag_target','log_archive_max_processes','db_flashback_retention_target') UNION ALL SELECT 'standby_configurado', CAST(NVL2((SELECT MAX(dest_id) FROM v$archive_dest WHERE target='STANDBY' AND destination IS NOT NULL),'SIM','NAO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'flashback_on', CAST(flashback_on AS VARCHAR2(60)) FROM v$database UNION ALL SELECT 'undo_autoextend', CAST(NVL((SELECT CASE WHEN MIN(autoextensible)='YES' THEN 'SIM' ELSE 'NAO' END FROM dba_data_files WHERE tablespace_name=(SELECT UPPER(value) FROM v$parameter WHERE name='undo_tablespace')),'DESCONHECIDO') AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'default_temp_tablespace', CAST(SUBSTR(NVL((SELECT property_value FROM database_properties WHERE property_name='DEFAULT_TEMP_TABLESPACE'),'(nulo)'),1,60) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'default_permanent_tablespace', CAST(SUBSTR(NVL((SELECT property_value FROM database_properties WHERE property_name='DEFAULT_PERMANENT_TABLESPACE'),'(nulo)'),1,60) AS VARCHAR2(60)) FROM dual"
+    },
+    {
+      "id": "bp_seguranca",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Seguranca e conformidade x recomendado",
+      "purpose": "Conta com senha default de instalacao, profile que nunca expira senha nem trava tentativa, pacotes de rede/arquivo liberados a PUBLIC e auditoria de SYSDBA desligada: o que a auditoria interna encontra antes do DBA.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_seguranca.txt",
+      "analyzer": "conformidade",
+      "subtitle": "SEGURANCA E CONFORMIDADE",
+      "optional": true,
+      "recommendation": "Senha default em conta aberta e o unico item para tratar hoje - o resto entra em plano de hardening. Revogar grant de PUBLIC exige teste: aplicacao antiga costuma depender dele.",
+      "references": [
+        "Oracle Database Security Guide - Default Passwords / Unified Auditing",
+        "CIS Oracle Database Benchmark"
+      ],
+      "sql": "SELECT 'contas_senha_default' AS item, CAST(TO_CHAR((SELECT COUNT(*) FROM dba_users_with_defpwd d JOIN dba_users u ON u.username = d.username WHERE u.account_status='OPEN')) AS VARCHAR2(60)) AS valor FROM dual UNION ALL SELECT 'profiles_senha_sem_expiracao', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_profiles WHERE resource_name='PASSWORD_LIFE_TIME' AND limit='UNLIMITED')) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'profiles_sem_limite_de_tentativas', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_profiles WHERE resource_name='FAILED_LOGIN_ATTEMPTS' AND limit='UNLIMITED')) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'grants_perigosos_a_public', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_tab_privs WHERE grantee='PUBLIC' AND privilege='EXECUTE' AND table_name IN ('UTL_FILE','UTL_TCP','UTL_HTTP','UTL_SMTP','UTL_INADDR'))) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'usuarios_com_role_dba', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_role_privs WHERE granted_role='DBA' AND grantee NOT IN ('SYS','SYSTEM'))) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'audit_sys_operations', CAST(SUBSTR(NVL((SELECT value FROM v$parameter WHERE name='audit_sys_operations'),'DESCONHECIDO'),1,60) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'unified_auditing', CAST(NVL((SELECT value FROM v$option WHERE parameter='Unified Auditing'),'N/A') AS VARCHAR2(60)) FROM dual"
+    },
+    {
+      "id": "bp_estrutura",
+      "category": "conformidade",
+      "requires_pack": "NONE",
+      "title": "Estrutura e contencao x recomendado",
+      "purpose": "Heranca de modelagem que vira contencao: objeto de aplicacao dentro de SYSTEM/SYSAUX, tablespace dictionary-managed ou sem ASSM e sequence sem cache (row cache lock em RAC).",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "bp_estrutura.txt",
+      "analyzer": "conformidade",
+      "subtitle": "ESTRUTURA E CONTENCAO",
+      "optional": true,
+      "recommendation": "Objeto de usuario em SYSTEM e o mais urgente: quando SYSTEM enche, para o banco inteiro. Sequence sem cache e correcao online e barata, e costuma explicar contencao que ninguem atribuia ao dicionario.",
+      "references": [
+        "Oracle Administrator's Guide - SYSTEM/SYSAUX e Locally Managed Tablespaces",
+        "Oracle RAC Administration - Sequence Cache"
+      ],
+      "sql": "SELECT 'objetos_usuario_em_system' AS item, CAST(TO_CHAR((SELECT COUNT(*) FROM dba_segments WHERE tablespace_name='SYSTEM' AND owner NOT IN ('SYS','SYSTEM','OUTLN','DBSNMP','SYSMAN','WMSYS','XDB','CTXSYS','MDSYS','OLAPSYS','EXFSYS','ORDSYS','ORDDATA','APPQOSSYS','AUDSYS','LBACSYS','DVSYS','OJVMSYS','GSMADMIN_INTERNAL','ORACLE_OCM','SI_INFORMTN_SCHEMA','DIP','SYSBACKUP','SYSDG','SYSKM','SYSRAC','GGSYS','MDDATA','REMOTE_SCHEDULER_AGENT'))) AS VARCHAR2(60)) AS valor FROM dual UNION ALL SELECT 'objetos_usuario_em_sysaux', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_segments WHERE tablespace_name='SYSAUX' AND owner NOT IN ('SYS','SYSTEM','OUTLN','DBSNMP','SYSMAN','WMSYS','XDB','CTXSYS','MDSYS','OLAPSYS','EXFSYS','ORDSYS','ORDDATA','APPQOSSYS','AUDSYS','LBACSYS','DVSYS','OJVMSYS','GSMADMIN_INTERNAL','ORACLE_OCM','SI_INFORMTN_SCHEMA','DIP','SYSBACKUP','SYSDG','SYSKM','SYSRAC','GGSYS','MDDATA','REMOTE_SCHEDULER_AGENT'))) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'tablespaces_dictionary_managed', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_tablespaces WHERE extent_management='DICTIONARY')) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'tablespaces_sem_assm', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_tablespaces WHERE contents='PERMANENT' AND segment_space_management='MANUAL' AND tablespace_name NOT IN ('SYSTEM','SYSAUX'))) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'sequences_nocache', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_sequences WHERE cache_size=0 AND sequence_owner NOT IN ('SYS','SYSTEM','OUTLN','DBSNMP','SYSMAN','WMSYS','XDB','CTXSYS','MDSYS','OLAPSYS','EXFSYS','ORDSYS','ORDDATA','APPQOSSYS','AUDSYS','LBACSYS','DVSYS','OJVMSYS','GSMADMIN_INTERNAL','ORACLE_OCM','DIP'))) AS VARCHAR2(60)) FROM dual UNION ALL SELECT 'sequences_cache_baixo', CAST(TO_CHAR((SELECT COUNT(*) FROM dba_sequences WHERE cache_size BETWEEN 1 AND 19 AND sequence_owner NOT IN ('SYS','SYSTEM','OUTLN','DBSNMP','SYSMAN','WMSYS','XDB','CTXSYS','MDSYS','OLAPSYS','EXFSYS','ORDSYS','ORDDATA','APPQOSSYS','AUDSYS','LBACSYS','DVSYS','OJVMSYS','GSMADMIN_INTERNAL','ORACLE_OCM','DIP'))) AS VARCHAR2(60)) FROM dual"
+    },
+    {
+      "id": "scheduler_failures",
+      "category": "jobs",
+      "requires_pack": "NONE",
+      "title": "Jobs do scheduler falhando (7 dias)",
+      "purpose": "Job de coleta de estatistica ou de purga falhando em silencio e causa raiz classica de degradacao lenta.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "jobs.txt",
+      "analyzer": "operacao",
+      "subtitle": "JOBS COM FALHA (7 dias)",
+      "optional": true,
+      "thresholds": {
+        "falhas": {
+          "warn": 1,
+          "crit": 10
+        }
+      },
+      "recommendation": "Veja ADDITIONAL_INFO do job para o erro real. Job de AUTOTASK falhando (gather stats, space advisor) explica plano ruim e espaco nao liberado - trate antes de investigar o SQL.",
+      "references": [
+        "Oracle Administrator's Guide - Scheduler",
+        "Oracle Reference - DBA_SCHEDULER_JOB_RUN_DETAILS"
+      ],
+      "sql": "SELECT owner, job_name, status, COUNT(*) AS falhas, TO_CHAR(MAX(log_date),'YYYY-MM-DD HH24:MI') AS ultima, SUBSTR(MAX(additional_info),1,60) AS erro FROM dba_scheduler_job_run_details WHERE log_date > SYSDATE-7 AND status <> 'SUCCEEDED' GROUP BY owner, job_name, status ORDER BY falhas DESC"
+    },
+    {
+      "id": "undo_errors",
+      "category": "space",
+      "requires_pack": "NONE",
+      "title": "ORA-01555 e falta de espaco em undo",
+      "purpose": "Conta os erros de snapshot too old e de falta de espaco em undo direto do v$undostat, em vez de esperar o usuario reclamar.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "undo_errors.txt",
+      "analyzer": "operacao",
+      "subtitle": "UNDO: ORA-01555 E ESPACO",
+      "optional": true,
+      "thresholds": {
+        "ora_01555": {
+          "warn": 1,
+          "crit": 5
+        }
+      },
+      "recommendation": "ORA-01555 recorrente: compare a maior consulta (maxquerylen) com o UNDO_RETENTION efetivo (tuned_undoretention). Aumentar a tablespace de undo so resolve se a retencao estiver limitada por espaco; senao, o caminho e reduzir a duracao da consulta.",
+      "references": [
+        "Oracle Administrator's Guide - Managing Undo",
+        "MOS 1004510.6 - ORA-01555 Snapshot Too Old"
+      ],
+      "sql": "SELECT SUM(ssolderrcnt) AS ora_01555, SUM(nospaceerrcnt) AS sem_espaco, MAX(maxquerylen) AS maior_query_seg, MAX(tuned_undoretention) AS retencao_efetiva_seg FROM v$undostat WHERE begin_time > SYSDATE-1"
+    },
+    {
+      "id": "host_osstat",
+      "category": "infra",
+      "requires_pack": "NONE",
+      "title": "Recursos do host (CPU e memoria)",
+      "purpose": "Saturacao de host (USE): sem isso o diagnostico enxerga o banco por dentro e ignora que a maquina esta sem CPU ou em swap.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "osstat.txt",
+      "analyzer": "operacao",
+      "subtitle": "RECURSOS DO HOST",
+      "optional": true,
+      "thresholds": {
+        "load_por_cpu": {
+          "warn": 1.0,
+          "crit": 2.0
+        },
+        "memoria_livre_pct": {
+          "warn": 10.0,
+          "crit": 5.0
+        }
+      },
+      "recommendation": "Load por CPU acima de 1 significa fila de execucao: o banco espera CPU e todo tempo de resposta piora junto. Antes de tunar SQL, confirme se ha outro consumidor no host (outra instancia, backup, agente).",
+      "references": [
+        "Brendan Gregg - USE Method",
+        "Oracle Reference - V$OSSTAT"
+      ],
+      "sql": "SELECT inst_id, stat_name, value FROM gv$osstat WHERE stat_name IN ('NUM_CPUS','NUM_CPU_CORES','LOAD','PHYSICAL_MEMORY_BYTES','FREE_MEMORY_BYTES','VM_IN_BYTES','VM_OUT_BYTES') ORDER BY inst_id, stat_name"
+    },
+    {
+      "id": "parse_atividade",
+      "category": "config",
+      "requires_pack": "NONE",
+      "title": "Parse: hard x total (desde o startup)",
+      "purpose": "Hard parse em excesso queima CPU e latch de shared pool, e e a causa que antecede o ORA-04031. O framework tinha o erro no dicionario mas nada que o previsse.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "parse.txt",
+      "analyzer": "contencao",
+      "subtitle": "PARSE (ACUMULADO DESDE O STARTUP)",
+      "optional": true,
+      "thresholds": {
+        "hard_parse_pct": {
+          "warn": 10.0,
+          "crit": 25.0
+        }
+      },
+      "recommendation": "Hard parse alto quase sempre e SQL com literal em vez de bind. Confirme no check de literais (literais.txt) antes de mexer em SHARED_POOL_SIZE: aumentar o pool acomoda o desperdicio, nao o corrige.",
+      "references": [
+        "Oracle Database Performance Tuning Guide - Shared Pool",
+        "Oracle Reference - V$SYSSTAT"
+      ],
+      "sql": "SELECT inst_id, name AS estatistica, value AS valor FROM gv$sysstat WHERE name IN ('parse count (total)','parse count (hard)','parse count (failures)','execute count','session cursor cache hits') ORDER BY inst_id, name"
+    },
+    {
+      "id": "shared_pool_free",
+      "category": "config",
+      "requires_pack": "NONE",
+      "title": "Shared pool: memoria livre",
+      "purpose": "Contexto para o ORA-04031. Serve para qualificar o hard parse, NAO como alarme isolado: shared pool com pouca memoria livre e o estado normal de um banco em uso.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "parse.txt",
+      "analyzer": "contencao",
+      "subtitle": "SHARED POOL LIVRE",
+      "optional": true,
+      "thresholds": {
+        "livre_pct": {
+          "warn": 1.0
+        }
+      },
+      "recommendation": "Nao dimensione o shared pool por este numero sozinho. Livre perto de zero COM hard parse alto e fragmentacao por literal; livre perto de zero com parse saudavel costuma ser apenas cache quente.",
+      "references": [
+        "Oracle Reference - V$SGASTAT",
+        "MOS Doc ID 396940.1 - Troubleshooting ORA-04031"
+      ],
+      "sql": "SELECT inst_id, ROUND(SUM(bytes)/1048576,1) AS total_mb, ROUND(SUM(CASE WHEN name='free memory' THEN bytes ELSE 0 END)/1048576,1) AS livre_mb, ROUND(100*SUM(CASE WHEN name='free memory' THEN bytes ELSE 0 END)/SUM(bytes),1) AS livre_pct FROM gv$sgastat WHERE pool = 'shared pool' GROUP BY inst_id ORDER BY inst_id"
+    },
+    {
+      "id": "sql_literais",
+      "category": "sql",
+      "requires_pack": "NONE",
+      "title": "SQL repetido por literal (sem bind)",
+      "purpose": "Agrupa cursores por FORCE_MATCHING_SIGNATURE: muitas versoes do MESMO texto so mudando o literal e a origem concreta do hard parse e do entupimento do shared pool.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "literais.txt",
+      "analyzer": "contencao",
+      "subtitle": "SQL SEM BIND (AGRUPADO POR ASSINATURA)",
+      "optional": true,
+      "thresholds": {
+        "versoes": {
+          "warn": 50.0,
+          "crit": 200.0
+        }
+      },
+      "recommendation": "A correcao e na aplicacao (bind variable). CURSOR_SHARING=FORCE e paliativo com efeito colateral em plano - use como medida temporaria e declarada, nunca como solucao final.",
+      "references": [
+        "Oracle Database Performance Tuning Guide - Sharing Cursors",
+        "Oracle Reference - V$SQL.FORCE_MATCHING_SIGNATURE"
+      ],
+      "sql": "SELECT * FROM (SELECT force_matching_signature AS assinatura, COUNT(*) AS versoes, SUM(executions) AS execucoes, ROUND(SUM(sharable_mem)/1048576,1) AS mb_shared_pool, MAX(SUBSTR(REPLACE(REPLACE(sql_text,CHR(10),' '),CHR(13),' '),1,60)) AS exemplo FROM gv$sql WHERE force_matching_signature > 0 AND parsing_schema_name NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN') GROUP BY force_matching_signature HAVING COUNT(*) > 20 ORDER BY COUNT(*) DESC) WHERE ROWNUM <= 15"
+    },
+    {
+      "id": "redo_waits",
+      "category": "waits",
+      "requires_pack": "NONE",
+      "title": "Esperas de redo (log file sync e afins)",
+      "purpose": "Traduz 'commit lento' em numero. 'log file switch (checkpoint incomplete)' e prova de redo pequeno para a carga; 'log file sync' alto e latencia de commit sentida pela aplicacao.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "redo_waits.txt",
+      "analyzer": "contencao",
+      "subtitle": "ESPERAS DE REDO",
+      "optional": true,
+      "thresholds": {
+        "log_file_sync_ms": {
+          "warn": 10.0,
+          "crit": 20.0
+        }
+      },
+      "recommendation": "Compare 'log file sync' com 'log file parallel write': se o parallel write e baixo e o sync e alto, o gargalo nao e o disco de redo, e commit demais (loop com commit por linha) ou CPU do LGWR.",
+      "references": [
+        "Oracle Reference - V$SYSTEM_EVENT",
+        "MOS Doc ID 34592.1 - WAITEVENT log file sync"
+      ],
+      "sql": "SELECT inst_id, event, total_waits, ROUND(time_waited_micro/1000000,1) AS segundos, ROUND(time_waited_micro/DECODE(total_waits,0,1,total_waits)/1000,2) AS ms_medio FROM gv$system_event WHERE event IN ('log file sync','log file parallel write','log file switch completion','log file switch (checkpoint incomplete)','log file switch (archiving needed)','log buffer space') ORDER BY inst_id, time_waited_micro DESC"
+    },
+    {
+      "id": "deadlocks",
+      "category": "sessions",
+      "requires_pack": "NONE",
+      "title": "Deadlocks (ORA-00060, 7 dias)",
+      "purpose": "O analisador de locks ve o bloqueio ao vivo; deadlock ja resolvido pelo Oracle so deixa rastro no alert log. Sem este check ele nunca aparece como achado - vira 'a aplicacao deu erro estranho'.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "deadlocks.txt",
+      "analyzer": "contencao",
+      "subtitle": "DEADLOCKS (ORA-00060)",
+      "optional": true,
+      "thresholds": {
+        "ocorrencias": {
+          "warn": 1.0,
+          "crit": 5.0
+        }
+      },
+      "recommendation": "Deadlock e defeito de ordem de acesso na aplicacao, nao do banco. O trace citado na mensagem tem as duas sessoes e o SQL de cada lado: e ele que fecha o caso.",
+      "references": [
+        "Oracle Reference - V$DIAG_ALERT_EXT",
+        "MOS Doc ID 62365.1 - Understanding ORA-00060 Deadlock"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(originating_timestamp,'YYYY-MM-DD HH24:MI') AS quando, SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),CHR(13),' ')),1,110) AS mensagem FROM v$diag_alert_ext WHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(7,'DAY') AND message_text LIKE '%ORA-00060%' ORDER BY originating_timestamp DESC) WHERE ROWNUM <= 20"
+    },
+    {
+      "id": "archive_rate",
+      "category": "recuperabilidade",
+      "requires_pack": "NONE",
+      "title": "Taxa de archive por hora (24h)",
+      "purpose": "Volume de archive por hora dimensiona FRA, janela de backup e banda do Data Guard. Rajada e o que enche FRA de madrugada e para o banco com ORA-00257.",
+      "read_only": true,
+      "min_privs": [
+        "SELECT_CATALOG_ROLE"
+      ],
+      "output_file": "archive_rate.txt",
+      "analyzer": "contencao",
+      "subtitle": "ARCHIVE POR HORA (24h)",
+      "optional": true,
+      "thresholds": {
+        "pico_sobre_mediana": {
+          "warn": 3.0
+        }
+      },
+      "recommendation": "Dimensione FRA e banda do standby pelo PICO, nao pela media: e na hora do pico que o destino enche. Rajada isolada costuma ser carga em lote, reorg ou rebuild de indice.",
+      "references": [
+        "Oracle Reference - V$ARCHIVED_LOG",
+        "Oracle MAA - Redo Transport Best Practices"
+      ],
+      "sql": "SELECT * FROM (SELECT TO_CHAR(completion_time,'YYYY-MM-DD HH24') AS hora, COUNT(*) AS arquivos, ROUND(SUM(blocks*block_size)/1048576) AS mb FROM v$archived_log WHERE completion_time > SYSDATE-1 AND dest_id = (SELECT MIN(dest_id) FROM v$archived_log WHERE completion_time > SYSDATE-1) GROUP BY TO_CHAR(completion_time,'YYYY-MM-DD HH24') ORDER BY hora DESC) WHERE ROWNUM <= 26"
+    }
+  ]
+}

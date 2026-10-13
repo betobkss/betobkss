@@ -1,0 +1,113 @@
+{
+  "id": "redis_latencia",
+  "plataforma": "redis",
+  "ordem": 52,
+  "titulo": "Redis: latencia, memoria e evicao",
+  "quando_usar": "Aplicacao reclamando de lentidao no cache, timeout no cliente Redis, OOM command not allowed, chave que 'sumiu' antes da hora, ou uso de memoria proximo do maxmemory.",
+  "tags": [
+    "redis",
+    "cache",
+    "latencia",
+    "timeout",
+    "slowlog",
+    "maxmemory",
+    "evicao",
+    "eviction",
+    "OOM command not allowed",
+    "keyspace miss",
+    "fork",
+    "rdb",
+    "aof",
+    "swap",
+    "big key",
+    "KEYS",
+    "single thread"
+  ],
+  "sintomas": [
+    "cache lento",
+    "timeout no redis",
+    "OOM command not allowed when used memory > maxmemory",
+    "chave sumiu antes do ttl",
+    "redis usando toda a memoria",
+    "picos de latencia sem carga",
+    "aplicacao caindo no banco em vez do cache"
+  ],
+  "secoes": [],
+  "fontes": [
+    "Redis Documentation - Diagnosing latency issues (LATENCY DOCTOR / LATENCY LATEST)",
+    "Redis Documentation - Key eviction e maxmemory-policy",
+    "Redis Documentation - Memory optimization e MEMORY DOCTOR",
+    "Redis Documentation - Persistence: fork, copy-on-write e o custo do RDB/AOF rewrite"
+  ],
+  "nota": "A regra que explica quase todo incidente de Redis: ele executa comandos em UMA unica thread. Nao existe 'consulta lenta que afeta so quem a rodou' - um comando de 200ms para o servidor inteiro por 200ms, e todos os outros clientes veem isso como latencia. Por isso a investigacao aqui nao comeca por recurso (CPU, memoria) e sim por COMANDO: o slowlog e a primeira parada, nao a ultima. Os dois causadores classicos sao o KEYS em producao e a manipulacao de uma chave gigante; o terceiro, menos obvio, e o fork do snapshot em maquina com pouca memoria livre.",
+  "verificado": {
+    "nivel": "estrutura",
+    "observacao": "Comandos escritos a partir da documentacao oficial do Redis. NAO executados: esta maquina nao tem redis-cli nem o pacote redis. Confirme a saida exata em um Redis de homologacao antes de confiar nos nomes dos campos."
+  },
+  "passos": [
+    {
+      "titulo": "Retrato geral da instancia",
+      "objetivo": "Em um comando, saber versao, memoria, clientes, evicao e persistencia - antes de formular qualquer hipotese.",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "INFO server\nINFO clients\nINFO memory\nINFO stats\nINFO persistence\nINFO replication",
+      "olhar": "Em memory: used_memory_human contra maxmemory, e principalmente mem_fragmentation_ratio - acima de 1.5 indica fragmentacao, e ABAIXO de 1.0 significa que o sistema operacional esta usando SWAP, que e a pior causa de latencia possivel aqui. Em stats: evicted_keys crescendo confirma evicao ativa, e keyspace_misses alto em relacao a hits significa que o cache parou de servir. Em clients: blocked_clients alto aponta BLPOP/BRPOP acumulando.",
+      "armadilha": "used_memory e o que o Redis acha que usa; used_memory_rss e o que o sistema operacional entregou. Dimensionar so pelo primeiro subestima o consumo real - a diferenca e a fragmentacao, e ela e paga em RAM de verdade."
+    },
+    {
+      "titulo": "O comando que parou o servidor",
+      "objetivo": "Como o Redis e single-thread, um comando lento e uma parada global. O slowlog e a evidencia mais direta que existe.",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "CONFIG GET slowlog-log-slower-than\nCONFIG GET slowlog-max-len\nSLOWLOG LEN\nSLOWLOG GET 25",
+      "olhar": "Cada entrada traz id, timestamp, duracao em MICROsegundos e o comando com os argumentos. Procure KEYS, FLUSHALL, SMEMBERS/HGETALL/LRANGE sobre colecao grande, e SORT. Compare o timestamp com a hora do incidente relatado pela aplicacao - se casar, a investigacao acabou. slowlog-log-slower-than em 10000 (10ms) e o padrao; se estiver muito alto, o slowlog esta vazio por configuracao e nao por ausencia de problema.",
+      "armadilha": "O slowlog e um buffer circular EM MEMORIA, limitado por slowlog-max-len (128 por padrao) e perdido no restart. Num servidor movimentado ele gira em minutos: slowlog vazio nao prova que nao houve comando lento, prova que voce chegou tarde."
+    },
+    {
+      "titulo": "Latencia medida pelo proprio Redis",
+      "objetivo": "Separar latencia causada por comando de latencia causada pelo ambiente (fork, swap, disco).",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "CONFIG GET latency-monitor-threshold\nLATENCY LATEST\nLATENCY HISTORY command\nLATENCY DOCTOR",
+      "olhar": "LATENCY LATEST lista os eventos por tipo: 'command' aponta comando lento (volte ao passo 2); 'fork' aponta o custo de criar o snapshot; 'expire-cycle' aponta expiracao em massa. O LATENCY DOCTOR e o unico comando de diagnostico do Redis que ja devolve o texto interpretado - leia antes de teorizar.",
+      "armadilha": "O monitor de latencia vem DESLIGADO por padrao (latency-monitor-threshold = 0) e, desligado, LATENCY LATEST devolve vazio - que parece 'sem problema de latencia'. Se o valor for 0, voce nao tem medicao nenhuma; ligar exige CONFIG SET, que e mudanca e nao leitura."
+    },
+    {
+      "titulo": "Memoria: quem ocupa e o que esta sendo evictado",
+      "objetivo": "Achar a chave ou o padrao de chave que domina a memoria, e entender a politica de evicao em vigor.",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "CONFIG GET maxmemory\nCONFIG GET maxmemory-policy\nMEMORY DOCTOR\nMEMORY STATS\nINFO keyspace",
+      "olhar": "maxmemory em 0 significa SEM LIMITE: o Redis vai crescer ate o sistema operacional matar o processo, e nao ha evicao nenhuma. maxmemory-policy = noeviction e o que produz 'OOM command not allowed' - o Redis recusa escrita em vez de descartar chave, o que e correto para fila e desastroso para cache. Em INFO keyspace, compare a contagem de chaves com 'expires': banco com muitas chaves e poucos expires costuma ser cache sem TTL, que so cresce.",
+      "armadilha": "Nunca rode KEYS * para descobrir o que ocupa memoria: ele percorre todo o keyspace numa thread unica e para o servidor pelo tempo todo da varredura - milhoes de chaves significam segundos de indisponibilidade. O substituto e SCAN, que pagina; e para achar chave grande existe o redis-cli --bigkeys e o --memkeys, que usam SCAN por baixo."
+    },
+    {
+      "titulo": "Fork e persistencia: a latencia que nao vem de comando",
+      "objetivo": "Descartar (ou confirmar) o snapshot como causa - e a explicacao tipica de pico periodico sem carga correspondente.",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "INFO persistence\nLATENCY HISTORY fork",
+      "olhar": "Em persistence: rdb_last_fork_usec e quanto o ultimo fork custou - dezenas de milissegundos sao normais, centenas ja param o servidor de forma perceptivel. rdb_changes_since_last_save muito alto com rdb_bgsave_in_progress=0 indica snapshot nao acontecendo. aof_rewrite_in_progress=1 durante o incidente explica IO e latencia. Picos REGULARES, sempre no mesmo intervalo, quase sempre sao o save periodico.",
+      "armadilha": "O fork copia a tabela de paginas do processo, entao o custo cresce com a memoria usada, nao com a quantidade de dados alterados. Uma instancia de 40 GB paga fork caro mesmo com pouca escrita - e em maquina com pouca RAM livre o copy-on-write durante o snapshot pode dobrar o consumo e levar o kernel a matar o Redis no meio do backup."
+    },
+    {
+      "titulo": "Conexoes e clientes",
+      "objetivo": "Descartar esgotamento de conexao e cliente mal-comportado antes de culpar o servidor.",
+      "risco": "leitura",
+      "onde": "redis",
+      "comando": "CONFIG GET maxclients\nCLIENT LIST\nINFO clients",
+      "olhar": "Em CLIENT LIST, olhe as colunas age (idade da conexao), idle (ocioso) e omem (memoria do buffer de saida daquele cliente). omem alto indica cliente lento que nao consome o que pediu - tipico de SUBSCRIBE mal tratado ou de um comando que devolve colecao gigante. connected_clients perto de maxclients significa recusa de conexao nova, e o erro chega na aplicacao como falha de conexao, nao como lentidao.",
+      "armadilha": "CLIENT LIST em servidor com milhares de conexoes devolve uma saida enorme e, sendo single-thread, o proprio diagnostico adiciona latencia. Em instancia muito carregada prefira INFO clients para o numero e use CLIENT LIST apenas quando precisar do detalhe."
+    },
+    {
+      "titulo": "Ajustar limite ou politica de memoria",
+      "objetivo": "Sair do 'OOM command not allowed' ou parar a evicao indevida.",
+      "risco": "mudanca",
+      "onde": "redis",
+      "comando": "# leia o valor atual antes:\n# CONFIG GET maxmemory\n# CONFIG GET maxmemory-policy\n\n# aplicar (vale imediatamente, NAO persiste sozinho):\n# CONFIG SET maxmemory 8gb\n# CONFIG SET maxmemory-policy allkeys-lru\n\n# so depois de validado, gravar no arquivo de configuracao:\n# CONFIG REWRITE",
+      "antes_de_executar": "1) Decida o que a instancia E: cache pode evictar (allkeys-lru / allkeys-lfu); fila, sessao ou dado unico NAO pode - evictar ali e perda de dado silenciosa, e para esses o certo e noeviction mais aumento de memoria. 2) maxmemory deve deixar folga para o fork do snapshot: reservar ~50% da RAM e a recomendacao classica quando ha persistencia. 3) CONFIG SET vale na hora e some no restart; sem CONFIG REWRITE (ou edicao do redis.conf) o problema volta na proxima manutencao. 4) Em cluster ou replica, aplique em todos os nos - configuracao divergente produz comportamento diferente por no. 5) Registre: CASO.py <caso> --acao 'CONFIG SET maxmemory-policy' --risco medio.",
+      "olhar": "Depois de aplicar, acompanhe evicted_keys e used_memory em INFO. Mudar para uma politica *-lru deve fazer evicted_keys subir e o OOM parar - se as chaves nao tiverem TTL e a politica for volatile-*, nada sera evictado e o OOM CONTINUA, porque nao ha candidato elegivel.",
+      "armadilha": "As politicas volatile-* so consideram chaves COM TTL. Num cache onde ninguem definiu expiracao, volatile-lru se comporta exatamente como noeviction: o Redis recusa escrita mesmo com a politica 'de evicao' configurada. E o erro de configuracao mais comum deste assunto, porque o parametro parece certo."
+    }
+  ]
+}

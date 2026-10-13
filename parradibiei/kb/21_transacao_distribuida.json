@@ -1,0 +1,129 @@
+{
+  "id": "transacao_distribuida",
+  "ordem": 21,
+  "titulo": "Transacao distribuida em duvida (ORA-01591 / 2PC pendente)",
+  "quando_usar": "Sessoes travadas com ORA-01591; DBA_2PC_PENDING com linhas; um DB link caiu no meio de um commit e deixou a transacao 'fantasma' segurando linhas; alert log com ORA-02054.",
+  "tags": [
+    "2pc",
+    "two phase commit",
+    "transacao distribuida",
+    "in-doubt",
+    "dblink",
+    "db link",
+    "ORA-01591",
+    "ORA-02054",
+    "reco",
+    "commit force",
+    "rollback force",
+    "purge_lost_db_entry",
+    "transacao fantasma"
+  ],
+  "sintomas": [
+    "ORA-01591",
+    "lock held by in-doubt distributed transaction",
+    "transacao fantasma",
+    "linha travada sem sessao",
+    "ORA-02054",
+    "distributed transaction pendente",
+    "commit nao volta"
+  ],
+  "secoes": [
+    "Bloqueios no historico (ASH)",
+    "Sessoes e processos",
+    "Erros no Alert Log",
+    "Distribuicao de esperas (ASH)"
+  ],
+  "erros_ora": [
+    "ORA-01591",
+    "ORA-02054",
+    "ORA-02051",
+    "ORA-01578",
+    "ORA-24756"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Managing Distributed Transactions, Manually Overriding In-Doubt Transactions",
+    "Oracle Database Reference - DBA_2PC_PENDING, DBA_2PC_NEIGHBORS",
+    "Oracle Database PL/SQL Packages Reference - DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY"
+  ],
+  "nota": "Este e o playbook mais perigoso da base, e o motivo e simples: a transacao esta EM DUVIDA em DOIS bancos ao mesmo tempo. Se voce forcar COMMIT de um lado e o outro fizer ROLLBACK, os dois bancos ficam com dados diferentes - e ninguem recebe erro. A divergencia so aparece semanas depois, como reclamacao de negocio, sem nenhum rastro que ligue ao incidente. Por isso a ordem correta e: (1) deixar o RECO trabalhar, ele resolve sozinho na maioria dos casos; (2) se precisar forcar, DESCOBRIR o que o outro lado fez e repetir a MESMA decisao; (3) PURGE so quando o outro banco nao existe mais. Forcar sem falar com o outro lado nunca e a opcao segura, mesmo com a aplicacao parada.",
+  "passos": [
+    {
+      "titulo": "Confirmar que ha transacao em duvida",
+      "objetivo": "Ver o que existe pendente, desde quando e em que estado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT local_tran_id, global_tran_id, state, mixed, advice,\n       TO_CHAR(fail_time,'DD/MM/YYYY HH24:MI') AS falhou_em,\n       ROUND(SYSDATE - fail_time, 2) AS dias_pendente,\n       tran_comment, os_user, host, db_user\nFROM dba_2pc_pending\nORDER BY fail_time;",
+      "olhar": "state e a informacao central. 'prepared' = o banco esta esperando a decisao e SEGURANDO os locks (e o que causa ORA-01591). 'collecting'/'committed'/'forced commit'/'forced rollback' contam o que ja aconteceu. Coluna MIXED = 'yes' e o pior cenario: significa que os dois lados JA decidiram diferente - os dados ja divergiram e o caso vira analise de negocio, nao de banco.",
+      "armadilha": "Tabela vazia nao encerra o assunto: se o ORA-01591 continua acontecendo, a pendencia pode estar no OUTRO banco. E atencao a `advice`: quando o commit ja tinha sido decidido, o Oracle escreve ali a acao correta - siga essa recomendacao em vez de escolher por conta propria."
+    },
+    {
+      "titulo": "Descobrir quem e o outro lado",
+      "objetivo": "Voce nao pode decidir sozinho: precisa saber com qual banco falar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT local_tran_id, in_out, database AS banco_remoto,\n       dbuser_owner, interface, dbid, sess#, branch\nFROM dba_2pc_neighbors\nORDER BY local_tran_id;\n\n-- os DB links existentes, para localizar o destino:\nSELECT owner, db_link, username, host, created\nFROM dba_db_links\nORDER BY owner, db_link;",
+      "olhar": "in_out = 'in' significa que ESTE banco e o no filho (quem comandou foi o outro); 'out' significa que a transacao saiu daqui. O coordenador global (quem decide) e a raiz do global_tran_id. A coluna `database` da o nome do banco remoto que voce precisa consultar.",
+      "armadilha": "Nao confunda o dono da transacao com o dono do DB link: a transacao pode ter nascido numa aplicacao que usa um link de outro schema. O que vale para achar o outro lado e a coluna `database` desta view."
+    },
+    {
+      "titulo": "Ver o estrago: quem esta travado por causa dela",
+      "objetivo": "Dimensionar a urgencia. Transacao pendente sem ninguem esperando nao e emergencia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, sid, serial#, username, machine, program,\n       event, seconds_in_wait AS seg, sql_id\nFROM gv$session\nWHERE event LIKE '%in-doubt%'\n   OR event LIKE 'enq: TX%'\n   OR blocking_session IS NOT NULL\nORDER BY seconds_in_wait DESC FETCH FIRST 20 ROWS ONLY;\n\n-- a transacao pendente ainda ocupa undo?\nSELECT inst_id, xidusn, xidslot, xidsqn, status, used_urec, used_ublk\nFROM gv$transaction\nORDER BY used_urec DESC;",
+      "olhar": "Sessoes com espera longa e evento de in-doubt confirmam o impacto em producao. Se ninguem esta esperando, voce tem tempo para fazer o certo: falar com o outro lado antes de forcar qualquer coisa.",
+      "armadilha": "A pressa aqui e o que causa a divergencia de dados. Aplicacao parada gera pressao para 'resolver agora', e forcar a decisao errada cria um problema silencioso e muito pior que a indisponibilidade."
+    },
+    {
+      "titulo": "Conferir se o RECO esta ativo e trabalhando",
+      "objetivo": "O Oracle tem um processo que resolve isso sozinho. Na maioria dos casos, a acao certa e nao fazer nada.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, name, description\nFROM gv$bgprocess\nWHERE name = 'RECO' AND paddr <> '00';\n\nSELECT name, value FROM v$parameter\nWHERE name IN ('distributed_lock_timeout','open_links','global_names',\n               'commit_point_strength');\n\n-- o RECO registra as tentativas no alert log; veja tambem:\nSELECT local_tran_id, state,\n       TO_CHAR(retry_time,'DD/MM/YYYY HH24:MI') AS ultima_tentativa,\n       TO_CHAR(fail_time,'DD/MM/YYYY HH24:MI')  AS falhou_em\nFROM dba_2pc_pending\nORDER BY retry_time;",
+      "olhar": "Se o RECO aparece na primeira consulta, ele esta vivo e tentando. retry_time avancando mostra que ele esta trabalhando: a rede ou o banco remoto e que ainda nao voltaram. Restabelecida a comunicacao, ele fecha tudo sozinho, sem risco de divergencia.",
+      "armadilha": "A causa raiz costuma estar FORA do banco: link de rede caido, banco remoto parado, listener fora do ar. Resolver a conectividade e a solucao correta e SEM risco - forcar a decisao e sempre a segunda melhor opcao."
+    },
+    {
+      "titulo": "Perguntar ao outro lado o que ele decidiu",
+      "objetivo": "Este e o passo que evita corromper o negocio: repetir a decisao do coordenador, em vez de inventar uma.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- EXECUTE NO BANCO REMOTO (o da coluna `database` do passo 2),\n-- procurando o MESMO global_tran_id:\nSELECT local_tran_id, global_tran_id, state, mixed, advice,\n       TO_CHAR(fail_time,'DD/MM/YYYY HH24:MI') AS falhou_em\nFROM dba_2pc_pending\nWHERE global_tran_id = '&global_tran_id';\n\n-- se la nao ha registro, a transacao ja foi concluida do outro lado:\n-- procure no historico da aplicacao/negocio se o dado FOI ou NAO gravado.",
+      "olhar": "Se o outro lado esta 'committed' ou 'forced commit', a sua decisao TEM de ser commit. Se esta 'forced rollback', a sua e rollback. Se o registro nao existe mais e o dado aparece gravado la, trate como commit.",
+      "armadilha": "'O outro lado nao tem mais o registro' NAO significa 'pode escolher'. Significa que ele ja concluiu e voce precisa descobrir COMO - conferindo o dado na tabela de negocio. Escolher no chute e exatamente o que produz a divergencia silenciosa."
+    },
+    {
+      "titulo": "Forcar a mesma decisao do coordenador",
+      "objetivo": "Liberar os locks repetindo a decisao que o outro lado ja tomou.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) So execute com a decisao do outro lado CONFIRMADA (passo 5). Sem isso, voce esta apostando a integridade de dois bancos numa moeda. 2) Registre no caso: global_tran_id, o que o outro lado decidiu, quem confirmou e quando. 3) Envolva o dono da aplicacao: ele precisa saber que aquela transacao foi concluida a mao, para conferir o dado depois. 4) Exige privilegio FORCE TRANSACTION (ou FORCE ANY TRANSACTION para transacao de outro usuario). 5) Nao rode em lote sobre varias transacoes: uma a uma, cada uma com sua confirmacao. 6) Se MIXED='yes', PARE - ja ha divergencia e o caso e de analise, nao de comando.",
+      "comando": "-- gera o comando para revisao (nao executa nada):\nSELECT 'COMMIT FORCE ''' || local_tran_id || ''';'   AS se_o_outro_lado_commitou,\n       'ROLLBACK FORCE ''' || local_tran_id || ''';' AS se_o_outro_lado_desfez,\n       state, mixed, advice\nFROM dba_2pc_pending\nWHERE state = 'prepared';\n\n-- execute APENAS a linha correspondente a decisao confirmada, por exemplo:\n-- COMMIT FORCE '1.23.4567';",
+      "olhar": "Depois de executar, o state em DBA_2PC_PENDING muda para 'forced commit' ou 'forced rollback' e os locks sao liberados na hora - as sessoes com ORA-01591 voltam a andar imediatamente.",
+      "armadilha": "A linha NAO some de DBA_2PC_PENDING depois do force, e isso e proposital: ela fica ali para o RECO reconciliar com o outro lado quando a comunicacao voltar. Se o RECO detectar que as decisoes foram diferentes, MIXED vira 'yes' - e esse e o alarme de que os dados divergiram. Nao apague a linha para 'limpar': voce estaria apagando justamente o detector."
+    },
+    {
+      "titulo": "Limpar a entrada orfa (so quando o outro banco nao existe mais)",
+      "objetivo": "Remover o registro local de uma transacao cujo par nunca mais vai responder.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) Este comando ELIMINA a possibilidade de reconciliacao automatica: o RECO nunca mais vai comparar sua decisao com a do outro lado, e uma eventual divergencia deixa de ser detectavel. 2) So use quando o banco remoto foi DESATIVADO/DESCOMISSIONADO de forma definitiva, ou o Suporte Oracle instruiu. Banco remoto 'temporariamente fora' NAO se enquadra - espere ele voltar. 3) Confirme antes que o state ja e 'forced commit'/'forced rollback' (a decisao ja foi tomada) e nao 'prepared'. 4) Confirme com o dono do dado que a transacao pode ser considerada encerrada. 5) Registre no caso a justificativa e quem autorizou. 6) Backup do banco em dia antes de mexer.",
+      "comando": "-- gera o comando para revisao (nao executa nada):\nSELECT 'EXECUTE DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY(''' ||\n       local_tran_id || ''');' AS comando_gerado,\n       state, mixed,\n       TO_CHAR(fail_time,'DD/MM/YYYY HH24:MI') AS falhou_em\nFROM dba_2pc_pending\nORDER BY fail_time;\n\n-- executar SOMENTE a linha analisada e autorizada, por exemplo:\n-- EXECUTE DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY('1.23.4567');",
+      "olhar": "A linha desaparece de DBA_2PC_PENDING. Confirme que sumiu apenas a pretendida e que nenhuma sessao ficou presa.",
+      "armadilha": "PURGE_LOST_DB_ENTRY nao pergunta nada ao outro banco e nao desfaz nem confirma coisa alguma: so apaga o registro local. Usar isso com o banco remoto apenas indisponivel e o caminho classico para dois bancos ficarem permanentemente diferentes, sem nenhum alerta. Se ha qualquer chance de o remoto voltar, ESPERE - o RECO resolve sozinho e sem risco."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Transacao em duvida e sintoma de instabilidade entre bancos. O que resolve e a causa da queda, nao o force.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- reincidencia: quantas ja aconteceram e com que frequencia\nSELECT TO_CHAR(fail_time,'YYYY-MM') AS mes, COUNT(*) AS pendencias\nFROM dba_2pc_pending\nGROUP BY TO_CHAR(fail_time,'YYYY-MM')\nORDER BY mes;\n\n-- parametros que influenciam o comportamento distribuido\nSELECT name, value, description\nFROM v$parameter\nWHERE name IN ('distributed_lock_timeout','commit_point_strength',\n               'open_links','open_links_per_instance','global_names');",
+      "olhar": "Pendencias recorrentes mes a mes apontam link instavel ou banco remoto que cai com frequencia - e ai o problema e de infraestrutura/arquitetura, nao do DBA de plantao. commit_point_strength define quem decide: o banco mais confiavel (normalmente o que tem o dado mestre) deve ter o valor MAIOR.",
+      "armadilha": "Aplicacao que faz transacao distribuida em cima de link instavel vai reincidir sempre. A conversa util com o time de aplicacao e sobre reduzir o escopo da transacao distribuida ou trocar por integracao assincrona (fila), nao sobre aumentar timeout."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

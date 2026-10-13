@@ -1,0 +1,124 @@
+{
+  "id": "sessoes_locks",
+  "ordem": 2,
+  "titulo": "Sessao travada e bloqueio (lock)",
+  "quando_usar": "Aplicacao reclama que 'travou', update nao termina, fila crescendo. Tambem quando o relatorio aponta bloqueio ou espera da classe Application/Concurrency.",
+  "tags": [
+    "lock",
+    "bloqueio",
+    "sessao",
+    "kill",
+    "enqueue",
+    "TX",
+    "row lock",
+    "deadlock",
+    "ORA-00060",
+    "abraco mortal"
+  ],
+  "sintomas": [
+    "aplicacao travada",
+    "update nao termina",
+    "enq: TX - row lock contention",
+    "sessao pendurada",
+    "deadlock",
+    "transaction was deadlocked",
+    "sessoes se bloqueando em ciclo"
+  ],
+  "erros_ora": [
+    "ORA-00060",
+    "ORA-02049"
+  ],
+  "secoes": [
+    "Locks",
+    "Bloqueio",
+    "Bloqueios",
+    "Sessoes",
+    "Distribuicao de esperas",
+    "bloqueadores"
+  ],
+  "fontes": [
+    "Pratica de campo: rotina de lock e kill aplicada inumeras vezes em ambientes diversos",
+    "Oracle Database Reference - GV$SESSION.BLOCKING_SESSION",
+    "Oracle Database Administrator's Guide - Terminating Sessions"
+  ],
+  "nota": "A ordem aqui e deliberada: identificar o bloqueador, entender O QUE ele faz e so entao decidir. Matar sessao e o ultimo passo, nao o primeiro - e quase sempre trata o sintoma, nao a causa.",
+  "passos": [
+    {
+      "titulo": "Ver quem espera e ha quanto tempo",
+      "objetivo": "Separar 'lento' de 'bloqueado'. Bloqueio tem vitima e culpado; lentidao nao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, sid, serial#, username, machine, program,\n       blocking_instance, blocking_session, event, seconds_in_wait\nFROM gv$session\nWHERE blocking_session IS NOT NULL\nORDER BY seconds_in_wait DESC;",
+      "olhar": "seconds_in_wait alto e crescente = bloqueio real. Se a lista muda a cada execucao, e concorrencia normal, nao um bloqueador preso.",
+      "armadilha": "Sempre use GV$ (todas as instancias) em RAC. Com V$ voce olha so o seu no e conclui que 'nao tem bloqueio' enquanto o bloqueador esta no outro."
+    },
+    {
+      "titulo": "Achar a raiz da arvore de bloqueio",
+      "objetivo": "O bloqueador de quem voce ve pode estar bloqueado por outro. Matar o intermediario nao resolve nada.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT LEVEL AS nivel, inst_id, sid, serial#, username, status,\n       event, seconds_in_wait, sql_id, module, machine\nFROM gv$session\nSTART WITH blocking_session IS NULL\n  AND sid IN (SELECT blocking_session FROM gv$session\n              WHERE blocking_session IS NOT NULL)\nCONNECT BY PRIOR sid = blocking_session\nORDER SIBLINGS BY seconds_in_wait DESC;",
+      "olhar": "O nivel 1 e a RAIZ: e essa sessao que precisa terminar (ou ser tratada). Conte quantas sessoes dependem dela - e o tamanho do estrago.",
+      "armadilha": "Raiz com status INACTIVE e o caso classico: alguem abriu transacao, nao deu commit e foi almocar. O problema esta na aplicacao (falta de commit/rollback), nao no banco."
+    },
+    {
+      "titulo": "Entender o que a sessao bloqueadora esta fazendo",
+      "objetivo": "Decidir com informacao. Matar um batch financeiro no meio e trocar um problema por outro maior.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username, s.osuser, s.machine,\n       s.program, s.module, s.action, s.status, s.last_call_et/60 AS min_no_estado,\n       TO_CHAR(s.logon_time,'DD/MM HH24:MI') AS logon,\n       s.sql_id, s.prev_sql_id, q.sql_text\nFROM gv$session s\nLEFT JOIN gv$sql q ON q.sql_id = NVL(s.sql_id, s.prev_sql_id)\n                  AND q.inst_id = s.inst_id\nWHERE s.sid = &sid AND s.inst_id = &inst;",
+      "olhar": "prev_sql_id importa quando a sessao esta INACTIVE: mostra o ultimo comando executado, que e o que deixou a transacao aberta.",
+      "armadilha": "Sessao de background ou de replicacao (GoldenGate, Data Guard) nunca deve ser morta. Confira program/module antes."
+    },
+    {
+      "titulo": "Ver o objeto em disputa",
+      "objetivo": "Saber qual tabela esta no meio da briga costuma apontar direto para o processo de negocio culpado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT o.owner, o.object_name, o.object_type, lo.session_id AS sid,\n       s.username, s.machine, DECODE(lo.locked_mode,\n         2,'Row Share',3,'Row Exclusive',4,'Share',\n         5,'Sh/Row Exclusive',6,'Exclusive',TO_CHAR(lo.locked_mode)) AS modo\nFROM gv$locked_object lo\nJOIN dba_objects o ON o.object_id = lo.object_id\nJOIN gv$session s ON s.sid = lo.session_id AND s.inst_id = lo.inst_id\nORDER BY o.owner, o.object_name;",
+      "olhar": "Modo Exclusive numa tabela de cadastro no horario de pico costuma ser DDL ou carga rodando fora de janela.",
+      "armadilha": null
+    },
+    {
+      "titulo": "Tentar o caminho da aplicacao ANTES de matar",
+      "objetivo": "Na maioria dos casos existe uma saida sem violencia: o dono do processo dando commit/rollback, ou o job terminando.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- Ha quanto tempo a transacao esta aberta e quanto undo ela ja gastou:\nSELECT s.inst_id, s.sid, s.serial#, s.username,\n       TO_CHAR(t.start_date,'DD/MM HH24:MI:SS') AS inicio_transacao,\n       ROUND((SYSDATE - t.start_date)*24*60,1) AS min_aberta,\n       t.used_ublk AS blocos_undo, t.used_urec AS registros_undo\nFROM gv$transaction t\nJOIN gv$session s ON s.saddr = t.ses_addr AND s.inst_id = t.inst_id\nORDER BY min_aberta DESC;",
+      "olhar": "used_ublk grande = rollback vai demorar MUITO se voce matar. Esse numero e o argumento tecnico para esperar em vez de matar.",
+      "armadilha": "Matar sessao com transacao grande dispara rollback; o banco pode ficar MAIS lento e o lock so libera no fim do rollback. Voce nao ganha tempo - costuma perder."
+    },
+    {
+      "titulo": "Gerar (sem executar) o comando de kill",
+      "objetivo": "Montar o comando exato, ja com instancia, para revisao antes de rodar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# ||\n       ',@' || s.inst_id || ''' IMMEDIATE;  -- ' || s.username ||\n       ' / ' || s.machine || ' / ' || NVL(s.module,'-') AS comando\nFROM gv$session s\nWHERE s.sid = &sid AND s.inst_id = &inst;",
+      "olhar": "Leia o comentario no fim da linha: confirme usuario, maquina e modulo antes de copiar.",
+      "armadilha": "Gerar em lote (varias sessoes de uma vez) e onde acontecem os acidentes. Revise linha a linha; nunca rode a saida inteira de um SELECT sem ler."
+    },
+    {
+      "titulo": "Matar a sessao bloqueadora",
+      "objetivo": "Liberar o bloqueio quando nao ha caminho pela aplicacao e o impacto de esperar e maior que o de matar.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme que a sessao NAO e background/replicacao. 2) Avise o dono da aplicacao - a transacao sera desfeita. 3) Anote sid/serial#/inst_id/username/module e o SQL que ela rodava (o passo 3 deste playbook). 4) Verifique used_ublk: se for grande, o rollback pode demorar mais que esperar. 5) Registre a acao no caso (CASO.py --acao ... --risco alto).",
+      "comando": "ALTER SYSTEM KILL SESSION '<sid>,<serial#>,@<inst_id>' IMMEDIATE;",
+      "olhar": "Depois, confirme que os esperadores sairam da fila: repita o passo 1. Se surgiu OUTRO bloqueador na mesma tabela, o problema e de desenho da aplicacao.",
+      "armadilha": "IMMEDIATE nao e instantaneo: a sessao vai para KILLED e o rollback roda ate o fim. Se ficar em KILLED por muito tempo, NAO insista - acompanhe o rollback por V$TRANSACTION/V$FAST_START_TRANSACTIONS. Matar o processo no SO (kill -9) com transacao grande pode derrubar a instancia via PMON."
+    },
+    {
+      "titulo": "Fechar a causa, nao o sintoma",
+      "objetivo": "Bloqueio que volta toda semana e problema de aplicacao. Sem esse passo, o playbook vira rotina eterna.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- Reincidencia do bloqueio nos ultimos 7 dias (exige Diagnostics Pack):\nSELECT TO_CHAR(sample_time,'DD/MM HH24') AS hora, blocking_session,\n       COUNT(*) AS amostras\nFROM dba_hist_active_sess_history\nWHERE blocking_session IS NOT NULL\n  AND sample_time > SYSDATE - 7\nGROUP BY TO_CHAR(sample_time,'DD/MM HH24'), blocking_session\nORDER BY amostras DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Concentracao no mesmo horario = job/batch concorrendo com o online. A correcao e de janela ou de commit da aplicacao, nao do DBA matando sessao.",
+      "armadilha": "Sem Diagnostics Pack, use o check de amostragem do framework (session_sampling) em vez de DBA_HIST_*."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

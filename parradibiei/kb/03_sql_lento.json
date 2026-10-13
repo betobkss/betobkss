@@ -1,0 +1,127 @@
+{
+  "id": "sql_lento",
+  "ordem": 3,
+  "titulo": "SQL lento ou que ficou lento (troca de plano)",
+  "quando_usar": "'Ontem rodava em 2 minutos, hoje nao termina'. Ou o relatorio apontou regressao de SQL, troca de plano, ou um SQL dominando o DB time.",
+  "tags": [
+    "sql",
+    "plano",
+    "regressao",
+    "tuning",
+    "otimizador",
+    "estatisticas",
+    "bind"
+  ],
+  "sintomas": [
+    "relatorio demora mais que ontem",
+    "batch estourou a janela",
+    "um SQL dominando o DB time",
+    "plano mudou"
+  ],
+  "secoes": [
+    "SQL",
+    "Regressao",
+    "Top SQL",
+    "Planos",
+    "Estatisticas",
+    "Compare Period",
+    "Carga por modulo",
+    "INDICES UNUSABLE",
+    "Mudancas no ambiente"
+  ],
+  "fontes": [
+    "Oracle SQL Tuning Guide - Query Optimizer, SQL Plan Management",
+    "Carlos Sierra / Mauro Pagano - SQLd360, planx (abordagem de comparar planos)",
+    "Metodo do proprio framework: check compare_period e o SQL Health Check"
+  ],
+  "nota": "Regra de ouro: NAO comece criando indice. Comece descobrindo se o plano mudou. Se mudou, a pergunta e 'por que mudou'; se nao mudou, o problema e volume, contencao ou dado. O atalho automatizado e: DETALHAR_SQL.py <caso> <sql_id> --conn <banco>",
+  "passos": [
+    {
+      "titulo": "Identificar o SQL pelo impacto, nao pela reclamacao",
+      "objetivo": "O SQL que o usuario cita nem sempre e o que consome o banco. Ordene por tempo total, nao por tempo unitario.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT sql_id, plan_hash_value AS phv, executions AS execs,\n       ROUND(elapsed_time/1e6,1) AS seg_total,\n       ROUND(elapsed_time/1e6/NULLIF(executions,0),3) AS seg_por_exec,\n       ROUND(buffer_gets/NULLIF(executions,0)) AS gets_por_exec,\n       parsing_schema_name AS schema,\n       SUBSTR(sql_text,1,80) AS sql\nFROM gv$sql\nWHERE elapsed_time > 1e6\nORDER BY elapsed_time DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "seg_total alto com seg_por_exec baixo = SQL rapido executado milhoes de vezes (problema de arquitetura/loop na aplicacao). O contrario = um SQL pesado (problema de plano/dado).",
+      "armadilha": "gv$sql so mostra o que ainda esta no shared pool. SQL que envelheceu sumiu - use DBA_HIST_SQLSTAT (Diagnostics Pack) para olhar para tras."
+    },
+    {
+      "titulo": "Perguntar a pergunta certa: o plano mudou?",
+      "objetivo": "Este passo decide o resto do playbook. Mais de um plan_hash_value para o mesmo sql_id, com tempos diferentes, e regressao de plano.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT plan_hash_value AS phv,\n       TO_CHAR(MIN(begin_interval_time),'DD/MM HH24:MI') AS visto_de,\n       TO_CHAR(MAX(begin_interval_time),'DD/MM HH24:MI') AS visto_ate,\n       SUM(executions_delta) AS execs,\n       ROUND(SUM(elapsed_time_delta)/1e6/\n             NULLIF(SUM(executions_delta),0),3) AS seg_por_exec\nFROM dba_hist_sqlstat s\nJOIN dba_hist_snapshot n ON n.snap_id = s.snap_id\n                        AND n.instance_number = s.instance_number\nWHERE s.sql_id = '&sql_id'\n  AND n.begin_interval_time > SYSDATE - 14\nGROUP BY plan_hash_value\nORDER BY visto_de;",
+      "olhar": "Se um PHV novo aparece na data em que a lentidao comecou e o seg_por_exec dele e muito maior: achou a causa. Se so existe UM plano, pule para o passo 6 - nao e troca de plano.",
+      "armadilha": "PHV = 0 e bloco PL/SQL ou comando sem plano - nao tente comparar. Exige Diagnostics Pack; sem ele, compare os PHV vivos em gv$sql."
+    },
+    {
+      "titulo": "Ver o plano de execucao (o real, nao o estimado)",
+      "objetivo": "EXPLAIN PLAN mente: ele nao usa os binds reais nem o plano que esta rodando. Pegue o plano do cursor de verdade.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- plano do cursor em memoria:\nSELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('&sql_id', NULL,\n                    'ALLSTATS LAST +PEEKED_BINDS +NOTE'));\n\n-- plano historico (para comparar com o de ontem):\nSELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_AWR('&sql_id', &phv, NULL, 'ADVANCED'));",
+      "olhar": "Compare E-Rows (estimado) com A-Rows (real). Diferenca de ordem de grandeza = o otimizador esta cego, quase sempre por estatistica. Procure tambem NESTED LOOPS onde deveria haver HASH JOIN, e MERGE JOIN CARTESIAN (quase sempre erro).",
+      "armadilha": "ALLSTATS LAST so traz numeros reais se o SQL rodou com STATISTICS_LEVEL=ALL ou hint /*+ GATHER_PLAN_STATISTICS */. Sem isso, as colunas A-Rows vem vazias."
+    },
+    {
+      "titulo": "Checar as estatisticas dos objetos envolvidos",
+      "objetivo": "Causa numero 1 de troca de plano. Estatistica velha ou recem-coletada, ambas mudam plano.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, table_name, num_rows,\n       TO_CHAR(last_analyzed,'DD/MM/YYYY HH24:MI') AS coletada_em,\n       ROUND(SYSDATE - last_analyzed) AS dias,\n       stale_stats, object_type\nFROM dba_tab_statistics\nWHERE (owner, table_name) IN (\n        SELECT object_owner, object_name FROM gv$sql_plan\n        WHERE sql_id = '&sql_id' AND object_type LIKE 'TABLE%')\nORDER BY dias DESC NULLS FIRST;",
+      "olhar": "last_analyzed NULO ou dias muito alto = otimizador chutando. Mas atencao ao inverso: estatistica coletada HOJE, na hora em que a lentidao comecou, e a suspeita mais forte de todas.",
+      "armadilha": "Coletar estatisticas 'para resolver' e a acao mais comum e mais perigosa: pode consertar um SQL e quebrar outros dez. Se a coleta causou a regressao, o caminho e restaurar a estatistica anterior, nao coletar de novo. Nota: DBA_TAB_STATISTICS NAO tem coluna PARTITIONED (essa e de DBA_TABLES) - use OBJECT_TYPE, que distingue TABLE de PARTITION e SUBPARTITION."
+    },
+    {
+      "titulo": "Ver o que mudou no ambiente na data da regressao",
+      "objetivo": "Plano nao muda sozinho. Alguem coletou estatistica, criou/apagou indice, mudou parametro ou o volume dobrou.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- historico de coleta de estatisticas do objeto:\nSELECT table_name, TO_CHAR(stats_update_time,'DD/MM/YYYY HH24:MI') AS quando\nFROM dba_tab_stats_history\nWHERE table_name = '&tabela'\nORDER BY stats_update_time DESC FETCH FIRST 10 ROWS ONLY;\n\n-- parametros de otimizador alterados fora do padrao:\nSELECT name, value, isdefault, ismodified\nFROM v$parameter\nWHERE (name LIKE 'optimizer%' OR name LIKE 'db_file_multiblock%'\n       OR name = 'cursor_sharing')\n  AND (isdefault = 'FALSE' OR ismodified <> 'FALSE');",
+      "olhar": "Casar o horario da coleta de estatistica com o horario em que o PHV novo apareceu fecha o diagnostico com evidencia, nao com opiniao.",
+      "armadilha": "O framework ja faz esse cruzamento sozinho (analisador de correlacao: mudanca -> achado como HIPOTESE). Use-o antes de fazer na mao."
+    },
+    {
+      "titulo": "Se o plano NAO mudou: procurar espera, volume ou bind",
+      "objetivo": "Mesmo plano e mais lento significa que o problema esta fora do otimizador.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- onde este SQL gasta o tempo (perfil de espera):\nSELECT event, wait_class, COUNT(*) AS amostras,\n       ROUND(100*RATIO_TO_REPORT(COUNT(*)) OVER (),1) AS pct\nFROM gv$active_session_history\nWHERE sql_id = '&sql_id' AND sample_time > SYSDATE - 1/24\nGROUP BY event, wait_class ORDER BY amostras DESC;",
+      "olhar": "wait_class 'User I/O' = le mais dado que antes (volume cresceu ou plano faz full scan). 'Concurrency'/'Application' = esta esperando outra sessao, nao e o SQL. 'CPU' com muitos buffer gets = plano ineficiente mesmo sem ter mudado.",
+      "armadilha": "Bind peeking: o mesmo plano pode ser otimo para um valor e pessimo para outro. Veja +PEEKED_BINDS no plano e compare com o bind que a aplicacao esta mandando agora."
+    },
+    {
+      "titulo": "Monitorar a execucao em andamento",
+      "objetivo": "Quando o SQL esta rodando AGORA, o Real-Time SQL Monitoring mostra em que passo do plano ele esta preso.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT DBMS_SQLTUNE.REPORT_SQL_MONITOR(sql_id => '&sql_id',\n         type => 'TEXT', report_level => 'ALL') FROM dual;",
+      "olhar": "A linha do plano com maior 'Activity %' e o gargalo real. Compare Estimated Rows com Actual Rows naquela linha.",
+      "armadilha": "SQL Monitoring exige Tuning Pack e so registra execucoes que passaram de 5s de CPU/IO ou usaram paralelismo."
+    },
+    {
+      "titulo": "Corrigir: restaurar a estatistica anterior",
+      "objetivo": "Quando a evidencia aponta que a coleta de estatisticas causou a regressao, voltar ao estado anterior e a acao mais direta e reversivel.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme pelo passo 5 que a coleta ocorreu junto com o inicio do problema. 2) Confirme a data disponivel em DBA_TAB_STATS_HISTORY (retencao padrao 31 dias). 3) Combine janela: restaurar estatistica INVALIDA os cursores da tabela, entao havera hard parse e um pico curto. 4) Registre a acao no caso (risco medio). 5) Tenha o horario exato para poder refazer o caminho de volta.",
+      "comando": "EXEC DBMS_STATS.RESTORE_TABLE_STATS('<owner>','<tabela>', TO_TIMESTAMP('<DD/MM/YYYY HH24:MI:SS>','DD/MM/YYYY HH24:MI:SS'));",
+      "olhar": "Depois, rode o SQL de novo e confira se voltou ao PHV bom (passo 2). Se o plano voltou mas o tempo nao, a estatistica nao era a causa.",
+      "armadilha": "Se houver job de coleta automatica, ele vai recoletar na proxima janela e a regressao volta. Ou trave as estatisticas (DBMS_STATS.LOCK_TABLE_STATS) ou trate a causa - e registre a decisao, porque estatistica travada esquecida vira problema meses depois."
+    },
+    {
+      "titulo": "Corrigir: fixar o plano bom (SQL Plan Baseline)",
+      "objetivo": "Quando o plano bom existe mas o otimizador insiste no ruim, o SPM prende o comportamento sem tocar na aplicacao.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Tenha certeza de QUAL PHV e o bom (passo 2). 2) Entenda que isto congela o plano: se o dado mudar muito, o plano fixado pode virar o problema no futuro. 3) Combine janela e registre a acao. 4) Anote como remover (DBMS_SPM.DROP_SQL_PLAN_BASELINE) antes de criar. 5) SPM em Enterprise Edition; confirme a edicao.",
+      "comando": "-- carrega o plano BOM (phv conhecido) do cursor cache para a baseline:\nDECLARE n NUMBER;\nBEGIN\n  n := DBMS_SPM.LOAD_PLANS_FROM_CURSOR_CACHE(\n         sql_id => '<sql_id>', plan_hash_value => <phv_bom>);\n  DBMS_OUTPUT.PUT_LINE('planos carregados: ' || n);\nEND;\n/",
+      "olhar": "Confira em DBA_SQL_PLAN_BASELINES que o plano esta ENABLED e ACCEPTED. Rode o SQL e veja no DISPLAY_CURSOR a nota 'SQL plan baseline SQL_PLAN_... used'.",
+      "armadilha": "Carregar o plano ERRADO na baseline prende a lentidao com forca. Confirme o PHV duas vezes. Fixar plano trata o sintoma - continue investigando por que o otimizador errou."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

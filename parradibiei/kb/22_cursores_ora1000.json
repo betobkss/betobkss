@@ -1,0 +1,153 @@
+{
+  "id": "cursores_ora1000",
+  "titulo": "Cursores abertos no limite (ORA-01000) e contencao de cursor",
+  "quando_usar": "A aplicacao recebe ORA-01000 'maximum open cursors exceeded', ou o numero de cursores abertos por sessao cresce sem parar, ou ha espera 'cursor: pin S wait on X' / 'library cache: mutex X' no topo do ASH.",
+  "tags": [
+    "cursor",
+    "cursores",
+    "ORA-01000",
+    "open_cursors",
+    "ORA-01000 maximum open cursors",
+    "cursor leak",
+    "vazamento de cursor",
+    "cursor: pin S wait on X",
+    "mutex",
+    "library cache mutex",
+    "session_cached_cursors",
+    "hard parse",
+    "ORA-04031"
+  ],
+  "sintomas": [
+    "ORA-01000: maximum open cursors exceeded no log da aplicacao",
+    "sessoes com milhares de cursores abertos e que nunca reduzem",
+    "espera 'cursor: pin S wait on X' concentrada em um SQL_ID",
+    "erro aparece sempre no mesmo modulo/servidor de aplicacao",
+    "aumentar open_cursors resolve por alguns dias e o erro volta"
+  ],
+  "secoes": [
+    "Sessoes",
+    "Sessoes e processos",
+    "LIMITES (PROCESSES/SESSIONS)",
+    "Distribuicao de esperas (ASH)",
+    "SGA DYNAMIC COMPONENTS"
+  ],
+  "erros_ora": [
+    "ORA-01000",
+    "ORA-00604",
+    "ORA-04031"
+  ],
+  "fontes": [
+    "Oracle Database Reference 19c - OPEN_CURSORS, SESSION_CACHED_CURSORS",
+    "Oracle Support - ORA-01000 Maximum Open Cursors Exceeded (Doc ID 76684.1)",
+    "Oracle Support - Troubleshooting 'cursor: pin S wait on X' (Doc ID 1349387.1)",
+    "Pratica de campo: roteiro de diagnostico de cursores aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "ORA-01000 quase nunca e problema de banco: e a aplicacao que abre PreparedStatement/cursor e nao fecha. open_cursors e o LIMITE que denuncia o vazamento, nao a causa. Subir o limite compra tempo e some com a evidencia - e no proximo incidente o consumo estara maior ainda. O objetivo deste playbook e sair com o MODULO e o SQL_ID responsaveis identificados, para a conversa com o time de aplicacao ser sobre codigo, nao sobre parametro.",
+  "passos": [
+    {
+      "titulo": "Medir a folga real: pico de cursores contra o limite",
+      "objetivo": "Saber se o banco esta perto do teto ou se o erro veio de uma sessao isolada.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- pico historico de cursores em UMA sessao x limite configurado\nSELECT MAX(a.value)                          AS pico_cursores_por_sessao,\n       TO_NUMBER(p.value)                    AS open_cursors,\n       ROUND(MAX(a.value)/TO_NUMBER(p.value)*100, 1) AS pct_do_limite\nFROM   v$sesstat a, v$statname b, v$parameter p\nWHERE  a.statistic# = b.statistic#\nAND    b.name = 'opened cursors current'\nAND    p.name = 'open_cursors'\nGROUP  BY p.value;",
+      "olhar": "pct_do_limite acima de 80% significa que o proximo pico gera ORA-01000. Se o pico for MUITO menor que o limite (ex.: 200 de 3000), o erro que a aplicacao viu nao foi de cursor do banco - reveja a mensagem, porque ORA-01000 tambem sai quando o driver JDBC tem seu proprio limite.",
+      "armadilha": "'opened cursors current' e o valor de AGORA, sessao por sessao - nao um acumulado do dia. Se o vazamento estourou de madrugada e a sessao ja caiu, esta consulta nao mostra nada. Nesse caso pule para o passo do ASH/AWR, que guarda historico."
+    },
+    {
+      "titulo": "Achar quem esta segurando os cursores",
+      "objetivo": "Identificar sessao, usuario, maquina e programa - o endereco do vazamento.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username, s.status,\n       SUBSTR(s.machine, 1, 30)  AS maquina,\n       SUBSTR(s.program, 1, 30)  AS programa,\n       SUBSTR(s.module,  1, 30)  AS modulo,\n       a.value                   AS cursores_abertos,\n       TO_CHAR(s.logon_time, 'DD/MM HH24:MI') AS conectou_em,\n       ROUND(s.last_call_et/60)  AS min_na_chamada_atual\nFROM   gv$sesstat a, gv$statname b, gv$session s\nWHERE  a.statistic# = b.statistic#\nAND    b.name   = 'opened cursors current'\nAND    a.inst_id = s.inst_id\nAND    a.sid     = s.sid\nAND    a.value   > 100\nORDER  BY a.value DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "MAQUINA e MODULO sao o que vale levar para a aplicacao. Sessao ha horas conectada, com milhares de cursores e last_call_et alto e o retrato classico de pool de conexao que reaproveita a sessao sem fechar o cursor.",
+      "armadilha": "Nao mate a sessao so porque ela lidera a lista. Num pool de conexoes ela e compartilhada por muitas threads da aplicacao, e matar derruba transacoes de usuarios que nada tem a ver com o vazamento."
+    },
+    {
+      "titulo": "Separar vazamento de uso legitimo pela maquina",
+      "objetivo": "Distinguir 'um servidor de aplicacao doente' de 'consumo alto em todos'.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT SUBSTR(s.machine, 1, 35) AS maquina,\n       s.username,\n       COUNT(*)        AS sessoes,\n       SUM(a.value)    AS total_cursores,\n       ROUND(AVG(a.value)) AS media_por_sessao,\n       MAX(a.value)    AS pior_sessao\nFROM   gv$sesstat a, gv$statname b, gv$session s\nWHERE  a.statistic# = b.statistic#\nAND    b.name = 'opened cursors current'\nAND    a.inst_id = s.inst_id\nAND    a.sid     = s.sid\nAND    s.username IS NOT NULL\nGROUP  BY SUBSTR(s.machine, 1, 35), s.username\nORDER  BY total_cursores DESC\nFETCH FIRST 15 ROWS ONLY;",
+      "olhar": "Media por sessao muito diferente entre maquinas com o MESMO usuario aponta uma versao de aplicacao ou um no do balanceador com o defeito. Media parecida e alta em todas indica que o comportamento e do codigo, nao de um servidor.",
+      "armadilha": "MACHINE vem do cliente e pode ser identico para dezenas de containers. Se todos aparecem com o mesmo nome, use PROGRAM e MODULE para diferenciar, ou peca a aplicacao para setar CLIENT_IDENTIFIER."
+    },
+    {
+      "titulo": "Ver quais cursores estao de fato abertos naquela sessao",
+      "objetivo": "Sair do numero para o SQL: o texto repetido milhares de vezes e o vazamento.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- troque 123 pelo SID identificado no passo 2\nSELECT COUNT(*)                       AS vezes_aberto,\n       oc.sql_id,\n       SUBSTR(oc.sql_text, 1, 70)     AS sql_text,\n       oc.cursor_type\nFROM   v$open_cursor oc\nWHERE  oc.sid = 123\nGROUP  BY oc.sql_id, SUBSTR(oc.sql_text, 1, 70), oc.cursor_type\nORDER  BY vezes_aberto DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "O MESMO sql_id aberto centenas de vezes na mesma sessao e a prova do vazamento - um cursor bem usado e aberto, consumido e fechado. Guarde este sql_id e o sql_text: e o que a aplicacao precisa corrigir.",
+      "armadilha": "CURSOR_TYPE = 'SESSION CURSOR CACHED' NAO e vazamento: e o cache de cursor da sessao (session_cached_cursors) trabalhando, e ele conta para open_cursors. Vazamento aparece como 'OPEN' ou 'OPEN-RECURSIVE'. Confundir os dois faz culpar a aplicacao errada."
+    },
+    {
+      "titulo": "Confirmar se o cache de cursor da sessao esta inflando a conta",
+      "objetivo": "Decidir se o caminho e corrigir a aplicacao ou ajustar o cache de cursor.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT cursor_type, COUNT(*) AS qtd\nFROM   v$open_cursor\nGROUP  BY cursor_type\nORDER  BY qtd DESC;\n\n-- parametros que governam o assunto\nSELECT name, value, isdefault\nFROM   v$parameter\nWHERE  name IN ('open_cursors', 'session_cached_cursors', 'cursor_sharing');\n\n-- eficiencia do cache: quanto do parse foi evitado\nSELECT name, value\nFROM   v$sysstat\nWHERE  name IN ('session cursor cache hits', 'session cursor cache count',\n                'parse count (total)', 'parse count (hard)',\n                'opened cursors cumulative');",
+      "olhar": "Se a maioria e 'SESSION CURSOR CACHED', o consumo e cache e nao vazamento - e ai reduzir session_cached_cursors alivia sem tocar na aplicacao. Compare 'session cursor cache hits' com 'parse count (total)': proporcao alta significa que o cache esta valendo a memoria que ocupa.",
+      "armadilha": "session_cached_cursors conta DENTRO de open_cursors. Subir os dois em conjunto multiplica o consumo de memoria da PGA por sessao - com 500 sessoes isso vira ORA-04031/ORA-04030 no lugar do ORA-01000. Trocou de erro, nao resolveu."
+    },
+    {
+      "titulo": "Confirmar se houve estouro real no historico",
+      "objetivo": "Provar quando o limite foi atingido, mesmo que a sessao culpada ja tenha caido.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ORA-01000 registrado pelo banco (nao depende do log da aplicacao)\nSELECT TO_CHAR(originating_timestamp, 'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(REPLACE(REPLACE(message_text, CHR(10), ' '), CHR(13), ' '), 1, 110) AS mensagem\nFROM   v$diag_alert_ext\nWHERE  originating_timestamp > SYSDATE - 7\nAND    REGEXP_LIKE(message_text, 'ORA-0?1000')\nORDER  BY originating_timestamp DESC\nFETCH FIRST 30 ROWS ONLY;",
+      "olhar": "A hora do estouro. Cruze com a janela de batch ou de deploy da aplicacao: vazamento que aparece sempre no mesmo horario tem dono e tem gatilho.",
+      "armadilha": "ORA-01000 muitas vezes NAO vai para o alert log - e um erro devolvido a sessao. Nenhuma linha aqui nao significa que nao aconteceu; significa que a evidencia esta no log da aplicacao. Peca o log com o horario."
+    },
+    {
+      "titulo": "Investigar contencao de cursor (cursor: pin S wait on X)",
+      "objetivo": "Tratar o outro sintoma da mesma familia: cursor disputado, nao cursor vazado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- espera de mutex de cursor no ASH das ultimas 4 horas\nSELECT ash.sql_id,\n       ash.event,\n       COUNT(*)                       AS amostras,\n       COUNT(DISTINCT ash.session_id) AS sessoes,\n       TO_CHAR(MIN(ash.sample_time), 'DD/MM HH24:MI') AS de,\n       TO_CHAR(MAX(ash.sample_time), 'DD/MM HH24:MI') AS ate\nFROM   gv$active_session_history ash\nWHERE  ash.sample_time > SYSTIMESTAMP - INTERVAL '4' HOUR\nAND    (ash.event LIKE 'cursor%' OR ash.event LIKE 'library cache%')\nGROUP  BY ash.sql_id, ash.event\nORDER  BY amostras DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Muitas sessoes esperando no MESMO sql_id com 'cursor: pin S wait on X' e disputa pelo mutex daquele cursor - tipico de SQL executado em altissima frequencia, ou de invalidacao constante do cursor (estatistica sendo coletada, DDL no objeto). Aqui o alvo e a frequencia de execucao, nao open_cursors.",
+      "armadilha": "gv$active_session_history exige Diagnostics Pack. Sem licenca, use a amostragem propria do framework (COLETAR.py --pack N) em vez desta consulta - o dado e menos preciso, mas nao gera cobranca."
+    },
+    {
+      "titulo": "Ver quantas versoes o cursor tem (invalidacao e o gatilho comum)",
+      "objetivo": "Descobrir se o cursor e recriado a toda hora, que e o que gera a disputa.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT sql_id,\n       version_count,\n       executions,\n       invalidations,\n       loads,\n       parsing_schema_name,\n       SUBSTR(sql_text, 1, 60) AS sql_text\nFROM   v$sqlarea\nWHERE  version_count > 20\nORDER  BY version_count DESC\nFETCH FIRST 20 ROWS ONLY;\n\n-- por que ha tantas versoes do mesmo SQL\nSELECT sql_id, COUNT(*) AS versoes,\n       SUM(CASE WHEN bind_mismatch          = 'Y' THEN 1 ELSE 0 END) AS bind_mismatch,\n       SUM(CASE WHEN optimizer_mismatch     = 'Y' THEN 1 ELSE 0 END) AS optimizer_mismatch,\n       SUM(CASE WHEN language_mismatch      = 'Y' THEN 1 ELSE 0 END) AS nls_mismatch,\n       SUM(CASE WHEN translation_mismatch   = 'Y' THEN 1 ELSE 0 END) AS schema_mismatch\nFROM   v$sql_shared_cursor\nGROUP  BY sql_id\nHAVING COUNT(*) > 20\nORDER  BY versoes DESC\nFETCH FIRST 15 ROWS ONLY;",
+      "olhar": "version_count alto com invalidations alto = o cursor vive sendo jogado fora e reconstruido (coleta de estatistica, DDL, particao nova). A coluna de mismatch diz o MOTIVO: bind_mismatch aponta tipo/tamanho de bind variavel diferente a cada chamada, que e defeito de aplicacao.",
+      "armadilha": "Nao trate version_count alto ligando cursor_sharing=FORCE. Isso muda o plano de TODO SQL do banco e ja causou regressao de performance em massa. cursor_sharing e ultimo recurso, com janela e plano de rollback."
+    },
+    {
+      "titulo": "Fechar cursores liberando a sessao culpada (paliativo)",
+      "objetivo": "Devolver folga imediata quando o banco esta no teto e a aplicacao nao pode ser corrigida agora.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme com o dono da aplicacao QUAL sessao pode cair - num pool de conexoes a sessao e compartilhada e matar derruba transacoes alheias. 2) Prefira que a propria aplicacao seja reiniciada pelo time dela: reinicio ordenado do pool devolve todos os cursores sem transacao interrompida. 3) KILL SESSION faz ROLLBACK do que estava aberto: verifique em gv$transaction se ha transacao longa antes, senao o rollback pode demorar mais que o problema. 4) Registre no caso o SID, o modulo e quem autorizou. 5) Isto e paliativo - sem correcao na aplicacao o consumo volta.",
+      "comando": "-- 1) conferir se a sessao tem transacao aberta (o rollback pode ser longo)\nSELECT s.inst_id, s.sid, s.serial#, s.username, s.module,\n       t.used_urec AS registros_de_undo,\n       ROUND(t.used_ublk * 8192 / 1024 / 1024) AS undo_mb\nFROM   gv$session s\nLEFT   JOIN gv$transaction t\n       ON  t.inst_id = s.inst_id AND t.ses_addr = s.saddr\nWHERE  s.sid = 123;\n\n-- 2) gera o comando para revisao (nao executa nada)\nSELECT 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial#\n       || ',@' || s.inst_id || ''' IMMEDIATE;' AS comando_gerado,\n       s.username, s.machine, s.module, a.value AS cursores\nFROM   gv$sesstat a, gv$statname b, gv$session s\nWHERE  a.statistic# = b.statistic#\nAND    b.name = 'opened cursors current'\nAND    a.inst_id = s.inst_id AND a.sid = s.sid\nAND    a.value > 1000\nORDER  BY a.value DESC;\n\n-- 3) executar APENAS a linha autorizada",
+      "olhar": "Depois do kill, repita o passo 1: o pico por sessao deve cair. Acompanhe por 30 minutos - se voltar a subir na mesma velocidade, esta confirmado que o vazamento e continuo e a correcao e na aplicacao.",
+      "armadilha": "Matar a sessao de um pool costuma fazer o pool abrir outra imediatamente e recomecar o vazamento do zero. O ganho e de minutos. Se o time da aplicacao reiniciar o pool, o efeito e o mesmo com muito menos risco."
+    },
+    {
+      "titulo": "Ajustar open_cursors (so com o vazamento descartado)",
+      "objetivo": "Dar folga ao limite quando o consumo e legitimo e cresceu com o negocio.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) So faca isso depois de descartar vazamento (passo 4: o mesmo sql_id nao aparece centenas de vezes numa sessao). Subir o limite com vazamento ativo apenas adia o incidente e some com a evidencia. 2) Cada cursor consome memoria na PGA: multiplique o aumento pelo numero de sessoes do pico e confirme que ha RAM no host (passo do free/vmstat). 3) open_cursors NAO e alteravel por PDB isoladamente em todos os releases - confirme o escopo antes. 4) A alteracao e dinamica (nao pede restart), mas registre o valor ANTERIOR no caso para rollback. 5) Combine a mudanca com o time de aplicacao: se eles tambem tem limite no driver, so o banco nao resolve.",
+      "comando": "-- valor atual e origem (spfile x memoria)\nSELECT name, value, display_value, isdefault, ismodified\nFROM   v$parameter WHERE name = 'open_cursors';\n\nSELECT sid, name, value FROM v$spparameter WHERE name = 'open_cursors';\n\n-- aumento (ajuste o numero ao pico medido + folga):\n-- ALTER SYSTEM SET open_cursors = 1000 SCOPE=BOTH SID='*';\n\n-- rollback: volte ao valor anotado antes\n-- ALTER SYSTEM SET open_cursors = <valor_anterior> SCOPE=BOTH SID='*';",
+      "olhar": "Depois da mudanca, refaca o passo 1: pct_do_limite deve cair para uma faixa confortavel (abaixo de 60%). Acompanhe a memoria do host por alguns dias.",
+      "armadilha": "SCOPE=MEMORY sozinho perde o ajuste no proximo restart e o erro reaparece 'do nada' semanas depois, quando ninguem lembra da mudanca. Use SCOPE=BOTH e registre no caso."
+    },
+    {
+      "titulo": "Fechar a causa com a aplicacao",
+      "objetivo": "Encerrar o incidente com dono e acao definida, nao com parametro maior.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- evidencia consolidada para a conversa com a aplicacao\nSELECT SUBSTR(s.module, 1, 40)  AS modulo,\n       SUBSTR(s.machine, 1, 30) AS maquina,\n       COUNT(*)                 AS sessoes,\n       MAX(a.value)             AS pior_sessao,\n       SUM(a.value)             AS total_cursores\nFROM   gv$sesstat a, gv$statname b, gv$session s\nWHERE  a.statistic# = b.statistic#\nAND    b.name = 'opened cursors current'\nAND    a.inst_id = s.inst_id AND a.sid = s.sid\nAND    s.username IS NOT NULL\nGROUP  BY SUBSTR(s.module, 1, 40), SUBSTR(s.machine, 1, 30)\nORDER  BY total_cursores DESC\nFETCH FIRST 10 ROWS ONLY;\n\n-- reincidencia do erro no periodo\nSELECT TO_CHAR(originating_timestamp, 'YYYY-MM-DD') AS dia,\n       COUNT(*) AS ocorrencias\nFROM   v$diag_alert_ext\nWHERE  originating_timestamp > SYSDATE - 30\nAND    REGEXP_LIKE(message_text, 'ORA-0?1000')\nGROUP  BY TO_CHAR(originating_timestamp, 'YYYY-MM-DD')\nORDER  BY dia;",
+      "olhar": "Entregue ao time de aplicacao: modulo, maquina, sql_id do passo 4 e o numero de vezes que o cursor aparece aberto. Com isso a correcao e objetiva - fechar o Statement/ResultSet no finally, ou usar try-with-resources.",
+      "armadilha": "Encerrar o caso so com 'open_cursors aumentado' garante a reincidencia. Se a aplicacao nao for corrigida, registre no caso como risco aceito e com dono - assim o proximo plantao nao comeca do zero."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

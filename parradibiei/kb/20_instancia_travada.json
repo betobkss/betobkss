@@ -1,0 +1,156 @@
+{
+  "id": "instancia_travada",
+  "ordem": 20,
+  "titulo": "Instancia travada (hang): nao conecta ou nao responde",
+  "quando_usar": "O banco parou de responder, novas conexoes ficam penduradas ou caem em timeout, a aplicacao inteira parou. Diferente de 'lentidao': aqui nao anda.",
+  "tags": [
+    "hang",
+    "travado",
+    "instancia travada",
+    "nao conecta",
+    "prelim",
+    "hanganalyze",
+    "systemstate",
+    "srvctl",
+    "restart",
+    "rac",
+    "processos"
+  ],
+  "sintomas": [
+    "banco travado",
+    "nao consigo conectar",
+    "sqlplus fica pendurado",
+    "aplicacao parou toda",
+    "ORA-00020",
+    "timeout ao conectar",
+    "instancia nao responde",
+    "hang"
+  ],
+  "secoes": [
+    "Saude da instancia",
+    "Sessoes e processos",
+    "Erros no Alert Log"
+  ],
+  "erros_ora": [
+    "ORA-00020",
+    "ORA-04031",
+    "ORA-00257",
+    "ORA-29740",
+    "ORA-01089"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Diagnosing and Resolving Problems",
+    "Oracle Support Doc 452358.1 - How to Collect Diagnostics for Database Hanging Issues",
+    "Oracle Real Application Clusters Administration - srvctl stop/start instance",
+    "Oracle Database Reference - GV$SESSION, GV$PROCESS, V$RESOURCE_LIMIT"
+  ],
+  "nota": "A pressa e a maior inimiga aqui: reiniciar resolve o sintoma em segundos e APAGA a evidencia de por que travou - e o mesmo hang volta na semana seguinte sem ninguem saber a causa. A regra e coletar antes de reiniciar, mesmo sob pressao. E antes de tudo, confirme que o hang e do BANCO: cliente que nao conecta pode ser rede, listener, DNS ou disco cheio no servidor, e nesses casos reiniciar a instancia nao resolve nada. Um travamento quase sempre tem uma destas causas: fila unica (bloqueio em cadeia), recurso esgotado (processes, shared pool, archive cheio) ou o servidor de joelhos (CPU/memoria/IO).",
+  "passos": [
+    {
+      "titulo": "Confirmar se e hang do banco ou problema de acesso",
+      "objetivo": "Nao reiniciar banco por causa de rede. Separar 'nao chega no banco' de 'o banco nao responde'.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "ping <host_do_banco>\n\ntnsping <service>\n\nlsnrctl status\nlsnrctl services\n\ndf -h\n\nuptime",
+      "olhar": "tnsping OK + sqlplus pendurado = o problema e no banco (siga o playbook). tnsping falhando = listener ou rede, e reiniciar a instancia nao resolve. Em df -h, filesystem de archive ou de diag a 100% trava o banco inteiro e e a causa mais facil de corrigir. Em uptime, load average muito acima do numero de CPUs indica servidor saturado.",
+      "armadilha": "ORA-00257 (archive cheio) se manifesta como banco 'travado': conexoes existentes funcionam para leitura e qualquer escrita congela. Se o destino de archive estiver cheio, o playbook certo e o de archive - liberar espaco resolve sem reiniciar nada."
+    },
+    {
+      "titulo": "Ver o estado da instancia e ha quanto tempo",
+      "objetivo": "Confirmar se a instancia esta OPEN, se aceita login e se ja houve restart recente.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT (SELECT name FROM v$database) AS banco,\n       i.instance_name, i.status, i.database_status, i.logins,\n       i.host_name,\n       TO_CHAR(i.startup_time,'DD/MM/YYYY HH24:MI:SS') AS subiu_em,\n       LPAD(TRUNC(SYSDATE - i.startup_time),3,'0') || 'd ' ||\n       LPAD(TRUNC(MOD((SYSDATE - i.startup_time)*24,24)),2,'0') || ':' ||\n       LPAD(TRUNC(MOD((SYSDATE - i.startup_time)*1440,60)),2,'0') AS uptime,\n       (SELECT COUNT(*) FROM gv$session s\n         WHERE s.status='ACTIVE' AND s.inst_id = i.inst_id) AS sessoes_ativas\nFROM gv$instance i\nORDER BY i.inst_id;",
+      "olhar": "status diferente de OPEN, ou database_status diferente de ACTIVE, ja explica a indisponibilidade. logins = RESTRICTED impede conexao de aplicacao e engana muito (parece hang e e restricao). Em RAC, instancia faltando na lista esta fora do ar.",
+      "armadilha": "Se esta consulta tambem trava, voce nao tem sessao utilizavel: siga pelo SO (proximo passo) e, se precisar entrar no banco, pela conexao preliminar do passo de coleta. E cuidado com uptime baixo: se o banco subiu ha minutos, alguem ja reiniciou e a evidencia do hang original provavelmente se perdeu."
+    },
+    {
+      "titulo": "Ver pelo SO se a instancia esta viva",
+      "objetivo": "Distinguir instancia TRAVADA de instancia CAIDA - o tratamento e completamente diferente e nao da para saber isso de dentro do banco.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# processos da instancia; sem pmon, a instancia nao esta travada: esta fora\nps -ef | grep ora_pmon | grep -v grep\n\nps -ef | grep -c ora_\n\n# processos de servidor mais antigos (candidatos a estar presos)\nps -eo pid,etime,pcpu,pmem,args --sort=-etime | grep oracle | head -20\n\n# memoria e swap: swap em uso pesado trava tudo e parece hang de banco\nfree -m\n\nvmstat 2 5",
+      "olhar": "Sem processo pmon, a instancia CAIU - o caminho e subir, nao diagnosticar hang. Com pmon vivo e o banco nao respondendo, e hang de verdade. Em vmstat, colunas si/so (swap in/out) diferentes de zero de forma continua explicam sozinhas a lentidao extrema, e a causa e memoria do servidor, nao o banco.",
+      "armadilha": "Quando nem o SQL*Plus normal conecta, existe a conexao preliminar (`sqlplus -prelim / as sysdba`), que nao precisa de sessao nem de latch. Ela esta no passo de coleta de diagnostico, com os cuidados devidos - e importante saber que ela NAO cria sessao: SELECT em v$ nao funciona nela, so comandos oradebug. Quem nao sabe disso acha que o banco esta corrompido porque um SELECT simples falhou."
+    },
+    {
+      "titulo": "Achar a cabeca da fila de bloqueio",
+      "objetivo": "Hang quase sempre e uma fila: dezenas de sessoes esperando UMA. Achar essa uma resolve o incidente inteiro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username, s.status,\n       s.event, s.wait_class, s.seconds_in_wait AS seg,\n       s.blocking_instance, s.blocking_session, s.sql_id,\n       s.machine, s.program, s.module\nFROM gv$session s\nWHERE s.username IS NOT NULL\n  AND (s.blocking_session IS NOT NULL\n       OR s.sid IN (SELECT blocking_session FROM gv$session\n                     WHERE blocking_session IS NOT NULL))\nORDER BY s.blocking_session NULLS FIRST, s.seconds_in_wait DESC;\n\n-- quantas sessoes cada bloqueador esta segurando:\nSELECT blocking_instance, blocking_session, COUNT(*) AS presas,\n       MAX(seconds_in_wait) AS espera_maxima_seg\nFROM gv$session\nWHERE blocking_session IS NOT NULL\nGROUP BY blocking_instance, blocking_session\nORDER BY presas DESC;",
+      "olhar": "A sessao que aparece como blocking_session e NAO tem blocking_session propria e a cabeca da fila. O segundo resultado ordena pelo estrago: quem segura mais gente. Anote inst_id, sid, serial# - sao eles que voce vai precisar para agir.",
+      "armadilha": "Sessao bloqueadora costuma estar INACTIVE ('esqueceu' um commit e foi almocar). Nao procure pela sessao mais ativa: procure pela que os outros apontam. E em RAC use sempre gv$ com blocking_instance - a cadeia atravessa nos."
+    },
+    {
+      "titulo": "Ver o que o banco inteiro esta esperando",
+      "objetivo": "Se nao ha cadeia de bloqueio, o hang e de recurso: descobrir qual.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, event, wait_class, COUNT(*) AS sessoes,\n       ROUND(AVG(seconds_in_wait),1) AS espera_media_seg,\n       MAX(seconds_in_wait) AS pior_seg\nFROM gv$session\nWHERE status = 'ACTIVE' AND wait_class <> 'Idle'\nGROUP BY inst_id, event, wait_class\nORDER BY sessoes DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "'latch: shared pool' ou 'library cache lock/pin' em massa = contencao de shared pool (veja o playbook de parse). 'log file switch (checkpoint incomplete)' = redo mal dimensionado. 'enq: TX - row lock contention' = bloqueio de aplicacao. 'buffer busy waits' concentrado = bloco quente. Classe Cluster em massa = veja o playbook de RAC.",
+      "armadilha": "Nao pare no evento mais frequente sem olhar o tempo: 200 sessoes esperando 0,1 s e ruido; 5 sessoes esperando 900 s e o incidente."
+    },
+    {
+      "titulo": "Conferir se algum recurso estourou o limite",
+      "objetivo": "ORA-00020 e primo do hang: sem slot de processo, nenhuma conexao nova entra e o banco parece morto.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT p.value AS processes_max,\n       (SELECT COUNT(*) FROM gv$process) AS processos_em_uso,\n       (SELECT value FROM v$parameter WHERE name='sessions') AS sessions_max,\n       (SELECT COUNT(*) FROM gv$session) AS sessoes_em_uso\nFROM v$parameter p\nWHERE p.name = 'processes';\n\n-- quem esta consumindo os slots:\nSELECT username, machine, program, COUNT(*) AS sessoes\nFROM gv$session\nWHERE username IS NOT NULL\nGROUP BY username, machine, program\nORDER BY sessoes DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "processos_em_uso encostado em processes_max explica o hang de conexao por si so. No segundo resultado, uma maquina com centenas de sessoes normalmente e pool de aplicacao vazando conexao - essa e a causa real, nao o banco.",
+      "armadilha": "Aumentar `processes` exige RESTART e nao resolve vazamento de conexao: em pouco tempo enche de novo, com o dobro de memoria consumida. Trate a aplicacao."
+    },
+    {
+      "titulo": "Ler o alert log de todas as instancias",
+      "objetivo": "O banco costuma avisar antes de travar. Contar os ORA- das ultimas linhas mostra o padrao na hora.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# top de erros somando TODAS as instancias do servidor\ngrep -ohE \"ORA-[0-9]{4,5}\" $ORACLE_BASE/diag/rdbms/*/*/trace/alert_*.log | sort | uniq -c | sort -nr | head -20\n\n# o mesmo, mas mostrando de qual instancia veio cada erro\ngrep -oE \"ORA-[0-9]{4,5}\" $ORACLE_BASE/diag/rdbms/*/*/trace/alert_*.log | sort | uniq -c | sort -nr | head -30\n\n# contexto das ocorrencias mais graves\ngrep -nE \"ORA-00600|ORA-07445|ORA-04031|ORA-00020|ORA-00257|ORA-29740\" $ORACLE_BASE/diag/rdbms/*/*/trace/alert_*.log | tail -40\n\n# ultimas linhas pelo caminho oficial (respeita o ADR)\nadrci exec=\"show alert -tail 200\"",
+      "olhar": "ORA-00020 (sem processos), ORA-04031 (shared pool), ORA-00257 (archive cheio) e ORA-29740 (eviction em RAC) explicam o hang direto. Repare tambem em 'WAITED TOO LONG FOR A ROW CACHE ENQUEUE' e em mensagens de 'hang' geradas pelo proprio Oracle.",
+      "armadilha": "Use ORA-[0-9]{4,5} e nao ORA-[0-9]{5}: o padrao de 5 digitos PERDE justamente os mais graves - ORA-600, ORA-7445 e ORA-1092 tem 4 digitos no log. Esse detalhe ja fez incidente ser fechado como 'sem erro no alert log'."
+    },
+    {
+      "titulo": "Coletar o diagnostico do hang antes de mexer",
+      "objetivo": "Gerar a evidencia que a Oracle vai pedir no SR - e que some para sempre se voce reiniciar antes.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Isto NAO altera dado nem configuracao, mas NAO e de graca: o systemstate percorre toda a SGA, pode gerar arquivos de varios GB e, numa instancia ja sofrendo, aumenta a pressao por alguns minutos. 2) Confira espaco no filesystem do diag ANTES (df -h) - encher o diag piora tudo. 3) Prefira hanganalyze (leve) e so use systemstate se o Suporte pedir. 4) Em RAC use a opcao -g all para pegar todos os nos de uma vez. 5) Registre no caso o horario exato da coleta.",
+      "comando": "sqlplus -prelim / as sysdba <<'EOF'\noradebug setmypid\noradebug unlimit\noradebug -g all hanganalyze 3\noradebug -g all dump systemstate 258\noradebug tracefile_name\nEOF\n\n-- empacotar para o SR:\nadrci exec=\"show problem\"",
+      "olhar": "oradebug tracefile_name imprime o caminho do trace gerado - e esse arquivo que vai para o SR. O hanganalyze ja traz, em texto, as cadeias de bloqueio e quem e o 'final blocker'.",
+      "armadilha": "systemstate 266 (com short stacks) e muito mais pesado que 258 e pode agravar o hang; use o nivel que o Suporte pedir. E nao rode em loop: dois systemstates seguidos numa instancia travada e receita para derrubar o servidor."
+    },
+    {
+      "titulo": "Encerrar a sessao que esta segurando a fila",
+      "objetivo": "Quando a cabeca da fila esta identificada, matar UMA sessao costuma destravar tudo - sem reiniciar o banco.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) Identifique a cabeca da fila pelo passo 4 e CONFIRME que ela e a origem, nao uma vitima. 2) Descubra o que ela estava fazendo (sql_id, module, machine) e avise o dono da aplicacao - matar sessao de batch no meio pode deixar carga pela metade. 3) A transacao sofre ROLLBACK: se ela alterou milhoes de linhas, o rollback pode demorar MAIS que o hang e nao pode ser interrompido. Estime antes em gv$transaction (used_urec). 4) Prefira ALTER SYSTEM KILL SESSION antes de ir ao SO. 5) Registre a acao, o motivo e o horario no caso.",
+      "comando": "-- 1) dimensionar o rollback ANTES de matar:\nSELECT s.inst_id, s.sid, s.serial#, s.username, t.used_urec AS registros_undo,\n       t.used_ublk AS blocos_undo,\n       TO_CHAR(t.start_date,'DD/MM HH24:MI') AS transacao_desde\nFROM gv$transaction t\nJOIN gv$session s ON s.saddr = t.ses_addr AND s.inst_id = t.inst_id\nORDER BY t.used_urec DESC;\n\n-- 2) gerar o comando para revisao (nao executa nada):\nSELECT 'ALTER SYSTEM KILL SESSION ''' || sid || ',' || serial# ||\n       ',@' || inst_id || ''' IMMEDIATE;' AS comando_gerado\nFROM gv$session\nWHERE sid = &sid AND inst_id = &inst_id;",
+      "olhar": "Depois de matar, repita o passo 4: a fila deve esvaziar em segundos. Se as sessoes continuam presas, voce matou uma vitima e nao o bloqueador.",
+      "armadilha": "used_urec na casa dos milhoes significa rollback longo: a sessao fica em KILLED por muito tempo e o recurso NAO e liberado na hora - o banco pode parecer ainda mais travado logo depois do kill. Nessas horas, esperar o commit pode ser melhor que matar. Nunca use kill -9 no processo do SO como primeira opcao: pode derrubar a instancia inteira."
+    },
+    {
+      "titulo": "Reiniciar a instancia (ultimo recurso)",
+      "objetivo": "Restabelecer o servico quando nao ha sessao utilizavel e a evidencia ja foi coletada.",
+      "risco": "destrutivo",
+      "onde": "so",
+      "antes_de_executar": "1) COLETE o diagnostico primeiro (passo 8) - reiniciar apaga a causa e o hang volta. 2) Isto e INDISPONIBILIDADE: exige comunicacao ao negocio e, em geral, aprovacao formal. 3) Confirme o db_unique_name e o nome exato da instancia com `srvctl config database -d <db>` - errar o alvo em RAC derruba o no errado. 4) Em RAC, pare UM no por vez: os outros seguem atendendo e o impacto e menor. 5) Pare o SERVICO antes da instancia, para o failover levar as conexoes com menos erro. 6) Tenha o plano de volta pronto e confira o alert log durante a subida. 7) Registre tudo no caso.",
+      "comando": "# 1) confirmar os nomes reais (NAO chutar):\nsrvctl config database -d <db_unique_name> -v\nsrvctl status database -d <db_unique_name> -v\n\n# 2) tirar o servico do no afetado (as conexoes vao para os outros):\nsrvctl stop service -d <db_unique_name> -s <service> -i <instancia> -f\n\n# 3) parar a instancia\nsrvctl stop instance -d <db_unique_name> -i <instancia> -stopoption IMMEDIATE -force\n\n# 4) subir de novo\nsrvctl start instance -d <db_unique_name> -i <instancia>\n\n# 5) devolver o servico\nsrvctl start service -d <db_unique_name> -s <service> -i <instancia>\n\n# single-instance (sem Grid Infrastructure):\n# SQL> SHUTDOWN IMMEDIATE;   -- se demorar demais: SHUTDOWN ABORT + STARTUP\n# SQL> STARTUP;",
+      "olhar": "Acompanhe o alert log durante a subida. Depois confirme status OPEN em gv$instance e teste um login de aplicacao de verdade - instancia OPEN com servico fora do ar continua indisponivel para o negocio.",
+      "armadilha": "SHUTDOWN IMMEDIATE numa instancia travada frequentemente TAMBEM trava (ele espera as sessoes terminarem). O ABORT resolve, mas exige recuperacao de instancia na subida - e se houver transacao gigante em aberto, essa recuperacao pode levar mais tempo que o hang. Cuidado com `-force`: ele derruba as sessoes sem esperar. E nunca reinicie o CLUSTER inteiro quando um no basta."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Hang que volta e hang que nunca foi diagnosticado. O que fecha o caso e a causa, nao o restart.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- restarts recentes: hang recorrente deixa rastro\nSELECT inst_id, instance_name,\n       TO_CHAR(startup_time,'DD/MM/YYYY HH24:MI') AS ultimo_startup,\n       ROUND(SYSDATE - startup_time,2) AS dias_no_ar\nFROM gv$instance;\n\n-- bloqueios no historico: o hang de hoje costuma ter ensaiado antes\nSELECT TO_CHAR(sample_time,'DD/MM HH24') AS quando,\n       COUNT(*) AS amostras_bloqueadas,\n       COUNT(DISTINCT blocking_session) AS bloqueadores\nFROM gv$active_session_history\nWHERE sample_time > SYSDATE - 7 AND blocking_session IS NOT NULL\nGROUP BY TO_CHAR(sample_time,'DD/MM HH24')\nORDER BY amostras_bloqueadas DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "dias_no_ar sempre baixo indica banco que vem sendo reiniciado com frequencia - o incidente e cronico e ninguem tratou a raiz. Picos de bloqueio no historico apontam a janela e o padrao (batch noturno, fechamento, integracao).",
+      "armadilha": "A consulta ao ASH exige Diagnostics Pack - nao execute se o pack nao for licenciado. Sem o pack, use a amostragem de gv$session que o framework coleta. E lembre: se a causa foi recurso esgotado (processes, shared pool, archive), a prevencao e monitoramento com alerta, nao um restart agendado."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

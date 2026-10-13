@@ -1,0 +1,127 @@
+{
+  "id": "backup_rpo",
+  "ordem": 13,
+  "titulo": "Backup falhando e RPO estourado",
+  "quando_usar": "O relatorio apontou datafile sem backup recente, job de backup falhando, ou voce precisa responder 'quanto dado eu perderia se o banco morresse agora'.",
+  "tags": [
+    "backup",
+    "rman",
+    "rpo",
+    "restore",
+    "recuperabilidade",
+    "retencao",
+    "scheduler"
+  ],
+  "sintomas": [
+    "backup falhou",
+    "datafile sem backup ha dias",
+    "RPO estourado",
+    "job de backup com erro",
+    "nao sei se o backup presta"
+  ],
+  "secoes": [
+    "Backup",
+    "RPO",
+    "Recuperabilidade",
+    "Jobs do scheduler com falha",
+    "Idade do backup"
+  ],
+  "erros_ora": [
+    "ORA-19809",
+    "ORA-19502",
+    "ORA-27037"
+  ],
+  "fontes": [
+    "Oracle Database Backup and Recovery User's Guide - Reporting on RMAN Operations, Validating Backups",
+    "Oracle Database Reference - V$RMAN_BACKUP_JOB_DETAILS, V$BACKUP_DATAFILE"
+  ],
+  "nota": "A pergunta que importa nao e 'o backup rodou?', e 'eu consigo restaurar?'. Backup que roda todo dia e nunca foi testado e uma crenca, nao uma garantia. Este playbook vai de um para o outro - e o unico teste que vale e o RESTORE VALIDATE.",
+  "passos": [
+    {
+      "titulo": "Medir o RPO real por datafile",
+      "objetivo": "Traduzir backup em risco de negocio: quanto tempo de dado esta desprotegido, arquivo por arquivo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT f.file#, SUBSTR(f.name,-42) AS arquivo, f.ts#,\n       TO_CHAR(MAX(b.completion_time),'DD/MM/YYYY HH24:MI') AS ultimo_backup,\n       ROUND(SYSDATE - MAX(b.completion_time),2) AS dias_sem_backup\nFROM v$datafile f\nLEFT JOIN v$backup_datafile b ON b.file# = f.file#\nGROUP BY f.file#, f.name, f.ts#\nORDER BY dias_sem_backup DESC NULLS FIRST;",
+      "olhar": "dias_sem_backup NULO significa datafile NUNCA backupeado - o pior caso, e passa despercebido porque nao gera erro. Compare o maior valor com o RPO combinado com o negocio.",
+      "armadilha": "Um unico datafile fora do backup compromete a recuperacao do banco INTEIRO no ponto no tempo. Media de backup nao serve aqui: o que vale e o PIOR arquivo."
+    },
+    {
+      "titulo": "Ver as execucoes de backup e as que falharam",
+      "objetivo": "Descobrir desde quando o backup parou e com que erro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(start_time,'DD/MM HH24:MI') AS inicio,\n       input_type, status,\n       ROUND(elapsed_seconds/60,1) AS min,\n       ROUND(input_bytes/1024/1024/1024,2) AS lido_gb,\n       ROUND(output_bytes/1024/1024/1024,2) AS gravado_gb\nFROM v$rman_backup_job_details\nWHERE start_time > SYSDATE - 30\nORDER BY start_time DESC FETCH FIRST 30 ROWS ONLY;",
+      "olhar": "status COMPLETED WITH ERRORS e tao grave quanto FAILED e engana muita gente - o job 'terminou', mas algo nao foi salvo. A data da primeira falha costuma ser a causa raiz do incidente atual.",
+      "armadilha": "Backup que fica cada vez mais lento (min crescendo) vai acabar invadindo o horario de pico ou estourando a janela. Trate antes de virar incidente."
+    },
+    {
+      "titulo": "Ler o erro exato do RMAN",
+      "objetivo": "V$RMAN_OUTPUT guarda a saida do job - e la que esta a mensagem util.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT session_key, TO_CHAR(stamp) AS stamp, output\nFROM v$rman_output\nWHERE session_key = (SELECT MAX(session_key) FROM v$rman_status\n                     WHERE status LIKE '%FAILED%')\nORDER BY recid;",
+      "olhar": "Procure ORA-19502 (falha de escrita: destino cheio/indisponivel), ORA-27037 (arquivo nao encontrado) e mensagens de fita/Media Manager (SBT_TAPE).",
+      "armadilha": "Falha de backup e frequentemente problema de INFRAESTRUTURA (fita, NFS, credencial vencida), nao do banco. Ler o erro evita horas investigando o lugar errado."
+    },
+    {
+      "titulo": "Conferir a politica de retencao e o que ela promete",
+      "objetivo": "A retencao define ate onde voce consegue voltar no tempo. Precisa bater com o que o negocio acha que tem.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> SHOW RETENTION POLICY;\nRMAN> SHOW ALL;\nRMAN> REPORT NEED BACKUP;\nRMAN> REPORT UNRECOVERABLE;",
+      "olhar": "REPORT NEED BACKUP lista o que esta fora da politica. REPORT UNRECOVERABLE e o mais serio: lista datafile que NAO pode ser recuperado (tipicamente por operacao NOLOGGING) - se vier algo, e achado critico.",
+      "armadilha": "CONFIGURE CONTROLFILE AUTOBACKUP OFF (o padrao) e um dos desvios mais comuns da frota: sem o autobackup do controlfile, um desastre que perca o controlfile complica muito o restore. O check de conformidade do framework aponta isso."
+    },
+    {
+      "titulo": "Verificar se os backups existem de verdade",
+      "objetivo": "O catalogo pode dizer que o backup existe enquanto o arquivo sumiu do disco ou da fita.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> LIST BACKUP SUMMARY;\nRMAN> LIST BACKUP OF DATABASE SUMMARY;\nRMAN> LIST EXPIRED BACKUP;",
+      "olhar": "Qualquer coisa em LIST EXPIRED significa catalogo dizendo uma coisa e disco dizendo outra. Ate reconciliar, voce nao sabe o que realmente tem.",
+      "armadilha": "LIST mostra o que o catalogo REGISTRA, nao o que esta integro. Um backup listado pode estar corrompido - so o VALIDATE do proximo passo responde isso."
+    },
+    {
+      "titulo": "TESTAR o restore sem restaurar nada",
+      "objetivo": "O unico passo que transforma 'temos backup' em 'conseguimos restaurar'. Le todos os backups e confere, sem tocar no banco.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> RESTORE DATABASE VALIDATE;\nRMAN> RESTORE ARCHIVELOG ALL VALIDATE;\nRMAN> VALIDATE BACKUPSET <chave>;",
+      "olhar": "Termina sem erro = a cadeia de restore esta completa e legivel. Qualquer falha aqui e achado CRITICO, mesmo com todos os jobs 'COMPLETED'.",
+      "armadilha": "VALIDATE le TODOS os backups: gera I/O pesado e pode demorar horas. Combine janela. Mas nao pule: e a diferenca entre backup e esperanca. Apesar do nome, nao escreve nada no banco nem restaura arquivo."
+    },
+    {
+      "titulo": "Ver por que o job nao rodou",
+      "objetivo": "Quando o backup nem comecou, o problema esta no agendador, nao no RMAN.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, job_name, TO_CHAR(log_date,'DD/MM HH24:MI') AS quando,\n       status, SUBSTR(additional_info,1,120) AS info\nFROM dba_scheduler_job_run_details\nWHERE log_date > SYSDATE - 15 AND status <> 'SUCCEEDED'\nORDER BY log_date DESC FETCH FIRST 20 ROWS ONLY;\n\nSELECT owner, job_name, enabled, state,\n       TO_CHAR(last_start_date,'DD/MM HH24:MI') AS ultima_execucao,\n       TO_CHAR(next_run_date,'DD/MM HH24:MI')  AS proxima,\n       failure_count\nFROM dba_scheduler_jobs\nWHERE UPPER(job_name) LIKE '%BACKUP%' OR UPPER(job_name) LIKE '%RMAN%';",
+      "olhar": "enabled = FALSE ou state = BROKEN explicam sozinhos a ausencia de backup. failure_count alto mostra que vem falhando ha tempo sem ninguem ver.",
+      "armadilha": "Muitos ambientes agendam backup FORA do banco (cron, Control-M, TWS). Se nao ha job no scheduler, procure no agendador corporativo antes de concluir que ninguem agendou."
+    },
+    {
+      "titulo": "Backup imediato para fechar a janela de risco",
+      "objetivo": "Quando ha datafile desprotegido ha dias, reduzir o risco agora, sem esperar a proxima janela.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Confirme espaco no destino (disco/FRA/fita) - backup que enche a FRA para o banco (ORA-00257) e voce troca risco por indisponibilidade. 2) Combine a janela: backup completo concorre por I/O com a producao. 3) Prefira backup INCREMENTAL se ja houver nivel 0 valido - e muito mais leve. 4) Registre a acao no caso. 5) Nao dispare junto com outra carga pesada.",
+      "comando": "RMAN> BACKUP INCREMENTAL LEVEL 1 DATABASE PLUS ARCHIVELOG;\n\n-- se nao existir um nivel 0 valido, ele e obrigatorio antes:\nRMAN> BACKUP INCREMENTAL LEVEL 0 DATABASE PLUS ARCHIVELOG;",
+      "olhar": "Ao terminar, refaca o passo 1: os dias_sem_backup devem cair para perto de zero em todos os datafiles.",
+      "armadilha": "Incremental sem BLOCK CHANGE TRACKING le o banco inteiro para descobrir o que mudou - quase o custo de um full. Se os incrementais estao lentos, confira V$BLOCK_CHANGE_TRACKING: e outro item do check de conformidade."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Backup parado costuma ficar semanas sem ninguem notar. O que resolve e a deteccao, nao o backup avulso.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ha quanto tempo o problema existe (primeira falha da sequencia):\nSELECT MIN(start_time) AS desde_quando,\n       COUNT(*) AS execucoes_com_problema\nFROM v$rman_backup_job_details\nWHERE start_time > SYSDATE - 90 AND status <> 'COMPLETED';",
+      "olhar": "Se a primeira falha e de semanas atras, o problema real e de MONITORAMENTO: ninguem foi avisado. Esse e o achado que vai para a prevencao do RCA.",
+      "armadilha": "O framework ja cobre isto nos checks backup_age, rman_failures e scheduler_failures - inclua o servidor na rotina de health check periodico em vez de confiar em alguem lembrar de olhar."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

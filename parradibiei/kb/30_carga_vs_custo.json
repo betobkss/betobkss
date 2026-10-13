@@ -1,0 +1,106 @@
+{
+  "id": "carga_vs_custo",
+  "ordem": 30,
+  "titulo": "Tuning: ficou mais lento ou passou a fazer mais?",
+  "quando_usar": "Reclamacao de lentidao generica, sem erro e sem sessao bloqueada: 'esta pesado', 'demora desde hoje', 'o relatorio nao sai'. Use ANTES de tunar qualquer SQL - e o playbook que decide se o caso e de carga, de custo ou de mudanca na aplicacao.",
+  "tags": [
+    "tuning",
+    "carga",
+    "capacidade",
+    "sessao",
+    "sql",
+    "plano",
+    "regressao",
+    "aplicacao",
+    "mudanca"
+  ],
+  "sintomas": [
+    "banco lento",
+    "esta pesado",
+    "lentidao generica",
+    "aumento de carga",
+    "mais sessoes",
+    "dobrou o tempo",
+    "demora desde hoje",
+    "ontem estava bom",
+    "sem erro no alert"
+  ],
+  "secoes": [],
+  "erros_ora": [],
+  "fontes": [
+    "Cary Millsap - Optimizing Oracle Performance (Method R: priorizar por DB time)",
+    "Oracle Database Performance Tuning Guide - Automatic Workload Repository / v$sqlstats",
+    "Oracle Database Reference - V$SQLSTATS, DBA_HIST_SQLSTAT, V$ACTIVE_SESSION_HISTORY, DBA_OBJECTS"
+  ],
+  "nota": "A pergunta que decide o rumo e uma so: o banco ficou mais LENTO ou passou a fazer MAIS? Responder errado custa o plantao inteiro - tuna-se um SQL que nao mudou nada enquanto a origem da carga segue crescendo, ou pede-se hardware para uma regressao de plano que um SQL Plan Baseline resolveria em minutos. A separacao e simples e quase ninguem faz: compare o custo POR EXECUCAO. Se ele esta igual e o total subiu, o problema e volume (carga ou concorrencia). Se ele subiu, o volume e desculpa. E a terceira resposta, a que nunca vem no chamado: mudou a aplicacao. Cole a saida de cada passo na caixa do painel - o motor le a serie por hora, o custo por execucao, o historico de plano e a data do deploy, e repontua as hipoteses com isso.",
+  "passos": [
+    {
+      "titulo": "Confirmar que o tempo esta DENTRO do banco",
+      "objetivo": "Antes de medir carga ou custo, saber se o banco e o gargalo. Metade das reclamacoes de lentidao morre aqui - o tempo esta na rede, no cliente ou na aplicacao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT wait_class,\n       ROUND(SUM(time_waited)/100,1)                          AS seg,\n       ROUND(100*SUM(time_waited)/NULLIF(SUM(SUM(time_waited)) OVER (),0),1) AS pct\nFROM v$system_wait_class\nWHERE wait_class <> 'Idle'\nGROUP BY wait_class\nORDER BY seg DESC;",
+      "olhar": "A wait class dominante e o rumo: 'Concurrency' pede lock/parse, 'User I/O' pede plano ou storage, 'Network' e 'Application' apontam para FORA do banco. Se nada domina e mesmo assim esta lento, a resposta pode estar no cliente - e isso tambem e resposta.",
+      "armadilha": "V$SYSTEM_WAIT_CLASS e acumulado desde o startup: num banco de meses, o incidente de hoje desaparece na media. Para a janela do problema use ASH (passo 3) ou compare duas leituras com alguns minutos de intervalo."
+    },
+    {
+      "titulo": "Medir a carga por hora (a serie, nao o numero de agora)",
+      "objetivo": "Descobrir se o volume mudou de patamar. Um numero solto ('350 sessoes') nao diz nada; a serie traz o proprio comparativo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- Sessoes ativas por hora nas ultimas 24h (ASH: exige Diagnostics Pack)\nSELECT TO_CHAR(sample_time,'DD/MM HH24') AS hora,\n       COUNT(DISTINCT session_id)        AS sessoes\nFROM v$active_session_history\nWHERE sample_time > SYSDATE - 1\nGROUP BY TO_CHAR(sample_time,'DD/MM HH24')\nORDER BY 1;\n\n-- Sem pack: logons por hora do proprio dicionario\nSELECT TO_CHAR(first_load_time_dt,'HH24') AS hora, COUNT(*) AS sql_novos\nFROM (SELECT TO_DATE(first_load_time,'YYYY-MM-DD/HH24:MI:SS') AS first_load_time_dt\n      FROM v$sql)\nWHERE first_load_time_dt > SYSDATE - 1\nGROUP BY TO_CHAR(first_load_time_dt,'HH24')\nORDER BY 1;",
+      "olhar": "Compare o PICO com a mediana das outras horas, nao com zero. Pico ao dobro e mudanca de patamar; dentro de 1,5x e o dia normal do sistema. Cole a tabela inteira na caixa do painel: o motor faz essa comparacao e sustenta ou REFUTA 'aumento de carga'.",
+      "armadilha": "Comparar a hora do incidente com a madrugada sempre 'prova' aumento de carga. O comparativo honesto e a MESMA hora dos dias anteriores - carga tem estacionalidade (fechamento, folha, batch mensal)."
+    },
+    {
+      "titulo": "Comparar o custo POR EXECUCAO (o discriminador)",
+      "objetivo": "Separar carga de regressao com um numero: se cada execucao custa o mesmo, o SQL nao piorou.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- Top SQL por DB time, com o custo de CADA execucao\nSELECT sql_id, executions, elapsed_time,\n       ROUND(elapsed_time/1e6,1)                        AS seg_total,\n       ROUND(elapsed_time/NULLIF(executions,0)/1e6,3)   AS seg_por_exec,\n       ROUND(buffer_gets/NULLIF(executions,0))          AS gets_por_exec\nFROM v$sqlstats\nWHERE executions > 0\nORDER BY elapsed_time DESC\nFETCH FIRST 15 ROWS ONLY;\n\n-- O mesmo SQL ao longo do tempo (AWR: exige Diagnostics Pack)\n-- SELECT s.snap_id, s.plan_hash_value, s.executions_delta,\n--        ROUND(s.elapsed_time_delta/NULLIF(s.executions_delta,0)/1e6,3) AS seg_por_exec\n-- FROM dba_hist_sqlstat s\n-- WHERE s.sql_id = '<SQL_ID>' AND s.executions_delta > 0\n-- ORDER BY s.snap_id;",
+      "olhar": "seg_por_exec estavel entre snapshots com executions subindo = CARGA (o SQL esta igual, e chamado mais). seg_por_exec subindo = REGRESSAO, e o proximo passo e o plano. gets_por_exec e o sinal mais limpo dos dois: leitura logica por execucao nao depende de cache nem de concorrencia.",
+      "armadilha": "elapsed_time do v$sqlstats e ACUMULADO desde que o cursor entrou na shared pool: dividir pelo total de execucoes mistura o antes e o depois do problema. Para ver a virada, use dba_hist_sqlstat por snapshot (deltas) - o v$ so responde 'esta caro agora'."
+    },
+    {
+      "titulo": "Ver se o plano trocou",
+      "objetivo": "Confirmar ou descartar regressao de plano - a causa mais comum de 'ontem estava bom'.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT sql_id, plan_hash_value, child_number,\n       executions,\n       ROUND(elapsed_time/NULLIF(executions,0)/1e6,3) AS seg_por_exec,\n       TO_CHAR(last_active_time,'DD/MM HH24:MI')      AS visto_em\nFROM v$sql\nWHERE sql_id = '&sql_id'\nORDER BY last_active_time;\n\n-- Plano em uso agora:\nSELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('&sql_id', NULL, 'ALLSTATS LAST'));",
+      "olhar": "Mais de um plan_hash_value para o mesmo SQL_ID e a prova da troca - e o seg_por_exec de cada um diz qual e o bom. UM so plan_hash_value REFUTA a regressao: nao insista, volte para carga ou para o passo 5. No plano, TABLE ACCESS FULL em tabela grande e o achado objetivo.",
+      "armadilha": "Plano diferente NAO e sinonimo de regressao: a troca pode ser inofensiva (ou melhor). O que decide e o custo por execucao de cada plan_hash_value - por isso este passo vem DEPOIS do passo 3, e nao antes."
+    },
+    {
+      "titulo": "Procurar a mudanca que ninguem avisou",
+      "objetivo": "Descobrir deploy, recompilacao ou coleta de estatisticas na janela do problema. Quase nunca vem no chamado, e e a resposta com mais frequencia do que se admite.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- SQL que nasceu nas ultimas 24h e ja pesa\nSELECT sql_id, first_load_time, executions,\n       ROUND(elapsed_time/1e6,1) AS seg_total, parsing_schema_name, module\nFROM v$sql\nWHERE TO_DATE(first_load_time,'YYYY-MM-DD/HH24:MI:SS') > SYSDATE - 1\n  AND executions > 0\nORDER BY elapsed_time DESC\nFETCH FIRST 15 ROWS ONLY;\n\n-- Objeto recompilado / criado nas ultimas 48h\nSELECT owner, object_type, object_name,\n       TO_CHAR(last_ddl_time,'DD/MM/YYYY HH24:MI') AS last_ddl_time\nFROM dba_objects\nWHERE last_ddl_time > SYSDATE - 2\n  AND owner NOT IN ('SYS','SYSTEM')\nORDER BY last_ddl_time DESC;\n\n-- Estatisticas coletadas na janela (troca de plano tem causa)\nSELECT owner, table_name, num_rows,\n       TO_CHAR(last_analyzed,'DD/MM/YYYY HH24:MI') AS last_analyzed, stale_stats\nFROM dba_tab_statistics\nWHERE last_analyzed > SYSDATE - 2\nORDER BY last_analyzed DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "SQL novo no topo do DB time fecha o caso com o time de aplicacao - com evidencia, nao com suspeita. Objeto recompilado ou estatistica coletada na mesma hora da troca de plano EXPLICA a regressao: tratar so o plano deixa a causa viva para a proxima coleta.",
+      "armadilha": "Ser novo nao e ser culpado: SQL recem-carregado pode ser irrelevante. Exija as duas coisas - data recente E peso no DB time. E 'first_load_time' zera quando o cursor sai da shared pool: um SQL antigo pode parecer novo depois de um flush ou restart."
+    },
+    {
+      "titulo": "Ver quem esta gerando a carga (quando o volume mudou)",
+      "objetivo": "Se o passo 2 mostrou aumento e o passo 3 mostrou custo estavel, a acao nao e tunar SQL: e achar e conter a origem.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT NVL(module,'(sem module)') AS module,\n       NVL(program,'(sem program)') AS program,\n       machine, username, COUNT(*) AS sessoes,\n       SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) AS ativas\nFROM gv$session\nWHERE type <> 'BACKGROUND'\nGROUP BY module, program, machine, username\nORDER BY sessoes DESC\nFETCH FIRST 20 ROWS ONLY;\n\nSELECT resource_name, current_utilization, max_utilization, limit_value\nFROM v$resource_limit\nWHERE resource_name IN ('processes','sessions');",
+      "olhar": "Um module ou machine concentrando sessoes aponta o cliente responsavel - pool mal configurado, job novo, retry em loop. current_utilization perto do limit_value de processes/sessions e ORA-00020 a caminho: e indisponibilidade, nao lentidao.",
+      "armadilha": "Muitas sessoes INACTIVE nao sao carga: sao pool aberto. O que importa e ACTIVE por module. Matar sessao de pool tambem nao resolve - a aplicacao reconecta em segundos e o unico efeito e o erro chegar ao usuario."
+    },
+    {
+      "titulo": "Fixar o plano bom (contorno, quando a regressao esta confirmada)",
+      "objetivo": "Devolver o desempenho enquanto a causa (estatistica, bind, indice) e tratada com calma.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme pelos passos 3 e 4 que o custo por execucao SUBIU e que existe um plan_hash_value melhor com execucoes suficientes para nao ser sorte. 2) ANOTE os dois plan_hash_value (o atual e o desejado) - o rollback e desabilitar a baseline criada. 3) Fixar plano CONGELA a decisao do otimizador: se a causa era estatistica velha, corrija-a tambem, senao a divida fica. 4) Exige SQL Plan Management (Enterprise Edition). 5) Registre a acao no caso.",
+      "comando": "-- Trocar <SQL_ID> e <PLAN_HASH_BOM> pelos valores dos passos 3 e 4.\n-- Carrega o plano BOM do cursor cache para uma baseline:\n-- DECLARE n PLS_INTEGER;\n-- BEGIN\n--   n := DBMS_SPM.LOAD_PLANS_FROM_CURSOR_CACHE(\n--          sql_id          => '<SQL_ID>',\n--          plan_hash_value => <PLAN_HASH_BOM>,\n--          fixed           => 'YES');\n--   DBMS_OUTPUT.PUT_LINE('planos carregados: '||n);\n-- END;\n-- /\n\n-- Conferir:\n-- SELECT sql_handle, plan_name, enabled, accepted, fixed\n-- FROM dba_sql_plan_baselines WHERE sql_text LIKE '%<trecho>%';\n\n-- rollback: desabilitar a baseline criada\n-- DECLARE n PLS_INTEGER;\n-- BEGIN\n--   n := DBMS_SPM.ALTER_SQL_PLAN_BASELINE(\n--          sql_handle      => '<SQL_HANDLE>',\n--          plan_name       => '<PLAN_NAME>',\n--          attribute_name  => 'enabled',\n--          attribute_value => 'NO');\n-- END;\n-- /",
+      "olhar": "Depois de fixar, repita o passo 3: o seg_por_exec deve voltar ao patamar anterior nas execucoes seguintes. Se NAO voltar, o plano nunca foi a causa - desfaca e volte para carga (passo 2) ou para a mudanca de aplicacao (passo 5).",
+      "armadilha": "Fixar o plano de um SQL cujo custo subiu por VOLUME de dados (a tabela cresceu) so muda o lugar do problema: o plano antigo pode ficar pior que o novo em poucos dias. Confirme que o plano bom ainda e bom com o volume de HOJE."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

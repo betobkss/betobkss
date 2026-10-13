@@ -1,0 +1,520 @@
+{
+  "versao": 1,
+  "descricao": "Praticas recomendadas Oracle (estilo ORAchk/MAA) avaliadas contra a configuracao real do banco. Conhecimento como DADO: acrescentar regra nao exige mexer em analisador.",
+  "fontes": [
+    "Oracle Autonomous Health Framework - ORAchk/EXAchk best practice checks",
+    "Oracle Maximum Availability Architecture (MAA) Best Practices",
+    "Oracle Database Reference - Initialization Parameters",
+    "MOS 2312911.1 - Optimizer Adaptive Features 12.2",
+    "MOS 361468.1 - HugePages on Linux",
+    "MOS 1302539.1 - Lost Write Detection / db_block_checking",
+    "MOS 1585343.1 - Applying the DSTv Update",
+    "Oracle Optimizer Blog - Best Practices for Gathering Optimizer Statistics",
+    "Oracle Database Security Guide - Default Passwords / Unified Auditing",
+    "CIS Oracle Database Benchmark - password profiles e grants a PUBLIC"
+  ],
+  "parametros": {
+    "db_block_checksum": {
+      "esperado": [
+        "TYPICAL",
+        "FULL"
+      ],
+      "severidade": "warn",
+      "porque": "Sem checksum o banco aceita gravar e ler bloco corrompido sem perceber. A corrupcao so aparece semanas depois, ja propagada para os backups.",
+      "acao": "ALTER SYSTEM SET db_block_checksum=TYPICAL SCOPE=BOTH;",
+      "referencia": "MAA Best Practices"
+    },
+    "db_block_checking": {
+      "esperado": [
+        "MEDIUM",
+        "FULL"
+      ],
+      "severidade": "info",
+      "porque": "Detecta corrupcao logica no momento em que ela e criada, e nao semanas depois. Tem custo de CPU real (1% a 10%), por isso e decisao consciente e nao regra cega.",
+      "acao": "Meca o custo antes: ALTER SYSTEM SET db_block_checking=MEDIUM SCOPE=BOTH; em janela, acompanhando CPU. Em banco critico com CPU sobrando, compensa.",
+      "referencia": "MOS 1302539.1 / MAA Best Practices"
+    },
+    "db_lost_write_protect": {
+      "esperado": [
+        "TYPICAL",
+        "FULL"
+      ],
+      "severidade": "warn",
+      "porque": "Lost write e a corrupcao mais traicoeira: o storage confirma uma escrita que nao aconteceu. Sem esta protecao, so o standby (ou o usuario) descobre.",
+      "acao": "ALTER SYSTEM SET db_lost_write_protect=TYPICAL SCOPE=BOTH;",
+      "referencia": "MOS 1302539.1"
+    },
+    "use_large_pages": {
+      "esperado": [
+        "ONLY",
+        "TRUE",
+        "AUTO_ONLY"
+      ],
+      "severidade": "warn",
+      "porque": "Sem HugePages o SO gasta memoria e CPU com page tables por processo; em SGA grande, o host chega a nao subir a instancia ou entra em swap.",
+      "acao": "Configure HugePages no SO (vm.nr_hugepages e memlock) e ALTER SYSTEM SET use_large_pages=ONLY SCOPE=SPFILE; exige restart.",
+      "referencia": "MOS 361468.1"
+    },
+    "filesystemio_options": {
+      "esperado": [
+        "SETALL"
+      ],
+      "severidade": "warn",
+      "porque": "Sem SETALL o banco perde I/O assincrono e direto em filesystem: cada escrita passa pelo cache do SO, dobrando copia de memoria.",
+      "acao": "ALTER SYSTEM SET filesystemio_options=SETALL SCOPE=SPFILE; exige restart. Em ASM o I/O ja e direto e assincrono: neste caso o desvio nao se aplica, avalie antes de mexer.",
+      "referencia": "Oracle Reference - FILESYSTEMIO_OPTIONS"
+    },
+    "disk_asynch_io": {
+      "esperado": [
+        "TRUE"
+      ],
+      "severidade": "warn",
+      "porque": "Sem I/O assincrono o DBWR serializa escrita e o checkpoint vira gargalo.",
+      "acao": "ALTER SYSTEM SET disk_asynch_io=TRUE SCOPE=SPFILE; exige restart.",
+      "referencia": "Oracle Reference - DISK_ASYNCH_IO"
+    },
+    "fast_start_mttr_target": {
+      "minimo": 1,
+      "severidade": "info",
+      "porque": "Com 0 o tempo de recuperacao apos crash e imprevisivel: o banco pode levar horas para abrir.",
+      "acao": "ALTER SYSTEM SET fast_start_mttr_target=300 SCOPE=BOTH; (300s = meta de recuperacao)",
+      "referencia": "MAA Best Practices"
+    },
+    "undo_retention": {
+      "minimo": 900,
+      "severidade": "info",
+      "porque": "Retencao curta e a origem classica do ORA-01555 em relatorio longo.",
+      "acao": "ALTER SYSTEM SET undo_retention=900 SCOPE=BOTH; (so vale se a tablespace de undo tiver espaco)",
+      "referencia": "Oracle Administrator's Guide - Managing Undo"
+    },
+    "open_cursors": {
+      "minimo": 300,
+      "severidade": "info",
+      "porque": "Valor baixo gera ORA-01000 em aplicacao com pool, mascarando o vazamento real de cursor.",
+      "acao": "ALTER SYSTEM SET open_cursors=300 SCOPE=BOTH;",
+      "referencia": "Oracle Reference - OPEN_CURSORS"
+    },
+    "session_cached_cursors": {
+      "minimo": 50,
+      "severidade": "info",
+      "porque": "Cache baixo aumenta soft parse e contencao de library cache em carga OLTP.",
+      "acao": "ALTER SYSTEM SET session_cached_cursors=50 SCOPE=SPFILE; exige restart.",
+      "referencia": "Oracle Performance Tuning Guide"
+    },
+    "cursor_sharing": {
+      "esperado": [
+        "EXACT"
+      ],
+      "severidade": "warn",
+      "porque": "CURSOR_SHARING=FORCE e paliativo para SQL sem bind: troca ORA-04031 por plano instavel e bind peeking imprevisivel.",
+      "acao": "Corrija o bind na aplicacao e volte para EXACT: ALTER SYSTEM SET cursor_sharing=EXACT SCOPE=BOTH;",
+      "referencia": "MOS 1169017.1"
+    },
+    "optimizer_adaptive_statistics": {
+      "esperado": [
+        "FALSE"
+      ],
+      "severidade": "warn",
+      "porque": "A propria Oracle recomenda desligar: adaptive statistics gera parse longo e planos instaveis em OLTP.",
+      "acao": "ALTER SYSTEM SET optimizer_adaptive_statistics=FALSE SCOPE=BOTH;",
+      "referencia": "MOS 2312911.1"
+    },
+    "statistics_level": {
+      "esperado": [
+        "TYPICAL",
+        "ALL"
+      ],
+      "severidade": "crit",
+      "porque": "Com BASIC o banco fica cego: sem AWR, sem ADDM, sem metricas e sem timed statistics. Um incidente aqui nao tem como ser diagnosticado depois.",
+      "acao": "ALTER SYSTEM SET statistics_level=TYPICAL SCOPE=BOTH;",
+      "referencia": "Oracle Reference - STATISTICS_LEVEL"
+    },
+    "timed_statistics": {
+      "esperado": [
+        "TRUE"
+      ],
+      "severidade": "crit",
+      "porque": "Sem timed statistics nao ha tempo nos eventos de espera - o Method R deixa de ser aplicavel.",
+      "acao": "ALTER SYSTEM SET timed_statistics=TRUE SCOPE=BOTH;",
+      "referencia": "Oracle Performance Tuning Guide"
+    },
+    "max_dump_file_size": {
+      "esperado": [
+        "UNLIMITED"
+      ],
+      "severidade": "warn",
+      "porque": "Trace truncado no meio de um ORA-00600 costuma inviabilizar o SR: a Oracle pede a coleta de novo, e o erro pode nao se repetir.",
+      "acao": "ALTER SYSTEM SET max_dump_file_size='UNLIMITED' SCOPE=BOTH;",
+      "referencia": "Oracle Reference - MAX_DUMP_FILE_SIZE"
+    },
+    "control_file_record_keep_time": {
+      "minimo": 30,
+      "comparar_com_retencao_rman": true,
+      "severidade": "warn",
+      "porque": "Abaixo da retencao do backup, o controlfile descarta o registro do backup antes do backup expirar: o RMAN 'esquece' backup que ainda existe.",
+      "acao": "Ajuste para ficar acima da janela de retencao do RMAN: ALTER SYSTEM SET control_file_record_keep_time=<retencao+1> SCOPE=BOTH;",
+      "referencia": "Oracle Backup and Recovery Reference"
+    },
+    "log_checkpoints_to_alert": {
+      "esperado": [
+        "TRUE"
+      ],
+      "severidade": "info",
+      "porque": "Registrar checkpoint no alert log e o que permite reconstruir depois um incidente de I/O ou de redo.",
+      "acao": "ALTER SYSTEM SET log_checkpoints_to_alert=TRUE SCOPE=BOTH;",
+      "referencia": "MAA Best Practices"
+    },
+    "resource_limit": {
+      "esperado": [
+        "TRUE"
+      ],
+      "severidade": "info",
+      "porque": "Com FALSE os limites de recurso do profile sao ignorados - inclusive os que protegem o banco de sessao fora de controle.",
+      "acao": "ALTER SYSTEM SET resource_limit=TRUE SCOPE=BOTH;",
+      "referencia": "Oracle Security Guide"
+    },
+    "remote_os_authent": {
+      "esperado": [
+        "FALSE"
+      ],
+      "severidade": "crit",
+      "porque": "TRUE permite autenticar pelo usuario do SO remoto: qualquer maquina que forje o nome do usuario entra no banco.",
+      "acao": "ALTER SYSTEM SET remote_os_authent=FALSE SCOPE=SPFILE; exige restart.",
+      "referencia": "Oracle Database Security Guide"
+    },
+    "audit_trail": {
+      "proibido": [
+        "NONE",
+        "FALSE"
+      ],
+      "severidade": "warn",
+      "porque": "Sem auditoria nao ha como responder 'quem fez' depois do incidente - e costuma ser exigencia de compliance.",
+      "acao": "Avalie Unified Auditing (12c+) ou ALTER SYSTEM SET audit_trail=DB SCOPE=SPFILE; exige restart.",
+      "referencia": "Oracle Database Security Guide"
+    }
+  },
+  "banco": {
+    "log_mode": {
+      "esperado": [
+        "ARCHIVELOG"
+      ],
+      "severidade": "crit",
+      "porque": "Sem archivelog so existe restore para o ultimo backup frio: qualquer falha perde todas as transacoes do periodo.",
+      "acao": "Planeje janela: SHUTDOWN IMMEDIATE; STARTUP MOUNT; ALTER DATABASE ARCHIVELOG; ALTER DATABASE OPEN. Garanta expurgo/backup de archive antes, senao a FRA enche e o banco para.",
+      "referencia": "Oracle Backup and Recovery Guide"
+    },
+    "force_logging": {
+      "esperado": [
+        "YES"
+      ],
+      "severidade": "crit",
+      "somente_se": {
+        "item": "standby_configurado",
+        "valor": "SIM"
+      },
+      "porque": "Com standby configurado e FORCE LOGGING desligado, uma operacao NOLOGGING deixa blocos ilegiveis no standby - descobertos so no failover.",
+      "acao": "ALTER DATABASE FORCE LOGGING;",
+      "referencia": "MAA Best Practices - Data Guard"
+    },
+    "block_change_tracking": {
+      "esperado": [
+        "ENABLED"
+      ],
+      "severidade": "info",
+      "porque": "Sem BCT o backup incremental le o banco inteiro para achar o que mudou: janela de backup muito maior sem necessidade.",
+      "acao": "ALTER DATABASE ENABLE BLOCK CHANGE TRACKING USING FILE '<caminho>';",
+      "referencia": "Oracle Backup and Recovery Guide"
+    },
+    "rman_controlfile_autobackup": {
+      "esperado": [
+        "ON"
+      ],
+      "severidade": "warn",
+      "porque": "Sem autobackup do controlfile/spfile, a perda do controlfile transforma um restore trivial em recuperacao manual demorada.",
+      "acao": "No RMAN: CONFIGURE CONTROLFILE AUTOBACKUP ON;",
+      "referencia": "Oracle Backup and Recovery Guide"
+    }
+  },
+  "multiplexacao": {
+    "controlfiles": {
+      "minimo": 2,
+      "severidade": "crit",
+      "porque": "Controlfile unico e ponto unico de falha: perde o arquivo, para o banco. Multiplexar custa nada.",
+      "acao": "Adicione copia em outro diskgroup/filesystem (control_files no spfile) e reinicie na janela. Em ASM com redundancia, avalie o risco real do diskgroup.",
+      "referencia": "Oracle Administrator's Guide - Managing Control Files"
+    },
+    "redo_membros": {
+      "minimo": 2,
+      "severidade": "crit",
+      "porque": "Grupo de redo com um membro so: se o arquivo corromper antes de arquivar, o banco para e o dado desse intervalo se perde.",
+      "acao": "ALTER DATABASE ADD LOGFILE MEMBER '<caminho>' TO GROUP <n>;",
+      "referencia": "Oracle Administrator's Guide - Managing Redo Log Files"
+    },
+    "standby_redo": {
+      "minimo": 1,
+      "severidade": "warn",
+      "somente_se": {
+        "item": "standby_configurado",
+        "valor": "SIM"
+      },
+      "porque": "Sem standby redo logs o transporte nao usa real-time apply: o RPO piora para o tamanho de um redo inteiro.",
+      "acao": "Crie standby redo logs (um grupo a mais que o online, mesmo tamanho) no primario e no standby.",
+      "referencia": "MAA Best Practices - Data Guard"
+    }
+  },
+  "instalacao": {
+    "spfile_em_uso": {
+      "esperado": [
+        "SIM"
+      ],
+      "severidade": "warn",
+      "porque": "Banco iniciado por pfile ignora todo ALTER SYSTEM ... SCOPE=SPFILE: o ajuste feito na madrugada some no proximo restart e o problema volta sem explicacao.",
+      "acao": "CREATE SPFILE FROM MEMORY; (ou FROM PFILE) e reinicie na janela para o banco passar a subir pelo spfile.",
+      "referencia": "Oracle Administrator's Guide - Managing Initialization Parameters"
+    },
+    "compatible_alinhado": {
+      "esperado": [
+        "SIM"
+      ],
+      "severidade": "info",
+      "porque": "COMPATIBLE abaixo da versao instalada mantem o banco no comportamento antigo: paga-se o upgrade e nao se recebe otimizador, formato de bloco nem recurso novo.",
+      "acao": "Confirme que a aplicacao esta homologada e suba COMPATIBLE em janela (ALTER SYSTEM SET compatible='<versao>' SCOPE=SPFILE; exige restart). ATENCAO: subir COMPATIBLE nao tem volta sem restore.",
+      "referencia": "Oracle Upgrade Guide - COMPATIBLE"
+    },
+    "dst_upgrade_pendente": {
+      "esperado": [
+        "NAO"
+      ],
+      "severidade": "warn",
+      "porque": "Upgrade de timezone (DST) iniciado e nao concluido deixa o banco com duas versoes de regra de fuso: coluna TIMESTAMP WITH TIME ZONE passa a devolver hora errada, e ninguem relaciona o erro ao DST.",
+      "acao": "Conclua o upgrade com DBMS_DST (PREPARE/UPGRADE) em janela, seguindo a nota da sua versao. Enquanto pendente, trate como risco de dado.",
+      "referencia": "MOS 1585343.1 - Applying the DSTv Update"
+    },
+    "underscore_parametros_setados": {
+      "maximo": 0,
+      "severidade": "info",
+      "porque": "Parametro underscore e workaround de bug antigo, quase sempre indicado num SR que ninguem lembra. Depois do patch ele vira um comportamento estranho e permanente que nao aparece em documentacao nenhuma.",
+      "acao": "Liste com SELECT name, value FROM v$parameter WHERE name LIKE '\\_%' ESCAPE '\\' AND isdefault='FALSE'; e para cada um ache o SR/nota que o justificou. Sem justificativa viva, planeje a remocao em janela.",
+      "referencia": "Oracle AHF - ORAchk (non-default underscore parameters)"
+    },
+    "autotask_stats": {
+      "esperado": [
+        "ENABLED"
+      ],
+      "severidade": "warn",
+      "porque": "Com a coleta automatica de estatisticas desligada, o otimizador envelhece junto com os dados: e a causa classica do plano que 'mudou sozinho' meses depois.",
+      "acao": "Se nao ha coleta propria em job controlado, reative: DBMS_AUTO_TASK_ADMIN.ENABLE(client_name=>'auto optimizer stats collection', operation=>NULL, window_name=>NULL);",
+      "referencia": "Oracle Performance Tuning Guide - Automatic Statistics Gathering"
+    },
+    "autotask_space": {
+      "esperado": [
+        "ENABLED"
+      ],
+      "severidade": "info",
+      "porque": "Sem o auto space advisor o banco deixa de avisar sobre segmento com espaco desperdicado - informacao barata que evita crescimento desnecessario.",
+      "acao": "DBMS_AUTO_TASK_ADMIN.ENABLE(client_name=>'auto space advisor', operation=>NULL, window_name=>NULL);",
+      "referencia": "Oracle Administrator's Guide - Automated Maintenance Tasks"
+    },
+    "stats_estimate_percent": {
+      "esperado": [
+        "DBMS_STATS.AUTO_SAMPLE_SIZE"
+      ],
+      "severidade": "warn",
+      "porque": "ESTIMATE_PERCENT fixo (heranca de 9i/10g) amostra de menos em tabela grande: histograma e NDV saem errados e o plano vira loteria. Desde o 11g o AUTO_SAMPLE_SIZE le tudo por hash, com custo baixo.",
+      "acao": "EXEC DBMS_STATS.SET_GLOBAL_PREFS('ESTIMATE_PERCENT','DBMS_STATS.AUTO_SAMPLE_SIZE');",
+      "referencia": "Oracle Optimizer Blog - Best Practices for Gathering Statistics"
+    },
+    "stats_method_opt": {
+      "esperado": [
+        "FOR ALL COLUMNS SIZE AUTO"
+      ],
+      "severidade": "info",
+      "porque": "METHOD_OPT alterado a mao costuma desligar histograma onde ele era necessario (ou cria-lo onde so atrapalha o bind peeking).",
+      "acao": "EXEC DBMS_STATS.SET_GLOBAL_PREFS('METHOD_OPT','FOR ALL COLUMNS SIZE AUTO'); ajuste por tabela quando houver motivo medido.",
+      "referencia": "Oracle Optimizer Blog - Best Practices for Gathering Statistics"
+    }
+  },
+  "ha": {
+    "standby_file_management": {
+      "esperado": [
+        "AUTO"
+      ],
+      "severidade": "crit",
+      "somente_se": {
+        "item": "standby_configurado",
+        "valor": "SIM"
+      },
+      "porque": "Com MANUAL, um datafile criado no primario nao nasce no standby: o apply para com ORA-01274 e o Data Guard fica parado ate alguem perceber - normalmente no dia do failover.",
+      "acao": "ALTER SYSTEM SET standby_file_management=AUTO SCOPE=BOTH; (no standby e no primario)",
+      "referencia": "MAA Best Practices - Data Guard Configuration"
+    },
+    "log_archive_config": {
+      "proibido": [
+        "(nulo)"
+      ],
+      "severidade": "warn",
+      "somente_se": {
+        "item": "standby_configurado",
+        "valor": "SIM"
+      },
+      "porque": "Sem LOG_ARCHIVE_CONFIG o banco nao valida de quem aceita redo: o transporte funciona, mas o Data Guard fica sem a protecao contra destino errado e o switchover falha por configuracao incompleta.",
+      "acao": "ALTER SYSTEM SET log_archive_config='DG_CONFIG=(<primario>,<standby>)' SCOPE=BOTH;",
+      "referencia": "Oracle Data Guard Concepts and Administration"
+    },
+    "archive_lag_target": {
+      "minimo": 900,
+      "severidade": "info",
+      "somente_se": {
+        "item": "standby_configurado",
+        "valor": "SIM"
+      },
+      "porque": "Com 0 o redo so e arquivado quando o grupo enche: num periodo de pouca atividade o standby pode ficar horas atras sem que nada pareca errado.",
+      "acao": "ALTER SYSTEM SET archive_lag_target=1800 SCOPE=BOTH; (limita o atraso a 30 min)",
+      "referencia": "MAA Best Practices - Redo Transport"
+    },
+    "log_archive_max_processes": {
+      "minimo": 4,
+      "severidade": "info",
+      "porque": "Poucos processos ARCn atrasam o arquivamento em pico de redo; quando o arquivamento nao acompanha, o banco simplesmente para de aceitar transacao.",
+      "acao": "ALTER SYSTEM SET log_archive_max_processes=4 SCOPE=BOTH;",
+      "referencia": "MAA Best Practices - Redo Transport"
+    },
+    "db_flashback_retention_target": {
+      "minimo": 1440,
+      "severidade": "info",
+      "somente_se": {
+        "item": "flashback_on",
+        "valor": "YES"
+      },
+      "porque": "Flashback ligado com janela curta da a falsa sensacao de rede de seguranca: no dia do erro humano, o ponto para onde voltar ja expirou.",
+      "acao": "ALTER SYSTEM SET db_flashback_retention_target=1440 SCOPE=BOTH; (24h) e confira o espaco da FRA.",
+      "referencia": "Oracle Backup and Recovery Guide - Flashback Database"
+    },
+    "undo_autoextend": {
+      "esperado": [
+        "SIM"
+      ],
+      "severidade": "warn",
+      "porque": "Undo sem autoextend transforma uma transacao longa em ORA-30036 e derruba a carga inteira; com autoextend o banco atravessa o pico e o DBA trata depois.",
+      "acao": "ALTER DATABASE DATAFILE '<datafile de undo>' AUTOEXTEND ON NEXT 256M MAXSIZE <limite>; sempre com MAXSIZE, para nao encher o filesystem.",
+      "referencia": "Oracle Administrator's Guide - Managing Undo"
+    },
+    "default_temp_tablespace": {
+      "proibido": [
+        "SYSTEM"
+      ],
+      "severidade": "crit",
+      "porque": "Com a temporaria padrao em SYSTEM, todo sort de usuario grava no tablespace do dicionario: contencao imediata e risco de encher SYSTEM, que para o banco.",
+      "acao": "CREATE TEMPORARY TABLESPACE temp TEMPFILE ...; ALTER DATABASE DEFAULT TEMPORARY TABLESPACE temp;",
+      "referencia": "Oracle Administrator's Guide - Temporary Tablespaces"
+    },
+    "default_permanent_tablespace": {
+      "proibido": [
+        "SYSTEM"
+      ],
+      "severidade": "warn",
+      "porque": "Usuario criado sem tablespace explicito passa a gravar objeto de aplicacao dentro de SYSTEM - a origem mais comum de 'objeto de usuario em SYSTEM'.",
+      "acao": "ALTER DATABASE DEFAULT TABLESPACE <tablespace de dados>;",
+      "referencia": "Oracle Administrator's Guide - Managing Tablespaces"
+    }
+  },
+  "seguranca": {
+    "contas_senha_default": {
+      "maximo": 0,
+      "severidade": "crit",
+      "porque": "Conta aberta com a senha default de instalacao e credencial publicada: qualquer lista de senhas Oracle da internet entra no banco.",
+      "acao": "Liste com SELECT * FROM dba_users_with_defpwd; troque a senha das contas em uso e bloqueie/expire as que nao sao usadas.",
+      "referencia": "Oracle Database Security Guide - Default Passwords"
+    },
+    "profiles_senha_sem_expiracao": {
+      "maximo": 0,
+      "severidade": "warn",
+      "porque": "PASSWORD_LIFE_TIME UNLIMITED mantem viva para sempre a senha de quem ja saiu da empresa - e costuma ser achado direto de auditoria.",
+      "acao": "ALTER PROFILE <profile> LIMIT PASSWORD_LIFE_TIME 180; combine com PASSWORD_GRACE_TIME para a aplicacao nao parar na virada.",
+      "referencia": "CIS Oracle Database Benchmark - Password Profiles"
+    },
+    "profiles_sem_limite_de_tentativas": {
+      "maximo": 0,
+      "severidade": "warn",
+      "porque": "FAILED_LOGIN_ATTEMPTS UNLIMITED deixa o banco aberto a forca bruta: da para tentar senha a noite inteira sem travar a conta nem gerar alarme.",
+      "acao": "ALTER PROFILE <profile> LIMIT FAILED_LOGIN_ATTEMPTS 10; avalie o impacto em usuario de aplicacao com senha antiga em cache.",
+      "referencia": "CIS Oracle Database Benchmark - Password Profiles"
+    },
+    "grants_perigosos_a_public": {
+      "maximo": 0,
+      "severidade": "info",
+      "porque": "EXECUTE a PUBLIC em UTL_FILE, UTL_TCP, UTL_HTTP ou UTL_SMTP da a qualquer usuario do banco um caminho para ler arquivo do servidor ou abrir conexao de rede a partir dele - inclusive para levar dado para fora. Vem assim de fabrica, e por isso quase nunca foi revisado: nao e incidente, e hardening pendente.",
+      "acao": "REVOKE EXECUTE ON <pacote> FROM PUBLIC; e conceda apenas ao schema que precisa. Teste antes: aplicacao antiga costuma depender do grant a PUBLIC.",
+      "referencia": "Oracle Database Security Guide - Revoking Privileges from PUBLIC"
+    },
+    "usuarios_com_role_dba": {
+      "maximo": 5,
+      "severidade": "info",
+      "porque": "Role DBA distribuida e o fim da rastreabilidade: depois do incidente nao ha como responder quem podia ter feito.",
+      "acao": "Liste com SELECT grantee FROM dba_role_privs WHERE granted_role='DBA'; e troque por privilegio minimo (ex.: SELECT_CATALOG_ROLE para quem so diagnostica).",
+      "referencia": "Oracle Database Security Guide - Least Privilege"
+    },
+    "audit_sys_operations": {
+      "esperado": [
+        "TRUE"
+      ],
+      "severidade": "warn",
+      "porque": "Sem auditar as operacoes de SYSDBA, justamente a conexao mais poderosa do banco e a unica que nao deixa rastro.",
+      "acao": "ALTER SYSTEM SET audit_sys_operations=TRUE SCOPE=SPFILE; exige restart. No 12c+ com Unified Auditing isso ja e coberto pelas policies.",
+      "referencia": "Oracle Database Security Guide - Auditing SYS"
+    },
+    "unified_auditing": {
+      "proibido": [
+        "FALSE"
+      ],
+      "severidade": "info",
+      "porque": "A auditoria tradicional foi deprecada: sem Unified Auditing a trilha fica espalhada entre tabela, arquivo e syslog, e nenhuma delas responde sozinha 'quem fez'.",
+      "acao": "Avalie migrar para Unified Auditing (relink com uniaud_on, exige restart) e crie policies do que realmente precisa ser auditado.",
+      "referencia": "Oracle Database Security Guide - Unified Auditing"
+    }
+  },
+  "estrutura": {
+    "objetos_usuario_em_system": {
+      "maximo": 0,
+      "severidade": "warn",
+      "porque": "Objeto de aplicacao dentro de SYSTEM compete com o dicionario pelo mesmo espaco: quando SYSTEM enche, o banco para inteiro - nao so a aplicacao.",
+      "acao": "Mova para um tablespace de dados (ALTER TABLE ... MOVE TABLESPACE ...; ALTER INDEX ... REBUILD) e ajuste o default tablespace do usuario.",
+      "referencia": "Oracle Administrator's Guide - The SYSTEM Tablespace"
+    },
+    "objetos_usuario_em_sysaux": {
+      "maximo": 0,
+      "severidade": "info",
+      "porque": "SYSAUX e dimensionada para os componentes do proprio banco (AWR inclusive). Objeto de usuario ali disputa espaco com o repositorio de diagnostico.",
+      "acao": "Mova para o tablespace de dados da aplicacao.",
+      "referencia": "Oracle Administrator's Guide - The SYSAUX Tablespace"
+    },
+    "tablespaces_dictionary_managed": {
+      "maximo": 0,
+      "severidade": "warn",
+      "porque": "Tablespace dictionary-managed e heranca de 8i/9i: cada alocacao de extent vira DML no dicionario, com contencao de ST enqueue que nenhuma versao moderna deveria ver.",
+      "acao": "Migre para locally managed (DBMS_SPACE_ADMIN.TABLESPACE_MIGRATE_TO_LOCAL) ou crie um tablespace novo e mova os objetos.",
+      "referencia": "Oracle Administrator's Guide - Locally Managed Tablespaces"
+    },
+    "tablespaces_sem_assm": {
+      "maximo": 0,
+      "severidade": "info",
+      "porque": "Sem ASSM o espaco livre e controlado por freelist: em carga concorrente isso vira 'buffer busy waits' em insert, e o ajuste (FREELISTS) tem de ser feito objeto a objeto.",
+      "acao": "Crie o tablespace com SEGMENT SPACE MANAGEMENT AUTO e mova os objetos com mais concorrencia de insert.",
+      "referencia": "Oracle Administrator's Guide - Automatic Segment Space Management"
+    },
+    "sequences_nocache": {
+      "maximo": 0,
+      "severidade": "warn",
+      "porque": "Sequence NOCACHE grava no dicionario a cada NEXTVAL: em RAC vira 'row cache lock' / 'DFS lock handle' e a insercao inteira serializa entre os nos.",
+      "acao": "ALTER SEQUENCE <owner>.<nome> CACHE 1000; (aceite o salto de numero apos restart - ordem sem buraco so com ORDER, que custa caro em RAC).",
+      "referencia": "Oracle RAC Administration - Sequence Cache"
+    },
+    "sequences_cache_baixo": {
+      "maximo": 0,
+      "severidade": "info",
+      "porque": "Cache de 20 (o padrao) e pouco para sequence de tabela quente: o recarregamento constante do cache reaparece como contencao em pico.",
+      "acao": "Para as sequences de maior volume, ALTER SEQUENCE ... CACHE 1000;",
+      "referencia": "Oracle RAC Administration - Sequence Cache"
+    }
+  }
+}

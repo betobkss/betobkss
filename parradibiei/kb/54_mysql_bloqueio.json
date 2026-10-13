@@ -1,0 +1,103 @@
+{
+  "id": "mysql_bloqueio",
+  "plataforma": "mysql",
+  "ordem": 54,
+  "titulo": "MySQL/InnoDB: lock wait timeout, deadlock e transacao longa",
+  "quando_usar": "'Lock wait timeout exceeded; try restarting transaction' (erro 1205), 'Deadlock found when trying to get lock' (erro 1213), gravacao travada, ou history list crescendo sem parar.",
+  "tags": [
+    "mysql",
+    "mariadb",
+    "innodb",
+    "lock wait timeout exceeded",
+    "erro 1205",
+    "deadlock found",
+    "erro 1213",
+    "data_locks",
+    "data_lock_waits",
+    "innodb_trx",
+    "history list length",
+    "undo",
+    "metadata lock",
+    "MDL",
+    "waiting for table metadata lock",
+    "innodb_lock_wait_timeout",
+    "gap lock"
+  ],
+  "sintomas": [
+    "lock wait timeout exceeded try restarting transaction",
+    "deadlock found when trying to get lock",
+    "waiting for table metadata lock",
+    "insert travado no mysql",
+    "history list length crescendo",
+    "alter table pendurado"
+  ],
+  "secoes": [],
+  "fontes": [
+    "MySQL Reference Manual - performance_schema.data_locks e data_lock_waits",
+    "MySQL Reference Manual - InnoDB Locking and Transaction Model",
+    "MySQL Reference Manual - SHOW ENGINE INNODB STATUS (LATEST DETECTED DEADLOCK)",
+    "MySQL Reference Manual - Metadata Locking e sys.schema_table_lock_waits"
+  ],
+  "nota": "Dois enganos dominam este assunto. O primeiro: o erro 1205 (lock wait timeout) NAO e deadlock - o InnoDB detecta deadlock em milissegundos e devolve 1213 matando a transacao mais barata; o 1205 significa que havia uma fila VIVA e a sua espera estourou innodb_lock_wait_timeout (50s por padrao). O segundo, mais traicoeiro: nem todo bloqueio no MySQL e do InnoDB. 'Waiting for table metadata lock' e lock de DICIONARIO, nao aparece em data_locks, e e causado por uma transacao aberta - ate um SELECT - que impede o ALTER TABLE de entrar. E quando o ALTER entra na fila, ele passa a bloquear todas as consultas seguintes na mesma tabela, derrubando a aplicacao inteira por causa de uma transacao esquecida.",
+  "verificado": {
+    "nivel": "estrutura",
+    "observacao": "Consultas escritas a partir do MySQL Reference Manual (8.0). NAO executadas: esta maquina nao tem cliente MySQL nem driver. Em MySQL 5.7 e MariaDB os nomes mudam (information_schema.INNODB_LOCKS em vez de performance_schema.data_locks) - confirme a versao antes de usar."
+  },
+  "passos": [
+    {
+      "titulo": "Quem espera e quem segura, agora",
+      "objetivo": "A fila viva do InnoDB, ja ligada - data_lock_waits faz o cruzamento que antes exigia tres tabelas.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT w.requesting_engine_transaction_id AS trx_espera,\n       w.blocking_engine_transaction_id  AS trx_segura,\n       rl.object_schema,\n       rl.object_name,\n       rl.lock_type,\n       rl.lock_mode,\n       rt.trx_query  AS consulta_bloqueada,\n       bt.trx_query  AS consulta_bloqueadora,\n       bt.trx_started AS bloqueadora_iniciou_em\nFROM   performance_schema.data_lock_waits AS w\nJOIN   performance_schema.data_locks AS rl\n       ON rl.engine_lock_id = w.requesting_engine_lock_id\nLEFT   JOIN information_schema.innodb_trx AS rt\n       ON rt.trx_id = w.requesting_engine_transaction_id\nLEFT   JOIN information_schema.innodb_trx AS bt\n       ON bt.trx_id = w.blocking_engine_transaction_id;",
+      "olhar": "consulta_bloqueadora NULA e o achado mais importante deste passo: significa que a transacao que segura o lock NAO esta executando nada - esta aberta e ociosa, esperando o cliente. lock_type='RECORD' com lock_mode contendo 'GAP' aponta gap lock, tipico de REPEATABLE READ com range - conflito que surpreende quem espera conflito so em linha existente.",
+      "armadilha": "Em MySQL 5.7 estas tabelas nao existem com estes nomes (era information_schema.INNODB_LOCKS / INNODB_LOCK_WAITS, removidas no 8.0) e em MariaDB a evolucao foi outra. Rodar a consulta errada devolve 'table doesn't exist', que parece falta de privilegio - confirme a versao primeiro."
+    },
+    {
+      "titulo": "A transacao mais antiga aberta",
+      "objetivo": "Achar a transacao esquecida - causa comum dos tres sintomas (lock, MDL e crescimento do undo).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT t.trx_id,\n       t.trx_state,\n       t.trx_started,\n       TIMESTAMPDIFF(SECOND, t.trx_started, NOW()) AS aberta_s,\n       t.trx_rows_locked,\n       t.trx_rows_modified,\n       t.trx_mysql_thread_id,\n       p.user,\n       p.host,\n       p.db,\n       p.command,\n       p.time AS thread_time_s,\n       LEFT(COALESCE(t.trx_query, p.info, ''), 120) AS consulta\nFROM   information_schema.innodb_trx AS t\nLEFT   JOIN information_schema.processlist AS p\n       ON p.id = t.trx_mysql_thread_id\nORDER  BY t.trx_started;",
+      "olhar": "Primeira linha e a suspeita. trx_state='RUNNING' com trx_query NULO e command='Sleep' e a assinatura da transacao aberta e abandonada: a thread nao faz nada, mas o BEGIN continua de pe. trx_rows_modified alto avisa o tamanho do rollback caso voce decida matar. aberta_s em milhares de segundos com poucas linhas modificadas e quase sempre defeito de aplicacao (autocommit desligado sem commit no fim).",
+      "armadilha": "trx_state 'RUNNING' NAO significa que ha um comando executando - significa que a transacao esta ativa (nao em rollback nem esperando lock). A confusao leva o DBA a procurar uma consulta pesada que nao existe, quando o problema e ausencia de commit."
+    },
+    {
+      "titulo": "Bloqueio de metadados (o que nao aparece em data_locks)",
+      "objetivo": "Diagnosticar 'Waiting for table metadata lock', que tem causa e cura diferentes do lock de linha.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT id, user, host, db, command, time, state,\n       LEFT(info, 120) AS consulta\nFROM   information_schema.processlist\nWHERE  state LIKE '%metadata lock%'\n   OR  state LIKE '%table lock%'\nORDER  BY time DESC;\n\nSELECT * FROM sys.schema_table_lock_waits;",
+      "olhar": "Se ha threads em 'Waiting for table metadata lock', identifique o DDL na fila e quem o bloqueia. O sys.schema_table_lock_waits nomeia as duas pontas. A causa quase sempre e uma transacao antiga (passo 2) que tocou a tabela - inclusive com SELECT - e nunca fez commit.",
+      "armadilha": "Um ALTER TABLE esperando MDL nao espera quieto: ele entra na fila e BLOQUEIA todas as consultas que chegarem depois na mesma tabela, mesmo SELECTs simples. Uma transacao esquecida + um ALTER de rotina derrubam a aplicacao inteira, e o sintoma reportado e 'o banco caiu' - nao 'o ALTER esta lento'. Matar o ALTER costuma restaurar o servico na hora."
+    },
+    {
+      "titulo": "O ultimo deadlock, na integra",
+      "objetivo": "Deadlock ja foi resolvido pelo InnoDB. O que se busca aqui e o padrao, para evitar a reincidencia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SHOW ENGINE INNODB STATUS;",
+      "olhar": "Va direto a secao 'LATEST DETECTED DEADLOCK': ela traz as duas transacoes, os indices disputados e qual foi a vitima. Compare a ORDEM de acesso aos objetos - o padrao quase universal e as duas transacoes tocarem as mesmas tabelas em ordem inversa. A secao 'TRANSACTIONS' mostra tambem o History list length: valor na casa dos milhoes indica undo nao purgado, o que vem de transacao longa.",
+      "armadilha": "A saida guarda apenas o ULTIMO deadlock e e perdida no restart. Se houve uma rajada, voce ve so o final dela; e se o servidor reiniciou, nao ha evidencia nenhuma. Para historico, e preciso ter innodb_print_all_deadlocks ligado ANTES do incidente - conferir isso agora e o que evita repetir a cegueira no proximo."
+    },
+    {
+      "titulo": "Configuracao que define o comportamento da espera",
+      "objetivo": "Saber por que a espera terminou em erro - e se o desenho atual e o desejado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SHOW VARIABLES WHERE Variable_name IN (\n  'innodb_lock_wait_timeout',\n  'innodb_deadlock_detect',\n  'innodb_print_all_deadlocks',\n  'transaction_isolation',\n  'autocommit',\n  'lock_wait_timeout'\n);",
+      "olhar": "innodb_lock_wait_timeout padrao 50s e o que produz o erro 1205. innodb_deadlock_detect=OFF (usado em cargas de altissima concorrencia) troca deteccao por timeout: nesse modo o deadlock NAO e detectado e vira 1205 depois de 50s, o que muda toda a interpretacao. transaction_isolation em REPEATABLE-READ explica gap locks que nao existiriam em READ-COMMITTED. lock_wait_timeout (sem o prefixo innodb) e o de METADATA e costuma estar em 31536000 - um ano.",
+      "armadilha": "innodb_lock_wait_timeout e lock_wait_timeout sao parametros DIFERENTES: o primeiro vale para lock de linha do InnoDB, o segundo para metadados. Ajustar o errado nao muda nada no sintoma e o DBA conclui que o parametro 'nao funciona'."
+    },
+    {
+      "titulo": "Encerrar a transacao que segura",
+      "objetivo": "Liberar a fila quando esperar ja custa mais que o rollback.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "comando": "-- reconfirme o alvo (o id de thread e reciclado):\nSELECT trx_mysql_thread_id, trx_started, trx_rows_modified\nFROM   information_schema.innodb_trx\nORDER  BY trx_started;\n\n-- encerrar so a consulta, preservando a conexao e a transacao:\n-- KILL QUERY <thread_id>;\n\n-- encerrar a conexao inteira (dispara ROLLBACK da transacao):\n-- KILL <thread_id>;",
+      "antes_de_executar": "1) Reconfirme o thread_id imediatamente antes: ele e reciclado e voce pode derrubar outra sessao. 2) Escolha o comando certo - KILL QUERY aborta o comando e MANTEM a transacao aberta (nao serve para transacao ociosa, que e o caso mais comum aqui); KILL encerra a conexao e faz rollback. 3) Meca trx_rows_modified: rollback no InnoDB pode ser mais lento que a propria transacao, e o lock continua segurado durante ele. 4) Avise o dono (user/host do passo 2). 5) Se o alvo for um ALTER TABLE preso em MDL, matar o ALTER costuma liberar dezenas de sessoes de uma vez e e a acao de menor impacto. 6) Registre: CASO.py <caso> --acao 'KILL thread <id>' --risco alto.",
+      "olhar": "Reexecute o passo 1: a fila deve esvaziar. Uma transacao em rollback continua visivel em innodb_trx com trx_state='ROLLING BACK' - e esperado, e nao adianta repetir o KILL. Acompanhe trx_rows_modified diminuindo para estimar o fim.",
+      "armadilha": "Matar a transacao sem tratar a causa apenas adia: se a origem e autocommit desligado com codigo que nao faz commit no caminho de excecao, o mesmo bloqueio volta no proximo erro da aplicacao - agora com o time convencido de que 'o banco esta instavel'."
+    }
+  ]
+}

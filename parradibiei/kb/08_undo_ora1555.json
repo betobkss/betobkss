@@ -1,0 +1,120 @@
+{
+  "id": "undo_ora1555",
+  "ordem": 8,
+  "titulo": "UNDO: snapshot too old (ORA-01555) e undo cheio (ORA-30036)",
+  "quando_usar": "Relatorio longo morre com ORA-01555, batch falha com ORA-30036, ou a tablespace de UNDO nao para de crescer. Tambem quando ha rollback demorado apos matar sessao.",
+  "tags": [
+    "undo",
+    "ORA-01555",
+    "ORA-30036",
+    "rollback",
+    "retention",
+    "consistencia de leitura",
+    "flashback"
+  ],
+  "sintomas": [
+    "snapshot too old",
+    "unable to extend segment in undo tablespace",
+    "undo crescendo",
+    "rollback demorado",
+    "relatorio longo falha no fim"
+  ],
+  "erros_ora": [
+    "ORA-01555",
+    "ORA-30036",
+    "ORA-01650",
+    "ORA-01628"
+  ],
+  "secoes": [
+    "Undo",
+    "Transacoes",
+    "Espaco",
+    "Sessoes"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Managing Undo",
+    "Oracle Database Reference - V$UNDOSTAT, DBA_UNDO_EXTENTS",
+    "AskTom / Jonathan Lewis - consistencia de leitura e o custo do delayed block cleanout"
+  ],
+  "nota": "Entenda o mecanismo antes de agir: ORA-01555 NAO e falta de espaco - e o bloco de undo que a sua consulta precisava ter sido SOBRESCRITO por outra transacao. Aumentar undo_retention sem espaco no datafile nao resolve nada, porque a retencao so e honrada se houver onde guardar.",
+  "passos": [
+    {
+      "titulo": "Ver o dimensionamento e a retencao efetiva",
+      "objetivo": "Confirmar se a retencao configurada e a que o banco consegue realmente honrar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT (SELECT value FROM v$parameter WHERE name='undo_retention')\n         AS undo_retention_s,\n       (SELECT value FROM v$parameter WHERE name='undo_tablespace')\n         AS undo_ts,\n       (SELECT retention FROM dba_tablespaces\n         WHERE tablespace_name = (SELECT UPPER(value) FROM v$parameter\n                                  WHERE name='undo_tablespace'))\n         AS modo_retencao\nFROM dual;\n\nSELECT MAX(tuned_undoretention) AS retencao_efetiva_s,\n       MAX(maxquerylen) AS maior_consulta_s,\n       MAX(undoblks) AS pico_blocos,\n       SUM(ssolderrcnt) AS erros_1555,\n       SUM(nospaceerrcnt) AS erros_sem_espaco\nFROM v$undostat WHERE begin_time > SYSDATE - 7;",
+      "olhar": "Compare maior_consulta_s com retencao_efetiva_s: se a consulta dura MAIS que a retencao, o ORA-01555 e questao de tempo. ssolderrcnt conta os ORA-01555 ja ocorridos; nospaceerrcnt conta os ORA-30036.",
+      "armadilha": "modo_retencao = NOGUARANTEE (o padrao) significa que o Oracle PODE sobrescrever undo ainda dentro da retencao para nao falhar um DML. Ou seja, undo_retention e um alvo, nao uma promessa - a menos que seja RETENTION GUARANTEE."
+    },
+    {
+      "titulo": "Dimensionar: quanto undo a carga realmente pede",
+      "objetivo": "Sair do chute. O proprio banco tem o dado para calcular o tamanho necessario.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(begin_time,'DD/MM HH24:MI') AS janela,\n       undoblks, txncount, maxquerylen AS maior_query_s,\n       maxconcurrency AS transacoes_simultaneas,\n       tuned_undoretention AS retencao_s\nFROM v$undostat\nORDER BY begin_time DESC FETCH FIRST 24 ROWS ONLY;\n\n-- tamanho necessario = pico de geracao x retencao desejada:\nWITH pico AS (\n  SELECT MAX(undoblks/((end_time-begin_time)*86400)) AS blocos_por_seg\n  FROM v$undostat WHERE begin_time > SYSDATE - 7)\nSELECT ROUND(p.blocos_por_seg\n       * (SELECT TO_NUMBER(value) FROM v$parameter WHERE name='undo_retention')\n       * (SELECT TO_NUMBER(value) FROM v$parameter WHERE name='db_block_size')\n       /1024/1024/1024, 2) AS undo_necessario_gb\nFROM pico p;",
+      "olhar": "Compare undo_necessario_gb com o tamanho atual da tablespace de undo. Este e o numero que justifica tecnicamente um pedido de espaco.",
+      "armadilha": "V$UNDOSTAT guarda 7 dias em janelas de 10 minutos. Se o fechamento mensal e o pico real, colete na epoca certa - a media da semana comum vai subdimensionar. Nota tecnica: a conta precisa da clausula WITH - subconsulta escalar dentro do argumento de uma funcao de grupo nao compila (ORA-00907)."
+    },
+    {
+      "titulo": "Ver a ocupacao atual do undo por estado",
+      "objetivo": "Saber quanto do undo esta em uso ativo, quanto ainda esta protegido pela retencao e quanto ja pode ser reciclado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT status, COUNT(*) AS extents,\n       ROUND(SUM(bytes)/1024/1024/1024,2) AS gb\nFROM dba_undo_extents GROUP BY status;\n\nSELECT tablespace_name,\n       ROUND(used_space*8/1024/1024,2) AS usado_gb,\n       ROUND(tablespace_size*8/1024/1024,2) AS total_gb,\n       ROUND(used_percent,1) AS pct\nFROM dba_tablespace_usage_metrics\nWHERE tablespace_name IN (SELECT UPPER(value) FROM v$parameter\n                          WHERE name='undo_tablespace');",
+      "olhar": "ACTIVE = transacao aberta agora (nao pode ser tocado). UNEXPIRED = dentro da retencao. EXPIRED = ja pode ser reciclado. Muito ACTIVE = transacao gigante ou esquecida aberta; pouco EXPIRED com tablespace cheia = ORA-30036 a caminho.",
+      "armadilha": "ACTIVE alto e persistente quase sempre e transacao que ninguem fechou (falta de commit/rollback na aplicacao), nao dimensionamento. Ver o proximo passo antes de pedir disco."
+    },
+    {
+      "titulo": "Achar a transacao que segura o undo",
+      "objetivo": "Uma unica transacao esquecida pode travar a reciclagem de todo o undo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username, s.machine, s.program,\n       s.status,\n       TO_CHAR(t.start_date,'DD/MM HH24:MI:SS') AS inicio,\n       ROUND((SYSDATE - t.start_date)*24*60,1) AS min_aberta,\n       t.used_ublk AS blocos_undo, t.used_urec AS registros,\n       ROUND(t.used_ublk *\n         (SELECT TO_NUMBER(value) FROM v$parameter\n           WHERE name='db_block_size')/1024/1024,1) AS mb_undo\nFROM gv$transaction t\nJOIN gv$session s ON s.saddr = t.ses_addr AND s.inst_id = t.inst_id\nORDER BY t.used_ublk DESC;",
+      "olhar": "Transacao com horas de vida e used_ublk alto e a culpada. Se o status da sessao for INACTIVE, e transacao abandonada: o problema esta na aplicacao.",
+      "armadilha": "Matar essa sessao dispara rollback proporcional a used_ublk - pode demorar mais que esperar e consome ainda mais recurso. Ver o playbook de sessoes e locks antes."
+    },
+    {
+      "titulo": "Identificar a consulta vitima do ORA-01555",
+      "objetivo": "Saber QUAL consulta longa esta falhando, para poder tratar a consulta em vez do undo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(originating_timestamp,'DD/MM HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),\n                           CHR(13),' ')),1,150) AS mensagem\nFROM v$diag_alert_ext\nWHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(7,'DAY')\n  AND REGEXP_LIKE(message_text,'ORA-0?1555')\nORDER BY originating_timestamp DESC FETCH FIRST 20 ROWS ONLY;\n\n-- consultas mais longas em execucao agora:\nSELECT inst_id, sid, serial#, username, sql_id,\n       ROUND(last_call_et/60,1) AS min_rodando, status\nFROM gv$session\nWHERE status = 'ACTIVE' AND username IS NOT NULL\n  AND last_call_et > 600\nORDER BY last_call_et DESC;",
+      "olhar": "Horario do ORA-01555 casando com o horario de uma carga pesada significa concorrencia entre o relatorio longo e o batch que gera undo. A solucao costuma ser de JANELA, nao de tamanho.",
+      "armadilha": "ORA-01555 tambem ocorre por delayed block cleanout: uma consulta le blocos de uma transacao gigante recem-commitada e precisa do undo para confirmar o commit. Nesse caso a vitima nao tem culpa nenhuma e o alvo e a transacao anterior."
+    },
+    {
+      "titulo": "Aumentar a retencao de undo",
+      "objetivo": "Quando a consulta longa e legitima e ha espaco, dar mais tempo antes do undo ser reciclado.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme no passo 2 que HA espaco para sustentar a nova retencao - retencao maior sem espaco nao e honrada e pode virar ORA-30036, que e pior que o ORA-01555. 2) Anote o valor atual. 3) Use como alvo o maxquerylen do passo 1, com folga. 4) Registre a acao. 5) Reverter e o mesmo comando com o valor antigo.",
+      "comando": "SHOW PARAMETER undo_retention\n\nALTER SYSTEM SET undo_retention = <segundos> SCOPE=BOTH;",
+      "olhar": "Acompanhe tuned_undoretention em V$UNDOSTAT nas horas seguintes: se ele nao subir para perto do novo valor, falta espaco e o banco esta ignorando o pedido.",
+      "armadilha": "Com AUTOEXTEND ligado no datafile de undo, aumentar a retencao pode fazer a tablespace crescer sozinha ate encher o filesystem. Confira o MAXSIZE antes."
+    },
+    {
+      "titulo": "Garantir a retencao (RETENTION GUARANTEE)",
+      "objetivo": "Transformar a retencao de alvo em promessa, quando o relatorio nao pode falhar.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) ENTENDA A TROCA: com GUARANTEE o banco prefere FALHAR UM DML (ORA-30036) a sobrescrever undo dentro da retencao. Voce esta escolhendo derrubar a escrita para salvar a leitura. 2) So faca isso se o negocio confirmar essa prioridade. 3) Garanta espaco de undo suficiente ANTES (passo 2). 4) Registre a acao com risco medio e o motivo. 5) Reverter: ALTER TABLESPACE <undo> RETENTION NOGUARANTEE.",
+      "comando": "ALTER TABLESPACE <undo_ts> RETENTION GUARANTEE;",
+      "olhar": "Confirme em DBA_TABLESPACES.RETENTION. Depois acompanhe nospaceerrcnt em V$UNDOSTAT: se comecar a subir, o DML esta sendo sacrificado.",
+      "armadilha": "Esta e a causa classica de ORA-30036 aparecendo 'do nada' semanas depois: alguem ligou GUARANTEE para resolver um ORA-01555 e ninguem lembrou. Documente no caso."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Na maioria dos incidentes o undo e vitima, nao culpado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- quem mais gera undo/redo (candidatos a rever a logica):\nSELECT s.username, s.program, s.module,\n       SUM(t.used_ublk) AS blocos_undo\nFROM gv$transaction t\nJOIN gv$session s ON s.saddr = t.ses_addr AND s.inst_id = t.inst_id\nGROUP BY s.username, s.program, s.module\nORDER BY blocos_undo DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "As correcoes reais, em ordem: (1) separar a janela do relatorio longo da janela do batch; (2) fazer o batch commitar em lotes em vez de uma transacao unica gigante; (3) usar Flashback Query ou uma copia para relatorio; (4) so entao aumentar undo.",
+      "armadilha": "'Commit dentro do loop' resolve o undo mas cria ORA-01555 para quem le - o commit frequente recicla undo mais rapido. O certo e commitar em LOTES, nao a cada linha."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

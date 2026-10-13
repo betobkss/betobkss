@@ -1,0 +1,137 @@
+{
+  "id": "volumetria_crescimento",
+  "titulo": "Volumetria e projecao de crescimento (capacity planning)",
+  "quando_usar": "Precisa responder 'quando o banco enche?', dimensionar storage para os proximos meses, justificar pedido de espaco, ou entender por que um tablespace cresceu de repente.",
+  "tags": [
+    "volumetria",
+    "crescimento",
+    "capacity",
+    "capacity planning",
+    "projecao",
+    "quando enche",
+    "crescimento vegetativo",
+    "tendencia de espaco",
+    "storage",
+    "dimensionamento",
+    "top segmentos",
+    "maiores tabelas",
+    "crescimento de tabela",
+    "dba_hist_tbspc_space_usage",
+    "espaco"
+  ],
+  "sintomas": [
+    "pedido de dimensionamento de storage para os proximos meses",
+    "tablespace que cresceu muito acima do normal em pouco tempo",
+    "necessidade de justificar aumento de area com numero, nao com percepcao",
+    "duvida sobre qual objeto e responsavel pelo crescimento",
+    "banco que atinge o limite do storage sem ninguem ter previsto"
+  ],
+  "secoes": [
+    "Tablespaces",
+    "Previsao de capacidade (dias ate encher)",
+    "TOP 10 SEGMENTOS",
+    "ASM Diskgroups",
+    "DATAFILES AUTOEXTEND OFF",
+    "Datafiles sem AUTOEXTEND"
+  ],
+  "erros_ora": [
+    "ORA-01653",
+    "ORA-01652",
+    "ORA-01688",
+    "ORA-01691",
+    "ORA-30036"
+  ],
+  "fontes": [
+    "Oracle Database Reference 19c - DBA_HIST_TBSPC_SPACE_USAGE, DBA_SEGMENTS",
+    "Oracle Database Administrator's Guide 19c - Managing Tablespaces",
+    "Pratica de campo: roteiro de volumetria e capacity aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "Projecao de crescimento so vale com o HISTORICO do AWR (DBA_HIST_TBSPC_SPACE_USAGE), e ele guarda apenas a retencao configurada - tipicamente 8 a 31 dias. Projetar 12 meses com 8 dias de amostra e chute com aparencia de numero. Este playbook separa o que e MEDIDO do que e ESTIMADO, e sempre declara a janela usada. Atencao a licenca: as views DBA_HIST_* exigem Diagnostics Pack.",
+  "passos": [
+    {
+      "titulo": "Retrato de hoje: alocado, usado e livre por tablespace",
+      "objetivo": "Estabelecer o ponto de partida antes de falar de tendencia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT df.tablespace_name,\n       ROUND(df.alocado_mb)                       AS alocado_mb,\n       ROUND(df.maximo_mb)                        AS maximo_mb,\n       ROUND(df.alocado_mb - NVL(fs.livre_mb, 0)) AS usado_mb,\n       ROUND(NVL(fs.livre_mb, 0))                 AS livre_no_alocado_mb,\n       ROUND((df.alocado_mb - NVL(fs.livre_mb, 0)) / df.alocado_mb * 100, 1) AS pct_do_alocado,\n       ROUND((df.alocado_mb - NVL(fs.livre_mb, 0)) / df.maximo_mb  * 100, 1) AS pct_do_maximo,\n       df.arquivos,\n       df.autoextend\nFROM   (SELECT tablespace_name,\n               SUM(bytes)/1024/1024 AS alocado_mb,\n               SUM(GREATEST(bytes, DECODE(autoextensible, 'YES', maxbytes, bytes)))/1024/1024 AS maximo_mb,\n               COUNT(*) AS arquivos,\n               MAX(autoextensible) AS autoextend\n        FROM   dba_data_files\n        GROUP  BY tablespace_name) df\nLEFT   JOIN (SELECT tablespace_name, SUM(bytes)/1024/1024 AS livre_mb\n             FROM   dba_free_space\n             GROUP  BY tablespace_name) fs\n       ON fs.tablespace_name = df.tablespace_name\nORDER  BY pct_do_maximo DESC;",
+      "olhar": "A coluna que importa e PCT_DO_MAXIMO, nao PCT_DO_ALOCADO. Um tablespace com 99% do alocado mas AUTOEXTEND ON e maximo distante nao esta em risco; um com 85% do alocado e AUTOEXTEND OFF nao tem para onde crescer.",
+      "armadilha": "MAXBYTES tem teto por arquivo (32 GB com bloco de 8 KB em datafile smallfile). Um datafile 'AUTOEXTEND ON MAXSIZE UNLIMITED' para de crescer nesse teto e o banco devolve ORA-01653 mesmo com storage sobrando no host. Conte quantos arquivos ja estao perto de 32 GB."
+    },
+    {
+      "titulo": "Saber quanto historico existe antes de projetar",
+      "objetivo": "Descobrir a janela real disponivel - e a honestidade de qualquer projecao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT COUNT(DISTINCT snap_id) AS snapshots,\n       COUNT(DISTINCT tablespace_id) AS tablespaces,\n       TO_CHAR(MIN(CAST(TO_DATE(rtime, 'MM/DD/YYYY HH24:MI:SS') AS DATE)), 'DD/MM/YYYY') AS mais_antigo,\n       TO_CHAR(MAX(CAST(TO_DATE(rtime, 'MM/DD/YYYY HH24:MI:SS') AS DATE)), 'DD/MM/YYYY') AS mais_recente,\n       ROUND(MAX(TO_DATE(rtime, 'MM/DD/YYYY HH24:MI:SS'))\n           - MIN(TO_DATE(rtime, 'MM/DD/YYYY HH24:MI:SS'))) AS dias_de_historico\nFROM   dba_hist_tbspc_space_usage;\n\n-- retencao configurada do AWR\nSELECT snap_interval, retention, most_recent_snap_time\nFROM   dba_hist_wr_control;",
+      "olhar": "DIAS_DE_HISTORICO e o limite de credibilidade da projecao. Com 8 dias, projete no maximo 30 e diga que e extrapolacao. Com 90 dias, a projecao anual comeca a ter sentido.",
+      "armadilha": "RTIME e VARCHAR2 no formato americano MM/DD/YYYY. Ordenar ou comparar essa coluna como texto da resultado errado (12/01 vem antes de 02/01). Converta sempre com TO_DATE e a mascara explicita - e o erro mais comum nos scripts desta familia."
+    },
+    {
+      "titulo": "Medir o crescimento realmente observado por tablespace",
+      "objetivo": "Trocar percepcao por MB/dia medido na janela que existe.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "WITH hist AS (\n  SELECT h.tablespace_id,\n         CAST(TO_DATE(h.rtime, 'MM/DD/YYYY HH24:MI:SS') AS DATE) AS dt,\n         h.tablespace_usedsize * ts.block_size / 1024 / 1024 AS usado_mb\n  FROM   dba_hist_tbspc_space_usage h\n  JOIN   v$tablespace v  ON v.ts#  = h.tablespace_id\n  JOIN   dba_tablespaces ts ON ts.tablespace_name = v.name\n), agreg AS (\n  SELECT tablespace_id,\n         MIN(dt) AS de, MAX(dt) AS ate,\n         ROUND(MAX(dt) - MIN(dt)) AS dias,\n         MIN(usado_mb) KEEP (DENSE_RANK FIRST ORDER BY dt) AS usado_inicio_mb,\n         MAX(usado_mb) KEEP (DENSE_RANK LAST  ORDER BY dt) AS usado_fim_mb\n  FROM   hist\n  GROUP  BY tablespace_id\n)\nSELECT v.name AS tablespace_name,\n       a.dias,\n       ROUND(a.usado_inicio_mb) AS usado_inicio_mb,\n       ROUND(a.usado_fim_mb)    AS usado_fim_mb,\n       ROUND(a.usado_fim_mb - a.usado_inicio_mb) AS cresceu_mb,\n       ROUND((a.usado_fim_mb - a.usado_inicio_mb) / NULLIF(a.dias, 0), 2) AS mb_por_dia,\n       ROUND((a.usado_fim_mb - a.usado_inicio_mb) / NULLIF(a.dias, 0) * 30)  AS proj_30d_mb,\n       ROUND((a.usado_fim_mb - a.usado_inicio_mb) / NULLIF(a.dias, 0) * 90)  AS proj_90d_mb\nFROM   agreg a\nJOIN   v$tablespace v ON v.ts# = a.tablespace_id\nWHERE  a.dias > 0\nORDER  BY mb_por_dia DESC NULLS LAST;",
+      "olhar": "MB_POR_DIA e o unico numero MEDIDO; as colunas de projecao sao aritmetica linear em cima dele. Tablespace com mb_por_dia negativo teve purga ou reorg no periodo - nao projete, investigue o que aconteceu.",
+      "armadilha": "Crescimento linear e a hipotese mais fraca deste playbook. Carga sazonal (fechamento mensal, Black Friday) faz a media de 8 dias errar por muito. Se o negocio tem sazonalidade conhecida, compare o mesmo periodo de meses anteriores em vez de extrapolar a media."
+    },
+    {
+      "titulo": "Estimar quantos dias faltam para encher",
+      "objetivo": "Converter MB/dia na unica resposta que o gestor quer: a data.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "WITH hist AS (\n  SELECT h.tablespace_id,\n         CAST(TO_DATE(h.rtime, 'MM/DD/YYYY HH24:MI:SS') AS DATE) AS dt,\n         h.tablespace_usedsize * ts.block_size / 1024 / 1024 AS usado_mb\n  FROM   dba_hist_tbspc_space_usage h\n  JOIN   v$tablespace v     ON v.ts# = h.tablespace_id\n  JOIN   dba_tablespaces ts ON ts.tablespace_name = v.name\n), taxa AS (\n  SELECT tablespace_id,\n         ROUND(MAX(dt) - MIN(dt)) AS dias,\n         (MAX(usado_mb) KEEP (DENSE_RANK LAST  ORDER BY dt)\n        - MIN(usado_mb) KEEP (DENSE_RANK FIRST ORDER BY dt))\n         / NULLIF(ROUND(MAX(dt) - MIN(dt)), 0) AS mb_dia\n  FROM   hist GROUP BY tablespace_id\n), cap AS (\n  SELECT tablespace_name,\n         SUM(GREATEST(bytes, DECODE(autoextensible, 'YES', maxbytes, bytes)))/1024/1024 AS maximo_mb\n  FROM   dba_data_files GROUP BY tablespace_name\n), uso AS (\n  SELECT df.tablespace_name,\n         df.alocado_mb - NVL(fs.livre_mb, 0) AS usado_mb\n  FROM   (SELECT tablespace_name, SUM(bytes)/1024/1024 AS alocado_mb\n          FROM dba_data_files GROUP BY tablespace_name) df\n  LEFT   JOIN (SELECT tablespace_name, SUM(bytes)/1024/1024 AS livre_mb\n               FROM dba_free_space GROUP BY tablespace_name) fs\n         ON fs.tablespace_name = df.tablespace_name\n)\nSELECT u.tablespace_name,\n       ROUND(u.usado_mb)                     AS usado_mb,\n       ROUND(c.maximo_mb)                    AS maximo_mb,\n       ROUND(c.maximo_mb - u.usado_mb)       AS folga_mb,\n       ROUND(t.mb_dia, 2)                    AS mb_por_dia,\n       t.dias                                AS dias_de_amostra,\n       CASE WHEN t.mb_dia > 0\n            THEN ROUND((c.maximo_mb - u.usado_mb) / t.mb_dia)\n       END                                   AS dias_ate_encher,\n       CASE WHEN t.mb_dia > 0\n            THEN TO_CHAR(SYSDATE + (c.maximo_mb - u.usado_mb) / t.mb_dia, 'DD/MM/YYYY')\n       END                                   AS data_estimada\nFROM   uso u\nJOIN   cap c ON c.tablespace_name = u.tablespace_name\nJOIN   v$tablespace v ON v.name   = u.tablespace_name\nJOIN   taxa t ON t.tablespace_id  = v.ts#\nWHERE  t.mb_dia > 0\nORDER  BY dias_ate_encher NULLS LAST;",
+      "olhar": "Ordene por DIAS_ATE_ENCHER e trate quem esta abaixo de 90 dias. Sempre reporte junto o DIAS_DE_AMOSTRA: 'enche em 45 dias, projetado sobre 8 dias de historico' e uma frase honesta; 'enche em 45 dias' sozinha nao e.",
+      "armadilha": "Esta conta usa o MAXIMO (com autoextend). Se o filesystem/diskgroup embaixo nao tem espaco para o autoextend acontecer, o banco falha MUITO antes da data calculada. Confira o passo do ASM/filesystem antes de prometer a data."
+    },
+    {
+      "titulo": "Descobrir QUEM cresceu: os maiores segmentos",
+      "objetivo": "Sair do tablespace para o objeto - e ai a conversa fica acionavel.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, segment_name, partition_name, segment_type, tablespace_name,\n       ROUND(bytes/1024/1024)      AS mb,\n       ROUND(bytes/1024/1024/1024, 2) AS gb\nFROM   dba_segments\nORDER  BY bytes DESC\nFETCH FIRST 30 ROWS ONLY;\n\n-- concentracao: quanto os 10 maiores representam do total\nSELECT ROUND(SUM(CASE WHEN rn <= 10 THEN mb ELSE 0 END)) AS top10_mb,\n       ROUND(SUM(mb))                                    AS total_mb,\n       ROUND(SUM(CASE WHEN rn <= 10 THEN mb ELSE 0 END)\n           / SUM(mb) * 100, 1)                           AS pct_nos_top10\nFROM   (SELECT bytes/1024/1024 AS mb,\n               ROW_NUMBER() OVER (ORDER BY bytes DESC) AS rn\n        FROM   dba_segments);",
+      "olhar": "Se os 10 maiores segmentos concentram mais de 60% do banco, o crescimento tem poucos donos e a acao e focada (purga, particionamento, arquivamento). Distribuido em milhares de objetos pequenos, a acao e de retencao geral.",
+      "armadilha": "DBA_SEGMENTS mostra o espaco ALOCADO, nao o ocupado por linhas. Uma tabela que sofreu DELETE massivo continua enorme aqui - o espaco esta abaixo da high water mark. Nao confunda 'segmento grande' com 'muito dado': veja o playbook de reorg antes de pedir storage."
+    },
+    {
+      "titulo": "Ver o crescimento historico de um objeto especifico",
+      "objetivo": "Confirmar se o objeto suspeito cresceu de fato e em que ritmo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ajuste OWNER e SEGMENT_NAME ao objeto identificado no passo anterior\nSELECT TO_CHAR(sn.begin_interval_time, 'DD/MM/YYYY') AS dia,\n       ROUND(MAX(ss.space_used_delta)/1024/1024, 2)  AS cresceu_no_dia_mb,\n       ROUND(MAX(ss.space_allocated_total)/1024/1024) AS alocado_total_mb\nFROM   dba_hist_seg_stat      ss\nJOIN   dba_hist_seg_stat_obj  o  ON o.dataobj#  = ss.dataobj#\n                                AND o.obj#      = ss.obj#\n                                AND o.dbid      = ss.dbid\nJOIN   dba_hist_snapshot      sn ON sn.snap_id  = ss.snap_id\n                                AND sn.dbid     = ss.dbid\n                                AND sn.instance_number = ss.instance_number\nWHERE  o.owner        = 'SYS'\nAND    o.object_name  = 'AUD$'\nGROUP  BY TO_CHAR(sn.begin_interval_time, 'DD/MM/YYYY')\nORDER  BY MIN(sn.begin_interval_time);",
+      "olhar": "Crescimento concentrado em poucos dias aponta evento (carga, migracao, job que rodou errado). Crescimento constante e vegetativo e se resolve com retencao/particionamento.",
+      "armadilha": "DBA_HIST_SEG_STAT so registra segmento que apareceu nas estatisticas do snapshot - objeto pouco acessado pode nao ter linha aqui mesmo tendo crescido. Ausencia nesta view nao prova ausencia de crescimento."
+    },
+    {
+      "titulo": "Conferir o espaco embaixo do banco (ASM ou filesystem)",
+      "objetivo": "Garantir que o autoextend prometido tem lastro real no storage.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ASM: espaco por diskgroup, ja considerando a redundancia\nSELECT name,\n       state,\n       type                                  AS redundancia,\n       ROUND(total_mb/1024, 1)               AS total_gb,\n       ROUND(free_mb/1024, 1)                AS livre_bruto_gb,\n       ROUND(usable_file_mb/1024, 1)         AS utilizavel_gb,\n       ROUND((total_mb - free_mb)/total_mb*100, 1) AS pct_usado,\n       required_mirror_free_mb\nFROM   v$asm_diskgroup\nORDER  BY pct_usado DESC;",
+      "olhar": "Use USABLE_FILE_MB, nao FREE_MB. Em NORMAL redundancy o espaco util e aproximadamente metade do livre bruto, e o ASM ainda reserva o necessario para sobreviver a perda de uma failgroup. usable_file_mb NEGATIVO significa que o diskgroup nao suporta mais a perda de um disco - e achado critico por si so.",
+      "armadilha": "Sem ASM esta consulta volta vazia (nao e erro). Nesse caso o espaco tem de ser verificado no filesystem com df -h nos pontos de montagem dos datafiles - e o banco nao tem como saber quanto ha ali."
+    },
+    {
+      "titulo": "Ver o espaco do filesystem quando nao ha ASM",
+      "objetivo": "Fechar a lacuna: banco em filesystem nao ve o limite do disco.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# pontos de montagem dos datafiles (rode no host do banco)\ndf -h | head -30\n\n# espaco por diretorio de dados (ajuste o caminho ao seu ambiente)\ndf -h /oracle /u01 /u02 2>/dev/null\n\n# os 20 maiores arquivos abaixo do diretorio de dados\n# (ajuste o caminho; -xdev evita atravessar montagens)\ndf -h .",
+      "olhar": "Compare o 'Avail' de cada mount com a soma de MAXBYTES - AL0CADO dos datafiles que moram nele. Se o autoextend pedir mais do que ha, o banco falha com ORA-01653 apesar de o dicionario dizer que havia espaco.",
+      "armadilha": "Storage com thin provisioning mente para o df: o filesystem informa espaco que o array pode nao ter. Em ambiente com thin provisioning confirme a ocupacao real com o time de storage antes de garantir a data de saturacao."
+    },
+    {
+      "titulo": "Registrar a volumetria como linha de base do caso",
+      "objetivo": "Deixar o numero de hoje gravado para a proxima medicao ter com que comparar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- resumo em uma linha: total do banco por tipo de conteudo\nSELECT ts.contents AS tipo,\n       COUNT(DISTINCT ts.tablespace_name) AS tablespaces,\n       ROUND(SUM(df.bytes)/1024/1024/1024, 2) AS alocado_gb\nFROM   dba_tablespaces ts\nJOIN   dba_data_files  df ON df.tablespace_name = ts.tablespace_name\nGROUP  BY ts.contents\nUNION ALL\nSELECT 'TEMP', COUNT(DISTINCT tablespace_name),\n       ROUND(SUM(bytes)/1024/1024/1024, 2)\nFROM   dba_temp_files;\n\n-- total do banco e do proprio dicionario\nSELECT ROUND(SUM(bytes)/1024/1024/1024, 2) AS segmentos_gb,\n       COUNT(*)                            AS qtd_segmentos\nFROM   dba_segments;",
+      "olhar": "Grave estes numeros no caso com a data. Duas medicoes do mesmo banco separadas por semanas valem mais que qualquer projecao feita sobre a retencao curta do AWR - e nao consomem licenca de pack.",
+      "armadilha": "Nao crie tabela de apoio no schema SYSTEM para guardar isso (varios scripts antigos fazem CREATE TABLE SYSTEM.CAPACITY). Escrever no tablespace SYSTEM para medir espaco e contraditorio, exige DDL em producao e deixa lixo. O framework grava a evidencia em arquivo, fora do banco."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

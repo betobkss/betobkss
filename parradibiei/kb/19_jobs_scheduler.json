@@ -1,0 +1,136 @@
+{
+  "id": "jobs_scheduler",
+  "ordem": 19,
+  "titulo": "Job do scheduler falhando, travado ou que nao roda",
+  "quando_usar": "O relatorio apontou jobs do scheduler com falha; uma rotina automatica (coleta de estatisticas, expurgo, carga) parou de acontecer; ou um job esta rodando ha muito mais tempo que o normal.",
+  "tags": [
+    "scheduler",
+    "job",
+    "dbms_scheduler",
+    "dbms_job",
+    "broken",
+    "janela",
+    "window",
+    "autotask",
+    "estatisticas",
+    "expurgo",
+    "batch"
+  ],
+  "sintomas": [
+    "job nao rodou",
+    "job falhando",
+    "job travado",
+    "estatisticas desatualizadas",
+    "expurgo parou",
+    "state BROKEN",
+    "job rodando ha horas",
+    "rotina automatica parou"
+  ],
+  "secoes": [
+    "Jobs do scheduler com falha",
+    "Scheduler",
+    "Jobs",
+    "Autotask"
+  ],
+  "erros_ora": [
+    "ORA-27492",
+    "ORA-27476",
+    "ORA-01031",
+    "ORA-12012"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Scheduling Jobs with Oracle Scheduler, Monitoring Jobs",
+    "Oracle Database Reference - DBA_SCHEDULER_JOBS, DBA_SCHEDULER_JOB_RUN_DETAILS, DBA_SCHEDULER_RUNNING_JOBS",
+    "Oracle Database Administrator's Guide - Managing Automated Database Maintenance Tasks"
+  ],
+  "nota": "Job que falha e barulhento; job que simplesmente NAO RODA e silencioso e costuma ser pior. Os tres modos de falha silenciosa: enabled=FALSE (alguem desabilitou e esqueceu), state=BROKEN (falhou vezes demais e o Oracle desistiu) e a janela de manutencao fechada (o job existe, esta habilitado, e nunca encontra horario). O maior impacto pratico dessa familia e o autotask de ESTATISTICAS: quando ele para, o otimizador vai degradando por semanas e o sintoma aparece como 'SQL ficou lento', bem longe da causa.",
+  "passos": [
+    {
+      "titulo": "Ver o que falhou nos ultimos dias",
+      "objetivo": "Comecar pelo fato: quais execucoes nao terminaram bem e com qual erro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, job_name,\n       TO_CHAR(log_date,'DD/MM HH24:MI') AS quando,\n       status,\n       run_duration,\n       error#,\n       SUBSTR(additional_info,1,120) AS info\nFROM dba_scheduler_job_run_details\nWHERE log_date > SYSDATE - 15\n  AND status <> 'SUCCEEDED'\nORDER BY log_date DESC FETCH FIRST 40 ROWS ONLY;",
+      "olhar": "error# traz o ORA- real da falha - e a informacao mais util da tela. status STOPPED normalmente significa que a janela de manutencao fechou no meio da execucao, e nao que o job deu erro. Repita o mesmo job em varias linhas: falha recorrente e diferente de falha isolada.",
+      "armadilha": "O historico e podado conforme a retencao (parametro log_history, 30 dias por padrao). Nao ver falha antiga nao quer dizer que nao houve - se o job parou ha meses, o registro pode ja ter sido descartado."
+    },
+    {
+      "titulo": "Encontrar os jobs desabilitados ou quebrados",
+      "objetivo": "Achar a falha silenciosa: o job que nao aparece em nenhuma lista de erro porque nem tenta rodar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, job_name, job_class, enabled, state, failure_count,\n       TO_CHAR(last_start_date,'DD/MM/YYYY HH24:MI') AS ultima_execucao,\n       TO_CHAR(next_run_date,'DD/MM/YYYY HH24:MI')   AS proxima,\n       ROUND(SYSDATE - CAST(last_start_date AS DATE)) AS dias_sem_rodar\nFROM dba_scheduler_jobs\nWHERE enabled = 'FALSE'\n   OR state IN ('BROKEN','FAILED','DISABLED')\n   OR failure_count > 0\nORDER BY failure_count DESC, last_start_date NULLS FIRST;",
+      "olhar": "state BROKEN significa que o Oracle desistiu apos max_failures - ele NAO tenta mais, para sempre, ate alguem reabilitar. next_run_date NULO em job habilitado indica agendamento invalido ou janela que nunca abre. dias_sem_rodar alto e o numero que dimensiona o estrago.",
+      "armadilha": "Job desabilitado pode ter sido desligado DE PROPOSITO (migracao, incidente, decisao do time). Antes de reabilitar, descubra por que foi desligado - reativar um expurgo esquecido ha meses pode disparar uma carga enorme de uma so vez."
+    },
+    {
+      "titulo": "Ver o que esta rodando agora e ha quanto tempo",
+      "objetivo": "Identificar job travado - o que 'esta rodando' mas nao anda ha horas.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT r.owner, r.job_name, r.session_id, r.running_instance,\n       TO_CHAR(r.elapsed_time) AS rodando_ha,\n       TO_CHAR(r.cpu_used)    AS cpu,\n       s.username, s.status, s.event, s.sql_id,\n       s.blocking_session, s.seconds_in_wait AS seg_esperando\nFROM dba_scheduler_running_jobs r\nLEFT JOIN gv$session s\n       ON s.sid = r.session_id AND s.inst_id = NVL(r.running_instance, s.inst_id)\nORDER BY r.elapsed_time DESC;",
+      "olhar": "elapsed_time e o tempo de parede e cpu_used o de CPU: os dois proximos significam job trabalhando; elapsed alto com cpu quase zero significa job PARADO esperando algo. blocking_session preenchido explica na hora: o job nao esta lento, esta BLOQUEADO por outra sessao. Compare a duracao com o normal do job (proximo passo).",
+      "armadilha": "Nao mate um job so porque esta demorando. Job de expurgo ou de estatisticas pode legitimamente levar horas, e matar no meio pode deixar rollback longo ou dados pela metade. Confirme o tempo tipico antes de agir."
+    },
+    {
+      "titulo": "Comparar com a duracao historica do job",
+      "objetivo": "Estabelecer o que e 'normal' para aquele job, para julgar se a execucao atual esta fora da curva.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, job_name,\n       COUNT(*) AS execucoes,\n       SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) AS sucessos,\n       ROUND(AVG(EXTRACT(HOUR FROM run_duration)*3600\n               + EXTRACT(MINUTE FROM run_duration)*60\n               + EXTRACT(SECOND FROM run_duration)),1) AS media_seg,\n       ROUND(MAX(EXTRACT(HOUR FROM run_duration)*3600\n               + EXTRACT(MINUTE FROM run_duration)*60\n               + EXTRACT(SECOND FROM run_duration)),1) AS pior_seg\nFROM dba_scheduler_job_run_details\nWHERE log_date > SYSDATE - 30\nGROUP BY owner, job_name\nHAVING COUNT(*) > 1\nORDER BY media_seg DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Job cuja media vem crescendo semana a semana esta acompanhando o crescimento de dados e um dia nao vai caber na janela - trate antes de virar incidente. sucessos menor que execucoes mostra taxa de falha.",
+      "armadilha": "Media esconde bimodalidade: um job que roda em 1 minuto em dia comum e em 3 horas no fechamento mensal tem media enganosa. Olhe tambem o pior caso."
+    },
+    {
+      "titulo": "Conferir as janelas de manutencao e os autotasks",
+      "objetivo": "Explicar por que as tarefas automaticas (estatisticas, tuning, segment advisor) nao estao acontecendo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT window_name, enabled, active,\n       TO_CHAR(next_start_date,'DD/MM/YYYY HH24:MI') AS proxima_abertura,\n       duration, repeat_interval\nFROM dba_scheduler_windows\nORDER BY window_name;\n\nSELECT client_name, status, consumer_group, window_group\nFROM dba_autotask_client;\n\nSELECT client_name, job_status,\n       TO_CHAR(CAST(job_start_time AS DATE),'DD/MM HH24:MI') AS inicio,\n       TO_CHAR(job_duration) AS duracao\nFROM dba_autotask_job_history\nWHERE CAST(job_start_time AS DATE) > SYSDATE - 10\nORDER BY job_start_time DESC FETCH FIRST 25 ROWS ONLY;",
+      "olhar": "'auto optimizer stats collection' com status DISABLED e achado importante: as estatisticas param de ser atualizadas e o otimizador degrada progressivamente - e a causa raiz oculta de muito 'SQL ficou lento'. Janela desabilitada impede TODOS os autotasks dela.",
+      "armadilha": "Muitos ambientes desabilitam o autotask de estatisticas de proposito, porque a coleta gerava carga em horario ruim, e substituem por job proprio. Antes de reabilitar, confirme se ja existe uma coleta alternativa - senao voce cria coleta duplicada concorrendo entre si. Nota tecnica: job_start_time e TIMESTAMP WITH TIME ZONE e o CAST para DATE acima nao e enfeite - sem ele, cliente em modo thin falha com DPY-3022 (fuso nomeado nao suportado)."
+    },
+    {
+      "titulo": "Conferir a capacidade de execucao concorrente",
+      "objetivo": "Descartar o caso em que o job nao roda por falta de slot, e nao por erro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, value, description\nFROM v$parameter\nWHERE name IN ('job_queue_processes','max_datapump_jobs_per_pdb');\n\nSELECT COUNT(*) AS jobs_rodando_agora FROM dba_scheduler_running_jobs;\n\nSELECT program, COUNT(*) AS processos\nFROM gv$process\nWHERE program LIKE '%J0%' OR program LIKE '%CJQ%'\nGROUP BY program;",
+      "olhar": "job_queue_processes igual a 0 desliga o scheduler por completo - nenhum job roda, e nao aparece erro nenhum. Se jobs_rodando_agora bate no limite configurado, os demais ficam na fila e parecem 'atrasados'.",
+      "armadilha": "job_queue_processes = 0 as vezes e deixado de proposito apos um clone ou refresh de ambiente, justamente para os jobs de producao nao dispararem na copia. Se este e um ambiente clonado, confirme antes de 'corrigir'."
+    },
+    {
+      "titulo": "Reabilitar um job quebrado",
+      "objetivo": "Voltar a rotina ao ar depois de tratar a causa da falha.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Corrija a CAUSA primeiro (erro do passo 1): reabilitar sem corrigir so recria o BROKEN depois de max_failures. 2) Descubra por que foi desabilitado - pode ter sido decisao deliberada. 3) Avalie o efeito do acumulo: job de expurgo parado ha meses pode, na primeira execucao, apagar um volume enorme e gerar undo/redo/archive muito acima do normal. Considere rodar por partes. 4) Confirme espaco em archive e undo antes. 5) Registre a acao no caso.",
+      "comando": "-- zera o contador de falhas e reabilita:\nBEGIN\n  DBMS_SCHEDULER.ENABLE('&owner..&job_name');\nEND;\n/\n\n-- conferir:\n-- SELECT owner, job_name, enabled, state, next_run_date\n--   FROM dba_scheduler_jobs WHERE job_name = '<JOB>';",
+      "olhar": "enabled deve virar TRUE, state voltar para SCHEDULED e next_run_date ser preenchido com uma data futura coerente. Se next_run_date continuar nulo, o agendamento (repeat_interval ou schedule) esta invalido.",
+      "armadilha": "ENABLE em job cujo repeat_interval ja passou pode disparar a execucao IMEDIATAMENTE, dependendo da definicao. Nao reabilite job pesado em horario de pico sem saber quando ele vai rodar."
+    },
+    {
+      "titulo": "Executar um job sob demanda para validar a correcao",
+      "objetivo": "Provar que o job volta a funcionar, sem esperar a proxima janela.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Saiba O QUE o job faz antes de dispara-lo: consulte o codigo em DBA_SCHEDULER_JOBS (job_action) - um job pode apagar, mover ou carregar dados. 2) Confirme a duracao tipica (passo 4) e se cabe na janela atual. 3) use_current_session=FALSE roda em background e nao prende seu terminal; TRUE roda na sua sessao e permite ver o erro na hora - escolha conscientemente. 4) Avalie a carga: rodar sob demanda em horario de pico concorre com a producao. 5) Registre a acao no caso.",
+      "comando": "-- ver o que o job faz ANTES de executar:\nSELECT owner, job_name, job_type, program_name,\n       SUBSTR(job_action,1,300) AS acao, repeat_interval\nFROM dba_scheduler_jobs\nWHERE job_name = '&job_name';\n\n-- executar sob demanda:\nBEGIN\n  DBMS_SCHEDULER.RUN_JOB(job_name           => '&owner..&job_name',\n                         use_current_session => FALSE);\nEND;\n/",
+      "olhar": "Acompanhe em dba_scheduler_running_jobs e depois confirme em dba_scheduler_job_run_details que o status foi SUCCEEDED.",
+      "armadilha": "RUN_JOB nao substitui a execucao agendada nem mexe em next_run_date: o job ainda vai rodar no horario normal. Em job de carga, isso pode significar processar duas vezes - confirme se a rotina e idempotente."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Job parado por semanas e falha de deteccao, nao de scheduler.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ha quanto tempo cada job habilitado nao roda com sucesso:\nSELECT j.owner, j.job_name, j.enabled, j.state,\n       TO_CHAR(MAX(d.log_date),'DD/MM/YYYY HH24:MI') AS ultimo_sucesso,\n       ROUND(SYSDATE - CAST(MAX(d.log_date) AS DATE)) AS dias_desde_o_sucesso\nFROM dba_scheduler_jobs j\nLEFT JOIN dba_scheduler_job_run_details d\n       ON d.owner = j.owner AND d.job_name = j.job_name\n      AND d.status = 'SUCCEEDED'\nWHERE j.enabled = 'TRUE'\nGROUP BY j.owner, j.job_name, j.enabled, j.state\nHAVING MAX(d.log_date) IS NULL OR MAX(d.log_date) < SYSDATE - 7\nORDER BY dias_desde_o_sucesso DESC NULLS FIRST;",
+      "olhar": "Job habilitado sem sucesso ha mais de 7 dias esta falhando ou nunca encontra janela - e ninguem percebeu. Job que nunca teve sucesso (nulo) provavelmente nasceu com agendamento errado.",
+      "armadilha": "O framework ja cobre isto no check scheduler_failures. Lembre tambem que muita rotina critica e agendada FORA do banco (cron, Control-M, TWS) e nao aparece em nenhuma destas views - se a rotina esperada nao esta aqui, procure no agendador corporativo antes de concluir que nao existe."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

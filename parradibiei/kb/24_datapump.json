@@ -1,0 +1,155 @@
+{
+  "id": "datapump",
+  "titulo": "Data Pump travado ou lento (expdp / impdp)",
+  "quando_usar": "Um export/import Data Pump nao termina, parece parado, esta muito mais lento que o normal, ou falhou no meio e voce precisa saber se da para retomar.",
+  "tags": [
+    "datapump",
+    "data pump",
+    "expdp",
+    "impdp",
+    "export",
+    "import",
+    "dump",
+    "exportacao",
+    "importacao",
+    "job travado",
+    "ORA-31693",
+    "ORA-39002",
+    "ORA-39171",
+    "ORA-31626",
+    "dba_datapump_jobs",
+    "attach",
+    "carga lenta",
+    "restore logico"
+  ],
+  "sintomas": [
+    "expdp/impdp sem sair do lugar, sem escrever no log por muito tempo",
+    "job aparece em DBA_DATAPUMP_JOBS mas nao progride",
+    "importacao muito mais lenta que a execucao anterior",
+    "sessao do Data Pump em espera de I/O ou de lock",
+    "job orfao (NOT RUNNING) impedindo iniciar outro com o mesmo nome",
+    "ORA-31693 / ORA-39171 no log do import"
+  ],
+  "secoes": [
+    "Sessoes",
+    "Sessoes e processos",
+    "Distribuicao de esperas (ASH)",
+    "Tablespaces",
+    "UNDO (retencao e erros)",
+    "TEMP USAGE POR SESSAO"
+  ],
+  "erros_ora": [
+    "ORA-31693",
+    "ORA-39002",
+    "ORA-39171",
+    "ORA-31626",
+    "ORA-01652",
+    "ORA-01653"
+  ],
+  "fontes": [
+    "Oracle Database Utilities 19c - Oracle Data Pump Export/Import",
+    "Oracle Support - Checklist for Slow Performance of Data Pump (Doc ID 453895.1)",
+    "Oracle Support - How To Monitor The Progress Of Data Pump Jobs (Doc ID 336014.1)",
+    "Pratica de campo: roteiro de acompanhamento de expdp/impdp aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "'Data Pump travado' quase sempre e uma de tres coisas: (1) esta trabalhando e o log nao mostra progresso por objeto grande, (2) esta esperando um lock ou espaco, (3) o job morreu e ficou orfao no dicionario. A ordem deste playbook separa os tres casos ANTES de qualquer acao, porque matar um job que estava progredindo custa horas de retrabalho.",
+  "passos": [
+    {
+      "titulo": "Ver os jobs de Data Pump que o banco conhece",
+      "objetivo": "Saber se o job existe, em que estado esta e se e orfao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner_name, job_name, operation, job_mode, state,\n       degree, attached_sessions, datapump_sessions\nFROM   dba_datapump_jobs\nORDER  BY owner_name, job_name;",
+      "olhar": "STATE = 'EXECUTING' com datapump_sessions > 0 e job vivo. STATE = 'NOT RUNNING' com attached_sessions = 0 costuma ser job orfao (a tabela mestre ficou, o processo morreu). 'DEFINING' preso por muito tempo indica que nao conseguiu nem montar o plano de trabalho.",
+      "armadilha": "Job orfao mantem a MASTER TABLE (uma tabela com o nome do job no schema de quem exportou) e impede reusar o mesmo JOB_NAME. Ele tambem ocupa espaco. Nao confunda orfao com job legitimamente pausado por STOP_JOB - o segundo pode e deve ser retomado."
+    },
+    {
+      "titulo": "Confirmar se ha progresso real (e nao apenas espera)",
+      "objetivo": "Responder 'esta andando?' com numero, nao com impressao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT sid, serial#,\n       TO_CHAR(start_time, 'DD/MM HH24:MI:SS') AS inicio,\n       opname,\n       SUBSTR(message, 1, 60)                  AS mensagem,\n       sofar, totalwork,\n       ROUND(sofar / NULLIF(totalwork, 0) * 100, 2) AS pct_completo,\n       elapsed_seconds                         AS decorrido_s,\n       time_remaining                          AS restante_s,\n       ROUND(time_remaining/60)                AS restante_min\nFROM   gv$session_longops\nWHERE  opname LIKE '%EXPORT%'\nOR     opname LIKE '%IMPORT%'\nORDER  BY start_time DESC;",
+      "olhar": "Rode DUAS vezes com 60 segundos de intervalo e compare SOFAR. Se SOFAR mudou, o job esta trabalhando e a resposta e esperar. Se nao mudou nada, va para o passo de esperas.",
+      "armadilha": "TIME_REMAINING do Data Pump e notoriamente otimista/erratico: ele estima sobre a operacao ATUAL, nao sobre o job inteiro. Nao prometa horario de termino com base nele. E se o job estiver na fase de indices/constraints, LONGOPS pode nao registrar nada mesmo com trabalho pesado em curso."
+    },
+    {
+      "titulo": "Descobrir em que o Data Pump esta esperando",
+      "objetivo": "Distinguir trabalho de bloqueio - e o que decide a acao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username,\n       SUBSTR(s.program, 1, 25) AS programa,\n       s.status,\n       s.event,\n       s.wait_class,\n       s.seconds_in_wait     AS s_esperando,\n       s.blocking_session    AS bloqueado_por,\n       s.sql_id,\n       ROUND(s.last_call_et/60) AS min_na_chamada\nFROM   gv$session s\nWHERE  s.program LIKE '%DM0%'       -- processo mestre do Data Pump\nOR     s.program LIKE '%DW0%'       -- worker do Data Pump\nOR     s.module  LIKE '%Data Pump%'\nORDER  BY s.seconds_in_wait DESC;",
+      "olhar": "BLOCKING_SESSION preenchido = ha bloqueio, e o alvo passa a ser o bloqueador (veja o playbook de sessoes e locks). WAIT_CLASS 'User I/O' com seconds_in_wait baixo e oscilando = esta lendo/gravando, ou seja, trabalhando. 'enq: TM - contention' aponta DML/DDL concorrente na tabela sendo importada.",
+      "armadilha": "Os processos DM00/DW00 sao filhos: matar so o DM (mestre) deixa os workers rodando e consumindo. Se for preciso encerrar, use KILL_JOB pela interface do Data Pump (passo adiante), nao ALTER SYSTEM KILL SESSION nos workers."
+    },
+    {
+      "titulo": "Medir a velocidade real da carga no import",
+      "objetivo": "Quantificar linhas por minuto para saber se 'lento' e real.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT SUBSTR(sql_text, INSTR(sql_text, 'into \"'), 40) AS tabela,\n       rows_processed,\n       ROUND((SYSDATE - TO_DATE(first_load_time, 'yyyy-mm-dd hh24:mi:ss')) * 24 * 60, 1) AS minutos,\n       TRUNC(rows_processed /\n             NULLIF((SYSDATE - TO_DATE(first_load_time, 'yyyy-mm-dd hh24:mi:ss')) * 24 * 60, 0)) AS linhas_por_minuto\nFROM   v$sqlarea\nWHERE  sql_text LIKE 'insert %into \"%'\nAND    command_type = 2\nAND    open_versions > 0\nORDER  BY rows_processed DESC;",
+      "olhar": "Uma tabela com muitas linhas e linhas_por_minuto baixo aponta o gargalo. Compare com a execucao anterior do mesmo import, se houver registro - variacao grande sem mudanca de volume indica problema de ambiente (I/O, redo, indice a mais).",
+      "armadilha": "OPEN_VERSIONS > 0 limita a consulta ao que esta ativo AGORA. Se o cursor fechou entre duas execucoes, a tabela desaparece do resultado - nao conclua que ela terminou."
+    },
+    {
+      "titulo": "Verificar os freios classicos do Data Pump",
+      "objetivo": "Checar espaco, undo, temp e paralelismo antes de culpar o Data Pump.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- espaco no destino: import falha no fim se faltar\nSELECT df.tablespace_name,\n       ROUND(df.alocado_mb - NVL(fs.livre_mb, 0)) AS usado_mb,\n       ROUND(NVL(fs.livre_mb, 0))                 AS livre_mb,\n       ROUND((df.alocado_mb - NVL(fs.livre_mb, 0)) / df.alocado_mb * 100, 1) AS pct\nFROM   (SELECT tablespace_name, SUM(bytes)/1024/1024 AS alocado_mb\n        FROM dba_data_files GROUP BY tablespace_name) df\nLEFT   JOIN (SELECT tablespace_name, SUM(bytes)/1024/1024 AS livre_mb\n             FROM dba_free_space GROUP BY tablespace_name) fs\n       ON fs.tablespace_name = df.tablespace_name\nORDER  BY pct DESC FETCH FIRST 10 ROWS ONLY;\n\n-- undo e temp em uso agora\nSELECT tablespace_name, status, ROUND(SUM(bytes)/1024/1024) AS mb\nFROM   dba_undo_extents GROUP BY tablespace_name, status;\n\nSELECT ROUND(SUM(u.blocks) * ts.block_size / 1024 / 1024) AS temp_mb_em_uso\nFROM   gv$tempseg_usage u, dba_tablespaces ts\nWHERE  ts.tablespace_name = u.tablespace\nGROUP  BY ts.block_size;\n\n-- paralelismo disponivel x em uso\nSELECT name, value FROM v$parameter\nWHERE  name IN ('parallel_max_servers', 'cpu_count', 'streams_pool_size');",
+      "olhar": "Import que morre no fim quase sempre e espaco. STREAMS_POOL_SIZE zerado prejudica o Data Pump (ele usa essa area para as filas internas). PARALLEL alem do cpu_count nao acelera: gera disputa.",
+      "armadilha": "PARALLEL no Data Pump exige tantos arquivos de dump quantos os processos paralelos (use %U no nome do arquivo). Com PARALLEL=8 e um unico arquivo, os workers ficam serializados no mesmo arquivo e o job fica MAIS lento que sem paralelismo."
+    },
+    {
+      "titulo": "Ler o log do job no sistema operacional",
+      "objetivo": "Ver a ultima linha real do Data Pump e o erro exato, se houver.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# descubra o caminho do DIRECTORY usado (consulta no banco):\n#   SELECT directory_name, directory_path FROM dba_directories;\n\n# ultimas linhas do log (ajuste o caminho e o nome)\ntail -50 /oracle/dump/export.log\n\n# erros no log\ngrep -E 'ORA-|Erro|error|failed' /oracle/dump/export.log | tail -30\n\n# o arquivo de dump esta crescendo? (duas leituras com intervalo)\nls -l /oracle/dump/",
+      "olhar": "Se o tamanho do .dmp cresce entre duas execucoes do ls, o export esta trabalhando mesmo sem novidade no log. No import, o log e a unica fonte confiavel de qual objeto esta sendo processado.",
+      "armadilha": "O log fica no DIRECTORY do BANCO (caminho do servidor), nao na maquina onde voce digitou o comando. Em RAC, o arquivo pode estar no no onde o job rodou - procurar no no errado faz parecer que o log nao existe."
+    },
+    {
+      "titulo": "Conectar no job para acompanhar ou pausar (ATTACH)",
+      "objetivo": "Assumir o controle do job sem mata-lo, obtendo status detalhado.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) ATTACH nao interrompe o job, mas os comandos disponiveis DEPOIS de conectado (STOP_JOB, KILL_JOB) interrompem - nao digite por reflexo. 2) Use o mesmo usuario que iniciou o job (ou um com DATAPUMP_EXP_FULL_DATABASE / DATAPUMP_IMP_FULL_DATABASE). 3) STATUS e read-only e e o que voce quer primeiro. 4) STOP_JOB=IMMEDIATE permite retomar depois com START_JOB; KILL_JOB destroi a master table e nao ha retomada. 5) Registre no caso o job_name antes de mexer.",
+      "comando": "# conectar ao job existente (nome vindo de DBA_DATAPUMP_JOBS)\nexpdp usuario@servico attach=SYS_EXPORT_SCHEMA_01\n\n# ja conectado, no prompt Export> :\n#   STATUS            -- detalhe por worker, read-only, e o que interessa\n#   CONTINUE_CLIENT   -- volta ao modo log ao vivo\n#   EXIT_CLIENT       -- sai SEM parar o job\n#   STOP_JOB=IMMEDIATE -- pausa (retomavel com START_JOB)\n\n# para import e o mesmo com impdp:\n# impdp usuario@servico attach=SYS_IMPORT_FULL_01",
+      "olhar": "STATUS mostra cada worker, o objeto atual e o percentual. E a informacao mais precisa disponivel - melhor que LONGOPS. Confirme aqui se ha worker parado enquanto outros trabalham.",
+      "armadilha": "CTRL+C no cliente do Data Pump NAO mata o job: ele cai no prompt interativo. Muita gente acha que interrompeu e inicia outro export, ficando com dois jobs concorrendo pelo mesmo storage. Sempre confira DBA_DATAPUMP_JOBS depois."
+    },
+    {
+      "titulo": "Encerrar um job que precisa ser abortado",
+      "objetivo": "Liberar recursos quando o job esta comprovadamente travado ou errado.",
+      "risco": "destrutivo",
+      "onde": "so",
+      "antes_de_executar": "1) So aqui depois de comprovar nos passos 2 e 3 que NAO ha progresso (SOFAR parado) e que a espera nao e um bloqueio removivel. 2) KILL_JOB descarta a master table: o job NAO pode ser retomado e todo o tempo gasto e perdido. Se houver chance de retomar, use STOP_JOB=IMMEDIATE. 3) Num IMPORT interrompido, o destino fica com dados PARCIAIS - defina antes com o dono do dado o que sera feito (truncate e recomeco, ou continuar de onde parou por TABLE_EXISTS_ACTION). 4) Confirme que a janela permite recomecar: um import de 6 horas abortado as 5h50 nao ganha nada com o kill. 5) Registre no caso o job_name, quem autorizou e o estado do destino.",
+      "comando": "# conectar e abortar\nexpdp usuario@servico attach=SYS_EXPORT_SCHEMA_01\n# no prompt Export> :\n#   KILL_JOB\n\n# se o cliente nao conseguir conectar, a master table pode ser removida\n# no banco DEPOIS de confirmar que nao ha sessao do job ativa:\n#   SELECT * FROM dba_datapump_jobs;                 -- state deve ser NOT RUNNING\n#   DROP TABLE <owner>.<JOB_NAME> PURGE;             -- remove a master table",
+      "olhar": "Depois do KILL_JOB, o job deve desaparecer de DBA_DATAPUMP_JOBS e as sessoes DM/DW devem sumir de gv$session. Confira as duas coisas antes de iniciar um novo job.",
+      "armadilha": "DROP da master table com o job ainda ativo deixa processos orfaos consumindo CPU e segurando locks, e o proximo job com o mesmo nome falha de forma confusa. A ordem importa: confirme NOT RUNNING e ausencia de sessao ANTES do drop. E lembre: no import, abortar deixa o destino inconsistente - dado pela metade e pior que dado nenhum se alguem consultar sem saber."
+    },
+    {
+      "titulo": "Retomar um job pausado",
+      "objetivo": "Continuar de onde parou, sem refazer o que ja foi processado.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Antes de retomar, resolva a causa da pausa: se foi falta de espaco, adicione espaco primeiro, senao o job para de novo no mesmo ponto. 2) Confirme que os arquivos de dump ainda estao no DIRECTORY e intactos. 3) O job so e retomavel se foi parado com STOP_JOB - se levou KILL_JOB, nao ha retomada. 4) Confirme com o dono da aplicacao se a janela ainda permite. 5) Registre no caso a hora da retomada.",
+      "comando": "expdp usuario@servico attach=SYS_EXPORT_SCHEMA_01\n# no prompt Export> :\n#   START_JOB\n#   CONTINUE_CLIENT   -- para acompanhar o log ao vivo\n\n# no import, se for recomecar tabela ja carregada, defina a acao:\n#   impdp ... TABLE_EXISTS_ACTION=TRUNCATE   (descarta e recarrega)\n#   impdp ... TABLE_EXISTS_ACTION=APPEND     (acrescenta - risco de duplicar)\n#   impdp ... TABLE_EXISTS_ACTION=SKIP       (nao toca no que existe)",
+      "olhar": "Acompanhe o log: o Data Pump informa de qual objeto retomou. Confirme no passo 2 que SOFAR volta a avancar.",
+      "armadilha": "TABLE_EXISTS_ACTION=APPEND numa retomada DUPLICA as linhas que ja tinham sido carregadas antes da interrupcao - e o erro mais caro desta familia, porque o job termina com sucesso e a duplicacao so aparece dias depois numa conciliacao. Na duvida use TRUNCATE, com o dono do dado ciente."
+    },
+    {
+      "titulo": "Fechar o caso com a evidencia do que foi movido",
+      "objetivo": "Provar o que entrou (ou saiu), em vez de confiar no 'terminou sem erro'.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- objetos invalidos criados pela importacao (comum, e precisa de recompilacao)\nSELECT owner, object_type, COUNT(*) AS qtd\nFROM   dba_objects\nWHERE  status <> 'VALID'\nGROUP  BY owner, object_type\nORDER  BY qtd DESC;\n\n-- contagem de linhas por tabela do schema importado (ajuste o OWNER)\nSELECT table_name, num_rows, last_analyzed\nFROM   dba_tables\nWHERE  owner = 'MEU_SCHEMA'\nORDER  BY num_rows DESC NULLS LAST\nFETCH FIRST 25 ROWS ONLY;\n\n-- constraints e indices que ficaram desabilitados/unusable\nSELECT owner, constraint_name, table_name, status\nFROM   dba_constraints\nWHERE  owner = 'MEU_SCHEMA' AND status <> 'ENABLED';\n\nSELECT owner, index_name, table_name, status\nFROM   dba_indexes\nWHERE  owner = 'MEU_SCHEMA' AND status NOT IN ('VALID', 'N/A');",
+      "olhar": "Import 'sem erro' costuma deixar objetos invalidos, constraints desabilitadas e estatisticas ausentes (LAST_ANALYZED nulo). Sem tratar isso, o proximo incidente sera de performance e ninguem vai ligar com a importacao.",
+      "armadilha": "NUM_ROWS vem da estatistica, nao da tabela: apos import ela pode estar desatualizada ou nula, e o valor exibido nao prova nada. Para conferir volume de verdade, faca COUNT(*) nas tabelas criticas ou colete estatisticas primeiro."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "id": "espaco_tablespace",
+  "ordem": 9,
+  "titulo": "Espaco: tablespace, datafile e TEMP cheios",
+  "quando_usar": "ORA-01653/ORA-01654 (nao consegue estender tabela/indice), ORA-01652 (TEMP), tablespace acima de 90%, ou o relatorio apontou previsao de estouro.",
+  "tags": [
+    "espaco",
+    "tablespace",
+    "datafile",
+    "temp",
+    "ORA-01652",
+    "ORA-01653",
+    "autoextend",
+    "asm",
+    "crescimento"
+  ],
+  "sintomas": [
+    "unable to extend",
+    "tablespace cheia",
+    "temp cheia",
+    "insert falhando",
+    "sort falhando"
+  ],
+  "erros_ora": [
+    "ORA-01652",
+    "ORA-01653",
+    "ORA-01654",
+    "ORA-01688",
+    "ORA-01691"
+  ],
+  "secoes": [
+    "Espaco",
+    "Tablespaces",
+    "Datafiles",
+    "Temp",
+    "Previsao",
+    "ASM Diskgroups",
+    "Diskgroup",
+    "capacidade"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Managing Tablespaces and Datafiles",
+    "Oracle Database Reference - DBA_TABLESPACE_USAGE_METRICS, V$TEMPSEG_USAGE"
+  ],
+  "nota": "Armadilha central deste tema: DBA_FREE_SPACE mostra o espaco livre DENTRO dos datafiles atuais e ignora o AUTOEXTEND. Uma tablespace a '99%' com autoextend e MAXSIZE folgado nao tem problema nenhum; uma a '80%' sem autoextend e num filesystem cheio esta prestes a parar a aplicacao. Use DBA_TABLESPACE_USAGE_METRICS, que ja considera o crescimento possivel.",
+  "passos": [
+    {
+      "titulo": "Ver a ocupacao real, considerando o autoextend",
+      "objetivo": "Comecar pela metrica certa. E o passo que evita o diagnostico errado mais comum deste tema.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT tablespace_name,\n       ROUND(used_space*8/1024,1) AS usado_mb,\n       ROUND(tablespace_size*8/1024,1) AS maximo_mb,\n       ROUND(used_percent,1) AS pct_do_maximo\nFROM dba_tablespace_usage_metrics\nORDER BY used_percent DESC;",
+      "olhar": "Aqui 'maximo' ja inclui o quanto os datafiles ainda podem crescer por autoextend. Acima de 90% e alerta real; acima de 97% e incidente iminente.",
+      "armadilha": "A conta usa blocos de 8K por padrao. Se a tablespace tem block size diferente, ajuste o multiplicador - senao o numero em MB sai errado (o percentual continua correto)."
+    },
+    {
+      "titulo": "Ver os datafiles: quem pode crescer e quanto",
+      "objetivo": "Descobrir se o limite e do datafile (MAXSIZE), do autoextend desligado ou do disco.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT tablespace_name, file_id,\n       SUBSTR(file_name,-45) AS arquivo,\n       ROUND(bytes/1024/1024) AS atual_mb,\n       ROUND(maxbytes/1024/1024) AS max_mb,\n       autoextensible AS autoext,\n       ROUND(increment_by*8/1024,1) AS incremento_mb\nFROM dba_data_files\nWHERE tablespace_name = '&tablespace'\nORDER BY file_id;",
+      "olhar": "autoext = NO significa que o arquivo NAO cresce: e a causa direta do ORA-01653 mesmo com disco sobrando. maxbytes proximo de bytes = ja chegou ao teto.",
+      "armadilha": "MAXSIZE UNLIMITED nao e infinito: em BIGFILE vai ate 32 TB, em SMALLFILE o teto e ~32 GB com bloco de 8K. Datafile 'unlimited' parado em 32 GB e exatamente isso."
+    },
+    {
+      "titulo": "Achar quem esta ocupando o espaco",
+      "objetivo": "Antes de pedir disco, saber se o crescimento e legitimo ou lixo acumulado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, segment_name, segment_type, partition_name,\n       ROUND(bytes/1024/1024/1024,2) AS gb\nFROM dba_segments\nWHERE tablespace_name = '&tablespace'\nORDER BY bytes DESC FETCH FIRST 20 ROWS ONLY;\n\n-- segmentos na lixeira (recyclebin) ocupando espaco:\nSELECT owner, SUM(space*8/1024/1024) AS gb_na_lixeira, COUNT(*) AS objetos\nFROM dba_recyclebin GROUP BY owner ORDER BY 2 DESC;",
+      "olhar": "Um objeto respondendo pela maior parte do crescimento e a pista. A lixeira costuma esconder dezenas de GB de tabelas 'apagadas' que ninguem sabe que ainda estao la.",
+      "armadilha": "Tabela grande nao significa desperdicio. Antes de propor reorganizacao, confirme que ha espaco realmente livre dentro do segmento - o proximo passo mede isso."
+    },
+    {
+      "titulo": "Ver o crescimento historico e projetar",
+      "objetivo": "Transformar 'esta enchendo' em 'enche no dia X' - o que muda a conversa com quem aprova disco.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(TRUNC(s.begin_interval_time),'DD/MM') AS dia,\n       ROUND(MAX(u.tablespace_usedsize)*8/1024/1024,2) AS usado_gb,\n       ROUND(MAX(u.tablespace_size)*8/1024/1024,2) AS max_gb\nFROM dba_hist_tbspc_space_usage u\nJOIN dba_hist_snapshot s ON s.snap_id = u.snap_id\nWHERE u.tablespace_id = (SELECT ts# FROM v$tablespace\n                         WHERE name = '&tablespace')\n  AND s.begin_interval_time > SYSDATE - 30\nGROUP BY TRUNC(s.begin_interval_time)\nORDER BY dia;",
+      "olhar": "Crescimento constante = previsivel, da para planejar. Degrau subito = uma carga especifica; procure o que rodou naquele dia antes de comprar disco.",
+      "armadilha": "DBA_HIST_* exige Diagnostics Pack. Sem licenca, o framework tem o analisador de forecast a partir da propria coleta - use-o em vez desta consulta."
+    },
+    {
+      "titulo": "TEMP: entender que a regra e outra",
+      "objetivo": "TEMP cheia raramente e falta de espaco: e um SQL fazendo sort ou hash gigante.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT tablespace_name,\n       ROUND(tablespace_size/1024/1024/1024,2) AS total_gb,\n       ROUND(free_space/1024/1024/1024,2) AS livre_gb\nFROM dba_temp_free_space;\n\n-- quem esta consumindo TEMP agora:\nSELECT u.inst_id, u.username, u.session_addr, s.sid, s.serial#,\n       u.tablespace, u.segtype, u.sql_id,\n       ROUND(u.blocks*8/1024,1) AS mb_usados,\n       SUBSTR(q.sql_text,1,60) AS sql\nFROM gv$tempseg_usage u\nJOIN gv$session s ON s.saddr = u.session_addr AND s.inst_id = u.inst_id\nLEFT JOIN gv$sql q ON q.sql_id = u.sql_id AND q.inst_id = u.inst_id\nORDER BY u.blocks DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "Uma sessao com dezenas de GB de TEMP quase sempre e um SQL sem indice adequado fazendo sort/hash de tabela inteira, ou um MERGE JOIN CARTESIAN. Trate o SQL, nao a TEMP.",
+      "armadilha": "TEMP nao encolhe sozinha depois do uso: o espaco fica alocado ao tablespace e e reaproveitado. Ver 'TEMP 100% usada' em repouso NAO e problema - o que importa e se ha falha de alocacao (ORA-01652)."
+    },
+    {
+      "titulo": "Ver o espaco no storage antes de qualquer acao",
+      "objetivo": "Nao adianta mandar o datafile crescer se o diskgroup ou o filesystem esta cheio.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, state, type, total_mb, free_mb, usable_file_mb,\n       ROUND((1-free_mb/NULLIF(total_mb,0))*100,2) AS pct_usado\nFROM v$asm_diskgroup ORDER BY pct_usado DESC;",
+      "olhar": "Em ASM use usable_file_mb, que ja desconta a redundancia. Em filesystem, confirme com 'df -h' no ponto de montagem.",
+      "armadilha": "Deixar o diskgroup de dados encher afeta TODOS os bancos que o usam, nao so o seu. Confirme o impacto antes de crescer um datafile ate o limite."
+    },
+    {
+      "titulo": "Ligar/ajustar o autoextend do datafile",
+      "objetivo": "A acao mais segura e reversivel: permitir que o arquivo cresca sozinho ate um teto controlado.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme espaco no storage (passo 6) - autoextend sem disco so troca ORA-01653 por filesystem cheio, que afeta o banco inteiro. 2) SEMPRE defina MAXSIZE explicito: UNLIMITED e o caminho para encher o diskgroup e derrubar vizinhos. 3) Anote o estado atual do arquivo (passo 2) para reverter. 4) Registre a acao no caso. 5) Reverter: ALTER DATABASE DATAFILE ... AUTOEXTEND OFF.",
+      "comando": "ALTER DATABASE DATAFILE '<caminho_ou_file_id>'\n  AUTOEXTEND ON NEXT 512M MAXSIZE 32G;",
+      "olhar": "Confirme em DBA_DATA_FILES que autoextensible = YES e maxbytes e o esperado. Depois reveja o percentual no passo 1: ele deve cair, porque o maximo aumentou.",
+      "armadilha": "Incremento pequeno (NEXT 1M) em tabela que cresce rapido causa centenas de extensoes e contencao. Use incremento proporcional ao crescimento diario."
+    },
+    {
+      "titulo": "Acrescentar datafile",
+      "objetivo": "Quando o datafile ja esta no teto (32 GB em smallfile) ou se quer distribuir I/O.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme espaco no storage. 2) Confirme o padrao de nomes e o diskgroup/caminho usado pelos demais datafiles da mesma tablespace - arquivo em lugar errado vira problema no restore. 3) Em ASM, use o diskgroup, nao caminho absoluto. 4) Registre a acao. 5) Reverter e trabalhoso (o datafile so sai vazio) - por isso confirme o caminho ANTES.",
+      "comando": "ALTER TABLESPACE <tablespace>\n  ADD DATAFILE '+DADOS' SIZE 16G AUTOEXTEND ON NEXT 512M MAXSIZE 32G;",
+      "olhar": "Confirme em DBA_DATA_FILES e refaca o passo 1. A aplicacao volta a inserir imediatamente.",
+      "armadilha": "Acrescentar datafile e definitivo na pratica: remover exige que ele esteja completamente vazio. Errar o diskgroup deixa a tablespace espalhada em storage indevido, e isso so aparece meses depois."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Espaco e sintoma. A pergunta e por que cresceu.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- objetos com muito espaco alocado e pouco dado (candidatos a reorganizacao):\nSELECT owner, table_name, num_rows, blocks,\n       ROUND(blocks*8/1024,1) AS mb_alocados,\n       ROUND(avg_row_len*num_rows/1024/1024,1) AS mb_de_dado_estimado,\n       TO_CHAR(last_analyzed,'DD/MM/YYYY') AS stats_de\nFROM dba_tables\nWHERE tablespace_name = '&tablespace' AND num_rows > 0\n  AND blocks*8192 > 1024*1024*1024\nORDER BY blocks DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "mb_alocados muito acima de mb_de_dado_estimado sugere espaco desperdicado por DELETE em massa (o HWM nao baixa sozinho). Ai a conversa e de reorganizacao, nao de disco novo.",
+      "armadilha": "A estimativa depende de estatistica atual: com last_analyzed antigo, num_rows e avg_row_len mentem e a conclusao sai errada. Confira a data antes de propor reorganizacao - que e operacao pesada e exige janela."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

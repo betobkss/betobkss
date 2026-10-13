@@ -1,0 +1,13 @@
+# Dados do parque / evidencias de casos - nao versionar (repo publico)
+troubleshooting/
+output/
+ambientes.json
+historico.json
+servidores.txt
+marcas_locais.txt
+stringConexao/
+*.local.*
+*.bak
+__pycache__/
+*.pyc
+python/

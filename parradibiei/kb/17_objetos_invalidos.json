@@ -1,0 +1,146 @@
+{
+  "id": "objetos_invalidos",
+  "ordem": 17,
+  "titulo": "Objetos invalidos e componentes do dicionario",
+  "quando_usar": "O relatorio apontou objetos INVALID; a aplicacao recebeu ORA-04068/ORA-06508 depois de um deploy; ou voce quer confirmar a saude do dicionario apos patch, upgrade ou datapump.",
+  "tags": [
+    "objetos invalidos",
+    "invalid",
+    "compilar",
+    "utlrp",
+    "package",
+    "view",
+    "synonym",
+    "dicionario",
+    "registry",
+    "deploy",
+    "ORA-04063",
+    "ORA-04068",
+    "PLS-00201",
+    "recompilar em massa",
+    "utl_recomp",
+    "dba_errors"
+  ],
+  "sintomas": [
+    "existing state of packages has been discarded",
+    "package body has errors",
+    "view is invalid",
+    "erro depois do deploy",
+    "objetos invalidos apos patch",
+    "ORA-04063",
+    "PLS-00905",
+    "nao consigo recompilar",
+    "utlrp nao roda",
+    "sessao cai ao recompilar",
+    "identifier must be declared"
+  ],
+  "secoes": [
+    "Objetos invalidos",
+    "Objetos",
+    "Dicionario",
+    "Componentes"
+  ],
+  "erros_ora": [
+    "ORA-04063",
+    "ORA-04068",
+    "ORA-06508",
+    "ORA-01031",
+    "ORA-00942",
+    "PLS-00201"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide - Managing Schema Objects, Recompiling Invalid Objects",
+    "Oracle Database Reference - DBA_OBJECTS, DBA_ERRORS, DBA_DEPENDENCIES, DBA_REGISTRY",
+    "Oracle Database Upgrade Guide - Running utlrp.sql"
+  ],
+  "nota": "Objeto invalido raramente e o problema em si: e a MARCA de outra coisa que aconteceu (deploy, DDL, patch, grant revogado, datapump incompleto). O Oracle recompila sozinho no primeiro acesso, entao muito invalido nao chega a doer - ate doer todo de uma vez. Duas armadilhas de leitura: (1) invalido que NAO recompila sozinho tem erro de verdade e precisa ser lido em DBA_ERRORS; (2) componente do dicionario invalido (DBA_REGISTRY) e MUITO mais grave que objeto de aplicacao invalido, e as duas coisas aparecem misturadas no mesmo numero.",
+  "passos": [
+    {
+      "titulo": "Inventariar os invalidos por dono e tipo",
+      "objetivo": "Separar invalido de aplicacao (rotina) de invalido em SYS/SYSTEM (grave).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, object_type, COUNT(*) AS invalidos\nFROM dba_objects\nWHERE status = 'INVALID'\nGROUP BY owner, object_type\nORDER BY invalidos DESC;",
+      "olhar": "Invalido em SYS, SYSTEM ou em schema de componente (XDB, MDSYS, CTXSYS, ORDSYS) e sinal de patch/upgrade mal terminado - trate com prioridade. Invalido em schema de aplicacao logo apos deploy e esperado e normalmente se resolve recompilando.",
+      "armadilha": "O numero total engana. 200 SYNONYM invalidos apontando para um objeto que nao existe mais e um problema; 200 PACKAGE BODY invalidos logo apos um deploy e outro completamente diferente. Sempre quebre por owner e tipo antes de dimensionar a gravidade."
+    },
+    {
+      "titulo": "Listar os invalidos e desde quando",
+      "objetivo": "Datar o evento: o last_ddl_time diz quando quebrou e ajuda a achar a mudanca que causou.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, object_name, object_type,\n       TO_CHAR(created,'DD/MM/YYYY')            AS criado,\n       TO_CHAR(last_ddl_time,'DD/MM/YYYY HH24:MI') AS ultima_alteracao\nFROM dba_objects\nWHERE status = 'INVALID'\nORDER BY last_ddl_time DESC FETCH FIRST 50 ROWS ONLY;",
+      "olhar": "Se muitos objetos tem o MESMO last_ddl_time, houve um evento unico (deploy, patch, script). Essa data e a chave para correlacionar com a linha do tempo do incidente.",
+      "armadilha": "last_ddl_time muda quando o objeto e recompilado, inclusive pela recompilacao automatica. Um objeto que quebrou ontem pode exibir a data de hoje se alguem ja tentou compilar - nao descarte a hipotese so pela data."
+    },
+    {
+      "titulo": "Ler o erro real de compilacao",
+      "objetivo": "Descobrir se o objeto so precisa recompilar ou se esta genuinamente quebrado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, name, type, sequence, line, position,\n       SUBSTR(text,1,150) AS erro\nFROM dba_errors\nWHERE attribute = 'ERROR'\nORDER BY owner, name, sequence FETCH FIRST 50 ROWS ONLY;",
+      "olhar": "PL/SQL: ORA-00942 (tabela nao existe) e PLS-00201 (identificador nao declarado) apontam objeto faltando ou GRANT revogado - nao adianta recompilar. PLS-00905 e so consequencia de outro objeto invalido. Se DBA_ERRORS vem vazio para um objeto invalido, ele provavelmente compila sem problema e so estava marcado invalido.",
+      "armadilha": "Erro em cascata engana: dezenas de objetos com PLS-00905 costumam ter UMA unica causa raiz la embaixo. Corrija o objeto base primeiro e recompile de novo antes de investigar os outros."
+    },
+    {
+      "titulo": "Mapear a dependencia que quebrou",
+      "objetivo": "Achar o objeto base cuja alteracao invalidou todo o resto.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT d.referenced_owner, d.referenced_name, d.referenced_type,\n       COUNT(*) AS dependentes_invalidos\nFROM dba_dependencies d\nJOIN dba_objects o\n  ON o.owner = d.owner AND o.object_name = d.name AND o.object_type = d.type\nWHERE o.status = 'INVALID'\nGROUP BY d.referenced_owner, d.referenced_name, d.referenced_type\nORDER BY dependentes_invalidos DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "O topo desta lista e o suspeito numero um: o objeto do qual todos os invalidos dependem. Confira se ELE tambem esta invalido ou se foi alterado recentemente.",
+      "armadilha": "Se o objeto base referenciado nao existe mais em dba_objects, a dependencia esta apontando para o vazio - foi drop de tabela ou revogacao de privilegio, e recompilar nunca vai resolver."
+    },
+    {
+      "titulo": "Conferir a saude dos componentes do dicionario",
+      "objetivo": "Distinguir invalido de aplicacao de componente do banco em estado ruim - este e o achado grave.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT comp_id, comp_name, version, status\nFROM dba_registry\nORDER BY comp_id;\n\nSELECT owner, object_type, COUNT(*) AS invalidos\nFROM dba_objects\nWHERE status = 'INVALID'\n  AND owner IN ('SYS','SYSTEM','XDB','MDSYS','CTXSYS','ORDSYS','OLAPSYS','WMSYS','DBSNMP')\nGROUP BY owner, object_type\nORDER BY invalidos DESC;",
+      "olhar": "Qualquer componente fora de VALID (INVALID, UPGRADED, LOADED) indica patch ou upgrade que nao terminou - e achado critico. 'OPTION OFF' e normal e nao e problema (aparece, por exemplo, em RAC dentro de instancia single).",
+      "armadilha": "Nao trate componente invalido do dicionario como objeto de aplicacao: NAO saia recompilando na mao. O caminho correto e o datapatch/utlrp do procedimento de patch, e em caso de duvida, SR no MOS. Mexer no dicionario por conta propria pode inutilizar o banco."
+    },
+    {
+      "titulo": "Recompilar um objeto especifico",
+      "objetivo": "Resolver caso pontual com controle, vendo o erro de cada objeto.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Recompilar invalida temporariamente o objeto para quem o estiver usando: sessao que chama um package no meio da recompilacao recebe ORA-04068. Prefira janela de baixa concorrencia. 2) A compilacao precisa de LOCK no objeto - se ha sessao executando o package, o comando FICA PRESO em 'library cache pin'. Confira sessoes ativas antes. 3) Nunca recompile objeto de SYS/dicionario por este caminho (veja o passo anterior). 4) Registre a acao no caso.",
+      "comando": "ALTER PACKAGE &owner..&objeto COMPILE;\nALTER PACKAGE &owner..&objeto COMPILE BODY;\n-- outros tipos:\n-- ALTER VIEW <owner>.<obj> COMPILE;\n-- ALTER PROCEDURE <owner>.<obj> COMPILE;\n-- ALTER TRIGGER <owner>.<obj> COMPILE;\n\n-- ler o resultado logo em seguida:\n-- SELECT line, position, text FROM dba_errors WHERE owner='<OWNER>' AND name='<OBJ>';",
+      "olhar": "Depois de compilar, confirme status VALID em dba_objects. Se continuar INVALID, o erro em DBA_ERRORS e real e precisa de correcao de codigo ou de privilegio - nao de mais uma tentativa.",
+      "armadilha": "ORA-04068 na aplicacao logo apos a recompilacao e ESPERADO: o Oracle descarta o estado das variaveis de package e a proxima chamada ja funciona. Aplicacoes que nao tratam isso podem precisar reconectar - avise o time antes de recompilar em producao."
+    },
+    {
+      "titulo": "Decidir se o caso e utlrp ou datapatch",
+      "objetivo": "Invalido em schema de aplicacao e utlrp. Invalido no DICIONARIO e patch/upgrade incompleto, e utlrp sozinho nao resolve.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, object_type, COUNT(*) AS qtd\nFROM dba_objects\nWHERE status <> 'VALID'\nGROUP BY owner, object_type\nORDER BY qtd DESC FETCH FIRST 20 ROWS ONLY;\n\n-- quanto e do dicionario (muda completamente a conduta):\nSELECT COUNT(*) AS invalidos_dicionario\nFROM dba_objects\nWHERE status <> 'VALID'\n  AND owner IN ('SYS','SYSTEM','XDB','MDSYS','CTXSYS','ORDSYS','WMSYS','OLAPSYS');\n\n-- componentes do registry fora de VALID apontam patch pela metade:\nSELECT comp_id, version, status FROM dba_registry WHERE status <> 'VALID';",
+      "olhar": "Invalidos concentrados em schema de APLICACAO: e deploy, e o utlrp (ou a recompilacao pontual) resolve. Invalido em SYS/SYSTEM ou componente do dba_registry fora de VALID: o pendente e o datapatch/postinstall do patch, e sair rodando utlrp mascara o problema sem corrigi-lo. Guarde o numero total: e a sua base de comparacao depois.",
+      "armadilha": "Contar so o total esconde a decisao. Dois bancos com '800 invalidos' podem exigir condutas opostas dependendo de QUEM e o owner."
+    },
+    {
+      "titulo": "Recompilar em massa com utlrp",
+      "objetivo": "Resolver de uma vez o cenario tipico de pos-patch ou pos-datapump, respeitando a ordem de dependencia.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) utlrp consome CPU pesado e usa paralelismo: rode em JANELA, nunca no pico. 2) Ele recompila TODOS os invalidos do banco, inclusive de outros schemas - confirme que isso e aceitavel. 3) Exige SYSDBA. 4) Em CDB, decida se roda no CDB$ROOT, num PDB ou em todos (catcon.pl); rodar no lugar errado nao resolve o PDB que doi. 5) Anote o numero de invalidos ANTES para poder comparar depois. 6) Registre a acao no caso. 7) O pacote e SYS.UTL_RECOMP e NAO tem grant publico: chamado por usuario comum levanta PLS-00201 ('identifier must be declared'), que parece erro de digitacao e e falta de privilegio. Conecte como SYSDBA. 8) Recompilar milhares de objetos numa unica sessao consome PGA: se a sessao morrer com ORA-03113 / 'No more data to read from socket', NAO reexecute antes de ler o alert log - procure ORA-04030, OOM killer (dmesg) e incidente ORA-600 no mesmo horario.",
+      "comando": "-- contar antes:\nSELECT COUNT(*) AS invalidos_antes FROM dba_objects WHERE status='INVALID';\n\n-- recompilacao em massa (como SYSDBA), em janela:\n-- @?/rdbms/admin/utlrp.sql\n\n-- alternativa com controle de paralelismo:\n-- EXEC UTL_RECOMP.RECOMP_PARALLEL(4);\n\n-- contar depois:\n-- SELECT COUNT(*) AS invalidos_depois FROM dba_objects WHERE status='INVALID';",
+      "olhar": "O numero deve cair drasticamente. O que SOBRAR invalido depois do utlrp e o que tem erro de verdade - e exatamente essa lista que merece o passo 3.",
+      "armadilha": "utlrp nao e magica: ele nao cria tabela que falta nem devolve GRANT revogado. Rodar utlrp repetidamente esperando que o numero chegue a zero e perda de tempo se a causa e objeto ou privilegio faltando. E nao troque o utlrp por um loop PL/SQL proprio que percorre dba_objects com EXECUTE IMMEDIATE 'ALTER ... COMPILE': ordenado por owner (ou por qualquer coisa que nao seja a dependencia), ele recompila um objeto que volta a invalidar logo em seguida, repete trabalho, roda tudo numa unica sessao serial e, com WHEN OTHERS engolindo o erro, esconde justamente a informacao util. O utlrp trata a ordem de dependencia, e reinicializavel e e o caminho suportado."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Objeto invalido reincidente aponta processo de deploy sem verificacao, nao problema de banco.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- invalidos agrupados pelo momento em que quebraram: revela o evento causador\nSELECT TO_CHAR(last_ddl_time,'DD/MM/YYYY HH24') AS quando,\n       COUNT(*) AS objetos,\n       COUNT(DISTINCT owner) AS schemas\nFROM dba_objects\nWHERE status = 'INVALID'\nGROUP BY TO_CHAR(last_ddl_time,'DD/MM/YYYY HH24')\nORDER BY objetos DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "Concentracao em uma unica hora identifica o deploy ou o script que causou. Se a hora bate com um patch, o pendente e o datapatch/utlrp do procedimento. Se bate com deploy de aplicacao, o pendente e incluir verificacao de invalidos no roteiro de deploy.",
+      "armadilha": "O framework ja cobre isto no check dict_health. A prevencao que funciona e simples: todo deploy deve terminar conferindo se sobrou objeto invalido - encontrar depois, por incidente, sempre custa mais caro."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "description": "Indice da biblioteca de scripts DBA. read_only=true sao seguros (diagnostico); destructive=true exigem Matriz de Risco (aviso + rollback + aprovacao). Diagnosticos read-only single-statement estao no mcp/catalog.json (coleta automatica); aqui ficam os interativos (com binds) e as acoes de manutencao.",
+  "scripts": [
+    {
+      "id": "diagnostico_interativo",
+      "file": "02_diagnostico_interativo.sql",
+      "category": "sql",
+      "read_only": true,
+      "destructive": false,
+      "binds": ["sql_id", "texto", "time"],
+      "run_in": "PDB",
+      "purpose": "Top SQL por CPU/atividade, sessoes longas (v$session_longops), achar SQL_ID por texto, fulltext e plano (DBMS_XPLAN)."
+    },
+    {
+      "id": "acoes_sql_tuning",
+      "file": "10_acoes_sql_tuning.sql",
+      "category": "sql",
+      "read_only": false,
+      "destructive": true,
+      "risk": "medio-alto",
+      "binds": ["sql_id", "owner", "table"],
+      "run_in": "PDB",
+      "purpose": "SQL Tuning Advisor (criar/executar/relatorio), aceitar SQL Profile, GATHER_STATS, drop task.",
+      "safety": "Aceitar profile e gather_stats MUDAM planos - sob Matriz de Risco (aviso + rollback + aprovacao)."
+    },
+    {
+      "id": "acoes_espaco_manutencao",
+      "file": "11_acoes_espaco_manutencao.sql",
+      "category": "space",
+      "read_only": false,
+      "destructive": true,
+      "risk": "alto",
+      "binds": [],
+      "run_in": "CDB$ROOT/PDB",
+      "purpose": "Resize/add/move datafile, recriar TEMP/UNDO, purge do shared pool, kill de sessao.",
+      "safety": "DROP/RESIZE/KILL sao destrutivos - NUNCA sem aviso + rollback + aprovacao. Verificar espaco no DG antes de resize/add."
+    }
+  ]
+}

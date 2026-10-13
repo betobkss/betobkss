@@ -1,0 +1,9 @@
+# Dependencias MINIMAS do Framework de Troubleshooting (COLETAR/TROUBLESHOOT/mcp).
+# Ambiente pinado (versoes exatas do .venv) em: requirements.txt
+#
+# Instalar:  python -m pip install -r requirements-troubleshoot.txt
+oracledb>=2.0.0        # coleta online read-only (modo thin, sem Oracle Client)
+python-pptx>=1.0.0     # geracao do PPTX (opcional; use --no-pptx para dispensar)
+
+# Desenvolvimento/testes (opcional):
+# pytest>=8.0.0

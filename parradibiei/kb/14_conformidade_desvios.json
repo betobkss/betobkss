@@ -1,0 +1,103 @@
+{
+  "id": "conformidade_desvios",
+  "ordem": 14,
+  "titulo": "Tratar desvios de conformidade (estilo ORAchk)",
+  "quando_usar": "O relatorio trouxe a secao 'Conformidade com as praticas Oracle' com percentual abaixo do esperado, e voce precisa decidir o que corrigir, em que ordem e com que risco.",
+  "tags": [
+    "conformidade",
+    "orachk",
+    "best practice",
+    "parametro",
+    "padronizacao",
+    "hardening"
+  ],
+  "sintomas": [
+    "percentual de conformidade baixo",
+    "desvio de parametro",
+    "sem autobackup de controlfile",
+    "redo com membro unico",
+    "NOARCHIVELOG"
+  ],
+  "secoes": [
+    "Conformidade",
+    "Conformidade com as praticas Oracle",
+    "Praticas Oracle"
+  ],
+  "fontes": [
+    "Oracle Autonomous Health Framework - ORAchk/EXAchk (conceito de compliance check)",
+    "Oracle Database Administrator's Guide - Managing Control Files, Redo Log Files",
+    "Regras do proprio framework: mcp/best_practices.json (cada regra traz porque, acao e referencia)"
+  ],
+  "nota": "AVISO QUE VALE MAIS QUE O RESTO: conformidade NAO e nota de prova. Um desvio pode ser decisao consciente e correta para aquele banco. O objetivo nao e chegar a 100% - e nao ter nenhum desvio DESCONHECIDO. Corrigir tudo de uma vez, sem entender, e a forma mais rapida de causar um incidente com a desculpa de boa pratica.",
+  "passos": [
+    {
+      "titulo": "Ler o desvio e o porque de cada regra",
+      "objetivo": "Antes de mudar qualquer coisa, entender o que a regra protege. Cada regra do framework declara motivo, acao e referencia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- os parametros que as regras avaliam, com a origem do valor atual:\nSELECT name, value, isdefault, ismodified, isadjusted, description\nFROM v$parameter\nWHERE name IN ('db_block_checking','db_block_checksum',\n               'db_lost_write_protect','filesystemio_options',\n               'control_file_record_keep_time','log_archive_max_processes',\n               'fast_start_mttr_target','undo_retention','processes',\n               'session_cached_cursors','open_cursors')\nORDER BY name;",
+      "olhar": "isdefault = TRUE significa que ninguem escolheu aquilo - o valor esta la porque veio de fabrica. Esse e o desvio facil de corrigir. isdefault = FALSE indica escolha deliberada de alguem: descubra o motivo ANTES de reverter.",
+      "armadilha": "Nao existe valor 'certo' universal. filesystemio_options depende do storage e do filesystem; db_block_checking custa CPU. A regra e ponto de partida para a conversa, nao veredito."
+    },
+    {
+      "titulo": "Separar o que e risco real do que e cosmetico",
+      "objetivo": "Priorizar. Nem todo desvio merece janela de mudanca.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- os tres desvios que costumam ser risco DE VERDADE:\n-- 1) o banco esta em ARCHIVELOG?\nSELECT log_mode, force_logging, flashback_on FROM v$database;\n\n-- 2) grupo de redo com membro unico (perda do membro = perda do grupo):\nSELECT group#, COUNT(*) AS membros, MAX(status) AS status\nFROM v$logfile GROUP BY group# HAVING COUNT(*) < 2;\n\n-- 3) controlfile multiplexado?\nSELECT name FROM v$controlfile;",
+      "olhar": "NOARCHIVELOG em banco de producao significa que nao existe recuperacao point-in-time: e o desvio mais grave que aparece na frota. Redo com um membro so e controlfile em copia unica sao pontos unicos de falha classicos.",
+      "armadilha": "Base de desenvolvimento em NOARCHIVELOG pode ser escolha correta e economica. O desvio so vira achado depois de confirmar o papel do banco - por isso o playbook comeca perguntando, nao corrigindo."
+    },
+    {
+      "titulo": "Confrontar a regra com a realidade do ambiente",
+      "objetivo": "Evitar corrigir para um numero que nao faz sentido no seu banco.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> SHOW RETENTION POLICY;\nRMAN> SHOW CONTROLFILE AUTOBACKUP;\nRMAN> SHOW ALL;",
+      "olhar": "control_file_record_keep_time precisa ser MAIOR que a retencao real do RMAN, senao o controlfile esquece backups que ainda existem. O framework ja compara com a retencao real em vez de um 30 fixo - confira o numero antes de aceitar a sugestao.",
+      "armadilha": "V$RMAN_CONFIGURATION so lista o que foi ALTERADO em relacao ao padrao. A AUSENCIA de 'CONTROLFILE AUTOBACKUP' na lista significa que ele esta OFF - a ausencia e que e o achado, e e facil ler a lista vazia como 'esta tudo certo'."
+    },
+    {
+      "titulo": "Verificar se o desvio ja causou dano",
+      "objetivo": "Desvio com consequencia observavel sobe de prioridade na hora.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ha erro no alert log relacionado ao que a regra protege?\nSELECT TO_CHAR(originating_timestamp,'DD/MM HH24:MI') AS quando,\n       SUBSTR(TRIM(REPLACE(message_text,CHR(10),' ')),1,140) AS mensagem\nFROM v$diag_alert_ext\nWHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(30,'DAY')\n  AND REGEXP_LIKE(message_text,'ORA-0*(1578|00600|257|16038|1555)')\nORDER BY originating_timestamp DESC FETCH FIRST 20 ROWS ONLY;\n\nSELECT COUNT(*) AS blocos_corrompidos FROM v$database_block_corruption;",
+      "olhar": "Corrupcao encontrada com db_block_checking desligado deixa de ser 'desvio de configuracao' e vira causa provavel. Esse cruzamento e o que transforma conformidade em argumento.",
+      "armadilha": "Ausencia de erro nao valida o desvio: db_lost_write_protect existe justamente para DETECTAR um problema que, sem ele, e silencioso. Alert log limpo pode significar que o banco nao esta olhando."
+    },
+    {
+      "titulo": "Corrigir um desvio de parametro dinamico",
+      "objetivo": "Aplicar a correcao de menor risco: parametro que muda sem reiniciar.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) UM POR VEZ. Mudar cinco parametros na mesma janela torna impossivel saber qual causou a regressao. 2) Anote o valor atual (SHOW PARAMETER) - e o seu rollback. 3) Confirme que o parametro e dinamico: SELECT issys_modifiable FROM v$parameter WHERE name='<x>'; se for FALSE, exige restart e vira outra conversa. 4) Meca o comportamento ANTES para poder comparar depois. 5) Registre a acao no caso com o valor antigo e o novo.",
+      "comando": "SELECT name, value, issys_modifiable FROM v$parameter WHERE name = '<parametro>';\n\nALTER SYSTEM SET <parametro> = <valor> SCOPE=BOTH SID='*';",
+      "olhar": "Depois, acompanhe por pelo menos um ciclo de carga: db_block_checking mexe em CPU, filesystemio_options mexe em I/O. Se o comportamento piorou, reverta com o valor anotado.",
+      "armadilha": "SCOPE=BOTH persiste no spfile: o valor volta no proximo restart e ninguem lembra. Um parametro mudado 'so para testar' sem registro e o que produz o proximo mistero de performance daqui a seis meses."
+    },
+    {
+      "titulo": "Multiplexar redo log ou controlfile",
+      "objetivo": "Eliminar ponto unico de falha - o desvio mais comum e mais barato de corrigir.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme espaco no segundo diskgroup/filesystem, e que ele e FISICAMENTE distinto - membro duplicado no mesmo disco nao protege de nada. 2) Para redo: acrescentar membro e online e seguro; NUNCA mexa num grupo com status CURRENT ou ACTIVE - confira em V$LOG. 3) Para controlfile: exige PARADA do banco (o parametro control_files nao e dinamico) - trate como mudanca planejada. 4) Registre a acao. 5) Rollback do redo: DROP LOGFILE MEMBER.",
+      "comando": "-- redo: seguro e online, um grupo INACTIVE por vez\nSELECT group#, status FROM v$log ORDER BY group#;\nALTER DATABASE ADD LOGFILE MEMBER '+DGREDO2' TO GROUP <n>;\n\n-- controlfile: NAO e dinamico. Exige parar, copiar o arquivo e\n-- ajustar control_files no spfile antes de subir.\nSHOW PARAMETER control_files",
+      "olhar": "Depois, refaca a consulta do passo 2: nenhum grupo deve ficar com menos de 2 membros. Confirme tambem no alert log que nao houve erro de escrita no membro novo.",
+      "armadilha": "Adicionar membro de redo no MESMO diskgroup do original satisfaz o check e nao protege de nada - a perda do diskgroup leva os dois. A regra existe para sobreviver a perda de um dispositivo, entao confirme que os caminhos sao independentes."
+    },
+    {
+      "titulo": "Registrar o desvio aceito",
+      "objetivo": "Fechar o ciclo. Desvio consciente e documentado deixa de ser risco e vira decisao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- retrato do que ficou, para anexar ao caso:\nSELECT name, value, isdefault FROM v$parameter\nWHERE name IN ('db_block_checking','db_lost_write_protect',\n               'filesystemio_options','control_file_record_keep_time')\nORDER BY name;",
+      "olhar": "Para cada desvio que NAO sera corrigido, registre no caso (CASO.py) o motivo e quem decidiu. Na proxima execucao o item vai aparecer de novo - com o registro, ninguem reabre a discussao do zero.",
+      "armadilha": "Perseguir 100% de conformidade e contraproducente e gera mudanca de risco sem beneficio. A meta util e: nenhum desvio sem dono e sem decisao registrada."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

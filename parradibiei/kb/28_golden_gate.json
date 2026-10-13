@@ -1,0 +1,154 @@
+{
+  "id": "golden_gate",
+  "titulo": "Golden Gate com lag, ABEND ou processo travado",
+  "quando_usar": "A replicacao Golden Gate acumulou lag, um Extract/Replicat esta em ABEND ou STOPPED, o processo nao responde ao comando de stop, ou o destino esta com dado atrasado.",
+  "tags": [
+    "golden gate",
+    "goldengate",
+    "ogg",
+    "ggsci",
+    "replicacao",
+    "lag",
+    "extract",
+    "replicat",
+    "pump",
+    "abend",
+    "manager",
+    "mgr",
+    "trail",
+    "checkpoint",
+    "gap de replicacao",
+    "destino atrasado",
+    "integrated extract",
+    "logdump",
+    "OGG-01031",
+    "OGG-02232"
+  ],
+  "sintomas": [
+    "lag crescente no info all do GGSCI",
+    "processo Extract ou Replicat em status ABEND",
+    "processo que nao responde ao comando STOP",
+    "destino com dado atrasado em relacao a origem",
+    "trail file antigo consumindo espaco sem ser purgado",
+    "Manager (MGR) parado, com todos os processos sem subir"
+  ],
+  "secoes": [
+    "Sessoes",
+    "Sessoes e processos",
+    "Distribuicao de esperas (ASH)",
+    "Archive",
+    "Destinos de archive",
+    "Erros no Alert Log"
+  ],
+  "erros_ora": [
+    "ORA-01555",
+    "ORA-00257",
+    "ORA-04031"
+  ],
+  "fontes": [
+    "Oracle GoldenGate 19c Administering Oracle GoldenGate",
+    "Oracle GoldenGate Reference - GGSCI commands (INFO, STATS, LAG, SEND)",
+    "Oracle Support - Troubleshooting Oracle GoldenGate Extract Performance",
+    "Pratica de campo: procedimento de validacao e recuperacao de OGG aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "Golden Gate e um produto separado com licenca propria, e o banco e apenas uma das pontas. Duas coisas mudam a conduta aqui: (1) o lado Oracle do problema (archive apagado, ORA-01555, undo curto) e resolvivel pelo DBA, mas o lado GGSCI e do time de replicacao - saiba onde termina o seu escopo; (2) NUNCA delete trail file a mao para liberar espaco: o Extract/Replicat perde o checkpoint e a replicacao tem de ser reinstanciada, o que custa horas e as vezes um refresh completo. O checkpoint do Golden Gate e a coisa mais fragil do conjunto.",
+  "passos": [
+    {
+      "titulo": "Ver o estado de todos os processos e o lag",
+      "objetivo": "Retrato geral em um comando: quem esta rodando e quem esta atrasado.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# entre no diretorio de instalacao do Golden Gate e abra o GGSCI\n# (ajuste o caminho ao seu ambiente; veja /etc/oratab ou pergunte ao time)\n#   cd /oracle/<instancia>/gg/gg19\n\nggsci\n\n# dentro do prompt GGSCI (tudo abaixo e somente leitura):\n#   INFO ALL                      -- status, lag no checkpoint e tempo desde o checkpoint\n#   INFO MGR                      -- o Manager esta no ar?\n#   INFO EXTRACT <nome>, DETAIL   -- detalhe de um Extract, com os trails\n#   INFO REPLICAT <nome>, DETAIL  -- detalhe de um Replicat\n#   LAG EXTRACT <nome>            -- lag medido agora, mais preciso que o INFO ALL\n#   LAG REPLICAT <nome>",
+      "olhar": "Duas colunas importam no INFO ALL: 'Lag at Chkpt' (quanto o processo esta atras do dado) e 'Time Since Chkpt' (quanto tempo faz que ele gravou progresso). Lag alto com Time Since Chkpt BAIXO = esta trabalhando, atras mas andando. Lag alto com Time Since Chkpt tambem alto = travado de verdade.",
+      "armadilha": "Status RUNNING nao significa saudavel: um Extract pode estar RUNNING e sem avancar o checkpoint ha horas. E o Manager (MGR) parado derruba a capacidade de iniciar qualquer processo - confira o MGR primeiro, senao voce tenta subir processos que nunca vao subir."
+    },
+    {
+      "titulo": "Confirmar se o processo avanca (duas leituras)",
+      "objetivo": "Separar 'lento' de 'travado' com evidencia, nao com impressao.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# no GGSCI, com 60 segundos entre as duas leituras:\n#   INFO ALL\n#   ... aguarde 60s ...\n#   INFO ALL\n\n# estatisticas de throughput do processo (quantas operacoes por tabela)\n#   STATS EXTRACT <nome>, TOTALSONLY *, LATEST\n#   STATS REPLICAT <nome>, TOTALSONLY *, LATEST\n\n# o que o processo esta fazendo neste instante\n#   SEND EXTRACT <nome>, STATUS\n#   SEND EXTRACT <nome>, SHOWTRANS\n#   SEND REPLICAT <nome>, STATUS",
+      "olhar": "Se o RBA/checkpoint mudou entre as duas leituras, o processo esta consumindo - o caso e de performance, nao de travamento. SHOWTRANS mostra transacao longa aberta na origem, que e a causa mais comum de Extract 'parado': ele nao pode avancar o checkpoint enquanto a transacao nao fechar.",
+      "armadilha": "Extract esperando uma transacao longa NAO esta travado e nao deve ser reiniciado - reiniciar faz ele reprocessar desde o checkpoint anterior e o lag AUMENTA. A acao correta e tratar a transacao longa no banco de origem (passo 4)."
+    },
+    {
+      "titulo": "Ler o relatorio e o log de erro do processo",
+      "objetivo": "Achar a mensagem OGG-xxxxx exata, que e o que direciona a solucao.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# no GGSCI:\n#   VIEW REPORT <nome_do_processo>       -- relatorio completo, com o erro do ABEND\n#   VIEW GGSEVT                          -- log de eventos do Golden Gate\n\n# direto no sistema de arquivos (ajuste o caminho da instalacao):\ntail -100 ggserr.log\n\ngrep -E 'ERROR|OGG-[0-9]+|ABEND' ggserr.log | tail -40\n\n# relatorios ficam em dirrpt/\nls -lt dirrpt/ | head -20",
+      "olhar": "O ABEND sempre registra a causa no report: erro de mapeamento, tabela inexistente no destino, conflito de chave, ORA-xxxxx do banco. Sem essa mensagem, reiniciar o processo e chute - e ele vai abendar de novo no mesmo ponto.",
+      "armadilha": "'OGG-02232 Switching to next trail file ... due to EOF' NAO e erro: e o Replicat trocando de arquivo normalmente. Tratar isso como falha leva a acao desnecessaria. Procure ERROR e ABEND, nao qualquer linha com codigo OGG."
+    },
+    {
+      "titulo": "Checar o lado Oracle: o que o Extract precisa e pode faltar",
+      "objetivo": "Verificar transacao longa, archive e undo - o escopo do DBA.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- transacao longa aberta: segura o checkpoint do Extract\nSELECT s.inst_id, s.sid, s.serial#, s.username,\n       SUBSTR(s.module, 1, 30) AS modulo,\n       TO_CHAR(t.start_date, 'DD/MM HH24:MI:SS') AS transacao_desde,\n       ROUND((SYSDATE - t.start_date) * 24 * 60) AS minutos_aberta,\n       t.used_urec AS registros_undo,\n       ROUND(t.used_ublk * 8192 / 1024 / 1024) AS undo_mb\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr\nORDER  BY t.start_date;\n\n-- archive disponivel: Extract classico le do archive\nSELECT thread#, sequence#,\n       TO_CHAR(first_time, 'DD/MM HH24:MI') AS de,\n       TO_CHAR(next_time,  'DD/MM HH24:MI') AS ate,\n       archived, deleted, status\nFROM   v$archived_log\nWHERE  first_time > SYSDATE - 2\nORDER  BY thread#, sequence# DESC\nFETCH FIRST 30 ROWS ONLY;\n\n-- espaco na FRA (archive cheio para a replicacao junto com o banco)\nSELECT name, space_limit/1024/1024/1024 AS limite_gb,\n       space_used/1024/1024/1024        AS usado_gb,\n       ROUND(space_used/space_limit*100, 1) AS pct_usado\nFROM   v$recovery_file_dest;\n\n-- retencao de undo (Extract integrado depende dela)\nSELECT name, value FROM v$parameter\nWHERE  name IN ('undo_retention', 'undo_tablespace', 'enable_goldengate_replication');",
+      "olhar": "Transacao aberta ha horas explica lag sem nenhum problema no Golden Gate. Archive com DELETED='YES' na faixa que o Extract ainda precisa e a falha mais grave: sem o archive, o Extract nao tem como avancar e pode exigir reinstanciacao. enable_goldengate_replication precisa estar TRUE.",
+      "armadilha": "Politica de delete de archive do RMAN que nao respeita o Golden Gate apaga exatamente o que o Extract ainda vai ler. Em Extract integrado o banco protege via capture, mas em Extract CLASSICO nao ha protecao nenhuma - e a causa classica de 'a replicacao morreu depois do backup'. Confirme a politica com o time de backup."
+    },
+    {
+      "titulo": "Ver o Extract integrado pelo lado do banco",
+      "objetivo": "Quando o Extract e integrado, o banco tem visao propria do capture.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- processos de captura registrados no banco\nSELECT capture_name, status, capture_type, purpose,\n       TO_CHAR(start_time, 'DD/MM HH24:MI:SS')        AS iniciado_em,\n       TO_CHAR(status_change_time, 'DD/MM HH24:MI:SS') AS mudou_status_em,\n       TO_CHAR(captured_scn) AS captured_scn,\n       TO_CHAR(applied_scn)  AS applied_scn,\n       error_number, SUBSTR(error_message, 1, 60) AS erro\nFROM   dba_capture;\n\n-- latencia da captura (view do lado Golden Gate integrado)\nSELECT capture_name, extract_name, state,\n       ROUND((SYSDATE - capture_message_create_time) * 86400) AS latencia_s,\n       TO_CHAR(capture_time, 'DD/MM HH24:MI:SS') AS ultima_captura,\n       total_messages_captured, total_messages_enqueued\nFROM   v$goldengate_capture;\n\n-- sessoes do Golden Gate conectadas ao banco\nSELECT s.inst_id, s.sid, s.username,\n       SUBSTR(s.program, 1, 35) AS programa,\n       s.status, s.event, s.seconds_in_wait\nFROM   gv$session s\nWHERE  UPPER(s.program) LIKE '%EXTRACT%'\nOR     UPPER(s.program) LIKE '%REPLICAT%'\nOR     UPPER(s.module)  LIKE '%GOLDENGATE%'\nORDER  BY s.seconds_in_wait DESC;",
+      "olhar": "STATUS diferente de ENABLED em DBA_CAPTURE, com error_number preenchido, entrega a causa sem sair do banco. Latencia alta com total_messages_captured avancando indica volume, nao travamento.",
+      "armadilha": "Estas views voltam vazias em Extract CLASSICO (nao integrado) - isso nao e erro nem prova de que o Golden Gate esta ausente. Confirme o modo com INFO EXTRACT <nome>, DETAIL antes de concluir qualquer coisa a partir do vazio."
+    },
+    {
+      "titulo": "Verificar o espaco dos trail files",
+      "objetivo": "Trail cheio para a replicacao; e a purga tem regra propria.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# espaco do filesystem onde ficam os trails\ndf -h .\n\n# trails e seus tamanhos (dirdat e o diretorio padrao)\nls -lt dirdat/ | head -30\n\n# quanto o diretorio ocupa no total\ndf -h dirdat 2>/dev/null\n\n# no GGSCI, ver quais trails ainda estao em uso e a regra de purga:\n#   INFO EXTTRAIL *\n#   INFO RMTTRAIL *\n#   INFO MGR, DETAIL          -- mostra as regras PURGEOLDEXTRACTS\n#   SEND MGR, GETPURGEOLDEXTRACTS",
+      "olhar": "Compare o trail mais antigo com o checkpoint dos processos (INFO ALL). Trail anterior ao checkpoint de TODOS os consumidores e elegivel a purga; o resto nao. PURGEOLDEXTRACTS configurado no MGR e o jeito correto de automatizar isso.",
+      "armadilha": "Apagar trail file com rm para liberar espaco e o erro mais caro deste playbook: o processo perde a sequencia, entra em ABEND e a recuperacao pode exigir reinstanciacao completa da replicacao (horas de janela, as vezes refresh do destino). Se o espaco esta critico, a saida e ampliar o filesystem ou ajustar PURGEOLDEXTRACTS - nunca o rm."
+    },
+    {
+      "titulo": "Tratar a transacao longa que segura o Extract",
+      "objetivo": "Remover a causa no banco, que e o escopo do DBA.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Identifique o DONO da transacao (passo 4) e fale com ele: a decisao de abortar uma transacao de negocio nao e do DBA sozinho. 2) KILL SESSION faz ROLLBACK, que pode ser mais longo que a propria transacao - verifique used_urec antes e avise sobre o tempo. 3) O Extract vai reprocessar a partir do checkpoint: espere o lag PIORAR antes de melhorar. 4) Se a transacao e de batch legitimo, a resposta correta pode ser esperar, nao matar. 5) Registre no caso o SID, o modulo, quem autorizou e o horario.",
+      "comando": "-- 1) dimensionar o rollback antes de decidir\nSELECT s.inst_id, s.sid, s.serial#, s.username, s.module,\n       t.used_urec AS registros_undo,\n       ROUND(t.used_ublk * 8192/1024/1024) AS undo_mb,\n       ROUND((SYSDATE - t.start_date)*24*60) AS minutos_aberta\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr\nORDER  BY t.used_urec DESC;\n\n-- 2) gera o comando para revisao (nao executa nada)\nSELECT 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial#\n       || ',@' || s.inst_id || ''' IMMEDIATE;' AS comando_gerado,\n       s.username, s.module, t.used_urec\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr\nWHERE  (SYSDATE - t.start_date) * 24 > 2\nORDER  BY t.start_date;\n\n-- 3) executar APENAS a linha autorizada\n-- 4) acompanhar o rollback:\nSELECT s.sid, s.username, s.status,\n       t.used_urec AS undo_restante\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr;",
+      "olhar": "Com a transacao encerrada, o Extract deve voltar a avancar o checkpoint (confirme com INFO ALL duas vezes). used_urec caindo indica rollback em progresso - espere zerar antes de concluir.",
+      "armadilha": "Matar a sessao nao termina o trabalho na hora: o rollback de uma transacao com milhoes de registros de undo pode levar mais tempo que a transacao original, e durante ele o Extract continua sem avancar. Ou seja, matar pode piorar o lag no curto prazo. Diga isso ao solicitante ANTES de executar."
+    },
+    {
+      "titulo": "Reiniciar processo do Golden Gate",
+      "objetivo": "Recolocar em execucao o que esta STOPPED ou em ABEND, pela ordem certa.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Antes de subir, entenda o ABEND (passo 3): reiniciar sem corrigir a causa gera novo ABEND no mesmo ponto e polui o historico. 2) O Manager (MGR) tem de estar no ar primeiro - sem ele nada sobe. 3) O processo reinicia do CHECKPOINT, nao do zero: espere reprocessamento e piora temporaria do lag. 4) Esta acao normalmente e do time de replicacao: confirme o escopo antes de executar, e registre no caso quem autorizou. 5) Suba um processo por vez e acompanhe com INFO ALL - subir tudo de uma vez esconde qual voltou a falhar. 6) NAO use 'kill extract' como primeira opcao (ver passo 9).",
+      "comando": "ggsci\n\n# ordem correta:\n#   1) INFO MGR                    -- confirmar o Manager\n#   2) START MGR                   -- se estiver parado\n#   3) INFO ALL                    -- ver o que esta parado\n#   4) START EXTRACT <nome>        -- um por vez\n#   5) INFO EXTRACT <nome>         -- confirmar RUNNING e checkpoint avancando\n#   6) START REPLICAT <nome>\n#   7) INFO ALL                    -- retrato final\n\n# se precisar parar de forma ordenada:\n#   STOP REPLICAT <nome>\n#   STOP EXTRACT <nome>\n#   STOP MGR                       -- por ultimo",
+      "olhar": "Depois do START, o status deve virar RUNNING e o 'Time Since Chkpt' deve voltar a valores baixos em poucos minutos. Lag alto ainda e esperado no inicio: o que importa e ele estar DIMINUINDO a cada INFO ALL.",
+      "armadilha": "A ordem de parada e o inverso da de partida: parar o MGR primeiro deixa os processos sem quem os supervisione, e depois eles nao sobem sozinhos. E 'START *' sobe tudo de uma vez - conveniente, mas se um abendar voce nao sabe qual sem ler todos os reports."
+    },
+    {
+      "titulo": "Forcar o encerramento de processo que nao responde",
+      "objetivo": "Ultimo recurso para processo que ignora o STOP e mantem o lag crescendo.",
+      "risco": "destrutivo",
+      "onde": "so",
+      "antes_de_executar": "1) Tente STOP normal e aguarde de verdade (minutos): um Extract processando transacao grande demora a parar e nao esta travado. 2) KILL abandona o processo sem encerramento ordenado: o checkpoint pode ficar defasado e o reprocessamento na volta e maior. Em cenario ruim, exige reinstanciacao. 3) Esta acao e do time de replicacao. Obtenha aprovacao explicita e registre no caso: processo, horario, quem autorizou e o lag no momento. 4) Confirme com o dono da aplicacao que o destino pode ficar atrasado mais tempo durante o reprocessamento. 5) Tenha o procedimento de reinstanciacao a mao ANTES de matar - se der errado, e ele que voce vai executar. 6) NUNCA combine kill com remocao de trail file.",
+      "comando": "ggsci\n\n# 1) confirme que o STOP normal nao resolveu:\n#   STOP EXTRACT <nome>\n#   ... aguarde e confira ...\n#   INFO EXTRACT <nome>\n\n# 2) somente entao, forcar:\n#   KILL EXTRACT <nome>\n#   KILL REPLICAT <nome>\n\n# 3) confirme que o processo saiu e nao ficou orfao no SO:\n#   INFO ALL\n# no shell:\nps -ef | grep -i extract | grep -v grep\n\n# 4) suba novamente pelo passo 9 e acompanhe o checkpoint",
+      "olhar": "Depois do KILL, confirme nos DOIS lugares: INFO ALL (o Golden Gate) e ps (o sistema operacional). Processo que sumiu do GGSCI mas continua no ps segue consumindo CPU e segurando arquivo - e precisa ser tratado com o time de replicacao.",
+      "armadilha": "KILL deixa o processo sem gravar o checkpoint final. Na volta, ele reprocessa a partir do ultimo checkpoint gravado, e se esse ponto estiver em trail ja purgado, a replicacao nao sobe de jeito nenhum - o caminho passa a ser reinstanciar, com refresh do destino. Foi por isso que o STOP ordenado vem primeiro: ele grava o checkpoint."
+    },
+    {
+      "titulo": "Fechar o caso com a causa e a reincidencia",
+      "objetivo": "Encerrar com dono definido, nao com 'reiniciei e voltou'.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- transacoes longas sao reincidentes? (o gatilho mais comum de lag)\nSELECT SUBSTR(s.module, 1, 40) AS modulo,\n       COUNT(*) AS transacoes_abertas,\n       MAX(ROUND((SYSDATE - t.start_date)*24*60)) AS pior_minutos\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr\nGROUP  BY SUBSTR(s.module, 1, 40)\nORDER  BY pior_minutos DESC;\n\n-- politica de retencao de archive x necessidade da replicacao\nSELECT name, value FROM v$parameter\nWHERE  name IN ('log_archive_dest_1', 'db_recovery_file_dest_size',\n                'undo_retention', 'enable_goldengate_replication');\n\n-- erros do banco no periodo do incidente\nSELECT TO_CHAR(originating_timestamp, 'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(REPLACE(REPLACE(message_text, CHR(10), ' '), CHR(13), ' '), 1, 100) AS mensagem\nFROM   v$diag_alert_ext\nWHERE  originating_timestamp > SYSDATE - 7\nAND    REGEXP_LIKE(message_text, 'ORA-[0-9]{4,5}')\nORDER  BY originating_timestamp DESC\nFETCH FIRST 25 ROWS ONLY;",
+      "olhar": "Se o mesmo modulo aparece sempre com transacao longa, a acao definitiva e com o time de aplicacao (reduzir o escopo da transacao, commitar em lotes). Se a causa foi archive purgado, a acao e ajustar a politica de backup - e ambas ficam registradas com dono.",
+      "armadilha": "Encerrar com 'reiniciei o Extract e o lag zerou' garante a repeticao no proximo mes. E se a causa foi archive apagado, o proximo incidente pode nao ter volta: registre a acao preventiva mesmo que a execucao fique para outro time."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

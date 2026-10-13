@@ -1,0 +1,159 @@
+{
+  "id": "rman_catalogo_wallet",
+  "ordem": 34,
+  "titulo": "Catalogo RMAN e wallet de credenciais (conectar, validar, registrar)",
+  "quando_usar": "RMAN nao acha o catalogo, backup falha na conexao com o repositorio, pacotes do catalogo desatualizados apos patch, duvida sobre QUAL usuario roda o backup, banco novo a registrar, ou servico do catalogo ativo no no errado do cluster.",
+  "tags": [
+    "rman",
+    "catalogo",
+    "recovery catalog",
+    "wallet",
+    "mkstore",
+    "credencial",
+    "tns_admin",
+    "backup",
+    "dblink",
+    "repositorio",
+    "RMAN-04004",
+    "RMAN-06429",
+    "RMAN-06445"
+  ],
+  "sintomas": [
+    "RMAN nao conecta no catalogo",
+    "TNS could not resolve the connect identifier",
+    "pacote do catalogo nao esta atual",
+    "nao sei qual usuario roda o backup",
+    "banco nao registrado no catalogo",
+    "servico do catalogo online no standby",
+    "consulta ao repositorio de historico falhando"
+  ],
+  "secoes": [
+    "Backup",
+    "RMAN",
+    "Recuperabilidade",
+    "Conexao"
+  ],
+  "erros_ora": [
+    "ORA-12154",
+    "ORA-01017",
+    "ORA-28759",
+    "ORA-12541",
+    "ORA-02019"
+  ],
+  "fontes": [
+    "Oracle Database Backup and Recovery User's Guide - Managing a Recovery Catalog",
+    "Oracle Database Security Guide - Managing Credentials in a Client-Side Oracle Wallet",
+    "Oracle Database Reference - V$RMAN_CONFIGURATION, GV$ACTIVE_SERVICES"
+  ],
+  "nota": "Duas coisas causam quase toda falha de conexao com catalogo, e nenhuma e do banco: o TNS_ADMIN errado (o alias do catalogo costuma existir SO no diretorio do wallet, nao no network/admin default) e a credencial do wallet desatualizada. Comece descobrindo QUAL wallet e QUAL TNS_ADMIN valem - e nao confunda 'tnsping responde' com 'a conexao funciona': tnsping fala com o listener e nao valida servico, usuario nem senha.",
+  "passos": [
+    {
+      "titulo": "Descobrir o TNS_ADMIN, o wallet e quem roda o backup",
+      "objetivo": "Sem isso o resto e chute: o alias do catalogo pode nao existir no TNS_ADMIN default, e a conta de backup nao esta no banco, esta no wallet.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# o ambiente do SEU shell agora:\ngrep -azE \"TNS_ADMIN|ORACLE_HOME|ORACLE_SID\" /proc/self/environ\n\n# o ambiente de um PROCESSO ja no ar (o que roda o backup, o pmon, o dmon):\ngrep -azE \"TNS_ADMIN|ORACLE_HOME|ORACLE_SID\" /proc/<PID>/environ\n\n# quais diretorios de rede existem neste home, e de quando sao os arquivos:\nls -ld $ORACLE_HOME/network/admin*\nls -l $ORACLE_HOME/network/admin*/tnsnames.ora $ORACLE_HOME/network/admin*/sqlnet.ora\n\n# o alias do catalogo resolve?\ntnsping <ALIAS_CATALOGO>\n\n# QUEM sao os usuarios gravados no wallet (nunca mostra senha):\nmkstore -wrl $ORACLE_HOME/network/admin_wallet -listCredential",
+      "olhar": "Se houver MAIS DE UM diretorio de rede (um default e outro com wallet), o alias do catalogo tipicamente vive so no do wallet - e por isso o RMAN falha com ORA-12154 sem apontar o TNS_ADMIN para la. Compare as DATAS: sqlnet.ora recente com tnsnames antigo indica que um patch mexeu em um e nao no outro. No -listCredential, confira se o alias de que voce precisa esta na lista, e com qual usuario.",
+      "armadilha": "Processo em execucao NAO herda o TNS_ADMIN do seu shell: usa o que tinha quando subiu - um alias que funciona no seu terminal pode falhar para o processo de background, e o /proc/<PID>/environ e a unica resposta confiavel. E nao use '-viewEntry' para 'conferir' credencial: ele imprime o segredo em texto claro, que vai para o log da sessao e para o print anexado ao chamado."
+    },
+    {
+      "titulo": "Provar a credencial e confirmar ONDE a conexao caiu",
+      "objetivo": "Validar de ponta a ponta (nome, rede, servico, credencial) e garantir que voce nao caiu no no errado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT USER AS conectado_como,\n       SYS_CONTEXT('USERENV','DB_NAME')     AS banco,\n       SYS_CONTEXT('USERENV','SERVER_HOST') AS host,\n       SYS_CONTEXT('USERENV','INSTANCE_NAME') AS instancia\nFROM dual;\n\nSELECT db_unique_name, database_role, open_mode FROM v$database;",
+      "olhar": "O usuario tem de ser o esperado, e o host/instancia tem de ser o lado CERTO - conectar com sucesso no no errado e a falha que mais engana, porque tudo parece funcionar. Se database_role vier PHYSICAL STANDBY quando voce queria o primary, pare aqui.",
+      "armadilha": "Ao testar pelo SO, use 'sqlplus -L': sem o -L, credencial invalida abre prompt interativo e o script TRAVA esperando digitacao em vez de falhar rapido. ORA-01017 nesse teste e, em um sentido, boa noticia - prova que nome e servico resolvem e que so a senha esta errada."
+    },
+    {
+      "titulo": "Ver a configuracao do RMAN sem entrar no RMAN",
+      "objetivo": "Conferir retencao, deletion policy e autobackup direto por SQL, antes de abrir o RMAN.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT conf#, name, value FROM v$rman_configuration ORDER BY conf#;",
+      "olhar": "Procure RETENTION POLICY, ARCHIVELOG DELETION POLICY e CONTROLFILE AUTOBACKUP. 'ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY' e o que impede apagar archive nao aplicado - protege o gap de Data Guard, mas faz a area de archive crescer sem parar se o standby parar de aplicar.",
+      "armadilha": "Esta view mostra so o que foi CONFIGURADO explicitamente: o que esta no default nao aparece como linha. Ausencia de CONTROLFILE AUTOBACKUP aqui nao prova que esta ligado - confirme no SHOW ALL do RMAN, que imprime os defaults marcados com '# default'."
+    },
+    {
+      "titulo": "Conferir a versao dos pacotes do catalogo",
+      "objetivo": "Detectar catalogo defasado em relacao ao banco - tipico depois de upgrade ou patch.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "-- conectar (no SO, com o TNS_ADMIN do wallet):\n--   rman target / catalog /@<ALIAS_CATALOGO>\nSHOW ALL;\nLIST INCARNATION OF DATABASE;\nREPORT SCHEMA;",
+      "olhar": "Repare nas linhas logo apos 'connected to recovery catalog database': aviso do tipo 'PL/SQL package ... version X in RCVCAT database is not current' significa catalogo em versao ANTERIOR a do banco. O REPORT SCHEMA tem de listar os datafiles reais deste banco - se listar outra coisa, voce conectou no target errado.",
+      "armadilha": "O RMAN CONECTA e opera com os pacotes defasados, apenas avisando - por isso o desvio passa meses invisivel, porque 'o backup roda'. Leia o cabecalho da conexao antes de ir para o comando: e ali que o problema aparece, e nao em nenhuma saida de consulta."
+    },
+    {
+      "titulo": "Ver em qual instancia o servico do catalogo esta ativo",
+      "objetivo": "O repositorio tambem tem primary e standby. Servico ativo no lado errado faz a automacao gravar/ler onde nao deve.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, name, network_name FROM gv$active_services ORDER BY name, inst_id;",
+      "olhar": "Rode no banco de CATALOGO. O servico do catalogo deve aparecer apenas na instancia do PRIMARY. Se aparecer nos dois lados, e achado: a automacao pode conectar no standby. Complemento pelo SO, como grid: 'srvctl status service -db <DB_CATALOGO> -service <SERVICO_CATALOGO>'.",
+      "armadilha": "Servico de catalogo ativo no standby e dos achados que mais enganam: o standby aceita a conexao e a falha aparece depois, como erro INTERMITENTE de backup em VARIOS bancos ao mesmo tempo. Se ha reclamacao 'geral' de backup, confira isto antes de investigar banco por banco."
+    },
+    {
+      "titulo": "Conferir o dblink do repositorio de historico",
+      "objetivo": "Quando a consulta de historico de backup falha, o problema costuma ser o dblink, nao o backup.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, db_link, host, created FROM dba_db_links ORDER BY db_link;\n\n-- a travessia em si (troque pelos nomes do seu repositorio):\nSELECT COUNT(*) AS linhas FROM <SCHEMA_REPO>.<TABELA_HIST>@<REPOSITORIO>;",
+      "olhar": "A coluna host tem de apontar para o alias correto do repositorio, e esse alias precisa existir no TNS_ADMIN da INSTANCIA - nao no do seu shell. Na travessia: ORA-02019 = alias ausente; ORA-01017 = senha do dblink desatualizada; ORA-12541 = listener do repositorio fora do ar.",
+      "armadilha": "dblink guarda a senha de quando foi criado. Se a senha do usuario do repositorio mudou, o dblink quebra em silencio e so aparece quando alguem consulta o historico - normalmente na hora de prestar conta, nao na hora do backup."
+    },
+    {
+      "titulo": "Desativar o servico do catalogo que subiu no standby",
+      "objetivo": "Deixar o servico apenas no lado correto, quando a verificacao mostrou os dois ativos.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) CONFIRME o papel de cada no (v$database.database_role) na mesma sessao em que vai executar - parar o servico no PRIMARY por engano derruba o catalogo de TODA a frota, nao so deste banco. 2) Verifique se ha backup rodando agora (v$rman_status): parar o servico no meio aborta o job. 3) Combine janela, porque o repositorio atende muitos bancos. 4) Registre a acao no caso.",
+      "comando": "# rodar NO NO STANDBY do catalogo, apos confirmar o papel:\nsrvctl stop service -d <DB_CATALOGO> -s <SERVICO_CATALOGO>\nsrvctl status service -db <DB_CATALOGO> -service <SERVICO_CATALOGO>",
+      "olhar": "Depois do stop, o servico deve constar OFFLINE neste no e seguir ONLINE no primary. Reteste a conexao (passo 2) para garantir que a automacao continua alcancando o catalogo.",
+      "armadilha": "E o MESMO comando que derruba o catalogo se executado no no errado, e o nome do servico e identico nos dois lados - nao ha protecao nenhuma embutida. Confirme hostname E papel na mesma sessao, nunca de memoria nem pela aba aberta do lado."
+    },
+    {
+      "titulo": "Atualizar os pacotes do catalogo (UPGRADE CATALOG)",
+      "objetivo": "Alinhar o catalogo a versao do banco quando a conexao avisou que os pacotes nao estao atuais.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) O catalogo atende MUITOS bancos: o impacto e da frota inteira, nao deste banco. Trate como mudanca do time de backup, com janela. 2) Export do schema do owner do catalogo antes. 3) O catalogo tem de ficar em versao IGUAL OU SUPERIOR a do cliente mais novo - descubra qual e antes. 4) Nenhum backup rodando. 5) Registre a acao.",
+      "comando": "-- conectar so no catalogo (no SO): rman catalog /@<ALIAS_CATALOGO>\n-- o comando pede confirmacao e deve ser repetido:\nUPGRADE CATALOG;\nUPGRADE CATALOG;",
+      "olhar": "Deve sair 'recovery catalog upgraded to version ...'. Reconecte com target + catalog e confirme que o aviso de pacote nao atual DESAPARECEU do cabecalho - essa e a unica verificacao que importa.",
+      "armadilha": "Nao existe DOWNGRADE de catalogo: uma vez atualizado, cliente de versao anterior pode precisar de tratamento. Se o seu problema e um banco so, a conexao ou o REGISTER resolvem sem tocar no catalogo - e mexer nele seria trocar um incidente por outro de escopo muito maior."
+    },
+    {
+      "titulo": "Criar ou trocar credencial no wallet",
+      "objetivo": "Quando o teste de conexao provou credencial invalida, ou o banco e novo no wallet.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) BACKUP da pasta do wallet inteira (cp -rp): ela guarda as credenciais de TODAS as conexoes automatizadas do servidor, e um erro aqui derruba backup, coleta e monitoracao de uma vez. 2) Liste antes (-listCredential) e guarde a saida: e a referencia do que existia. 3) Tenha a senha CORRETA validada antes de gravar. 4) Registre a acao no caso - sem a senha no registro.",
+      "comando": "cp -rp $ORACLE_HOME/network/admin_wallet $ORACLE_HOME/network/admin_wallet.bkp_<CASO>\n\nmkstore -wrl $ORACLE_HOME/network/admin_wallet -listCredential\nmkstore -wrl $ORACLE_HOME/network/admin_wallet -createCredential <ALIAS> <USUARIO>\nmkstore -wrl $ORACLE_HOME/network/admin_wallet -deleteCredential <ALIAS_OBSOLETO>",
+      "olhar": "Valide com o passo 2 (USER e SYS_CONTEXT pelo alias): tem de devolver o usuario esperado, no host esperado. Reteste TAMBEM a rotina que usa a credencial - backup, coleta - e nao so o sqlplus: o processo pode ler outro TNS_ADMIN.",
+      "armadilha": "NAO passe a senha na linha de comando: ela vai para o history do shell e fica visivel em 'ps' para qualquer usuario do servidor enquanto o comando roda. Omita o argumento e deixe o mkstore perguntar. Pelo mesmo motivo, senha nunca entra em runbook, wiki, chamado nem repositorio - e se ja entrou, o certo e ROTACIONAR, nao apagar o texto e seguir."
+    },
+    {
+      "titulo": "Registrar o banco no catalogo",
+      "objetivo": "Banco novo, ou recem migrado, que ainda nao aparece no repositorio.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Confirme que o banco NAO esta registrado (LIST INCARNATION OF DATABASE) - registrar duas vezes gera confusao de incarnation. 2) Confirme que e o banco certo pelo DBID, nao pelo nome: nome se repete entre ambientes, DBID nao (SELECT dbid FROM v$database). 3) Rode no PRIMARY. 4) Registre a acao.",
+      "comando": "-- conectar (no SO): rman target / catalog /@<ALIAS_CATALOGO>\nREGISTER DATABASE;\nLIST INCARNATION OF DATABASE;\nREPORT SCHEMA;",
+      "olhar": "'database registered in recovery catalog' e a confirmacao. O REPORT SCHEMA seguinte tem de listar os datafiles REAIS deste banco - se listar outra coisa, voce se conectou no target errado.",
+      "armadilha": "Em Data Guard, primary e standby compartilham o DBID: registrar a partir do standby, ou fazer RESYNC de lados diferentes sem criterio, mistura no catalogo a informacao do mesmo DBID. Padronize registro e backup no PRIMARY, salvo politica explicita em contrario."
+    },
+    {
+      "titulo": "Recriar o dblink do repositorio de historico",
+      "objetivo": "Restabelecer a consulta de historico quando o dblink esta invalido.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Guarde a definicao atual (dba_db_links) ANTES de dropar - depois nao ha como consultar o que era. 2) Confirme com o time do repositorio o usuario e o alias corretos antes de dropar, para nao ficar sem link nenhum. 3) dblink PUBLIC afeta todos os usuarios do banco: confirme que ninguem esta consultando agora. 4) Registre a acao - sem a senha no registro.",
+      "comando": "-- 1. guardar o que existe hoje:\nSELECT owner, db_link, host, created FROM dba_db_links\nWHERE UPPER(db_link) LIKE '%<REPOSITORIO>%';\n\n-- 2. recriar:\nDROP PUBLIC DATABASE LINK <REPOSITORIO>;\n\nCREATE PUBLIC DATABASE LINK <REPOSITORIO>\n  CONNECT TO <USUARIO_REPO> IDENTIFIED BY \"<senha>\"\n  USING '<ALIAS_REPO>';\n\n-- 3. validar a travessia:\nSELECT COUNT(*) FROM <SCHEMA_REPO>.<TABELA_HIST>@<REPOSITORIO>;",
+      "olhar": "O SELECT de validacao tem de retornar numero, nao erro. ORA-02019 significa que o alias '<ALIAS_REPO>' nao existe no TNS_ADMIN da instancia - o mesmo problema do passo 1, agora do lado do dblink.",
+      "armadilha": "A senha aparece em texto no CREATE, entao vai para o historico do SQL*Plus, para o spool e para qualquer log de sessao ativo. Prefira arquivo temporario com permissao restrita, apagado depois. E nao cole o comando pronto em chamado: chamado e lido por muita gente e fica para sempre."
+    }
+  ],
+  "verificado": {
+    "nivel": "estrutura",
+    "em": "2026-09-28"
+  }
+}

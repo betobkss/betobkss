@@ -1,0 +1,111 @@
+{
+  "id": "mssql_bloqueio",
+  "plataforma": "mssql",
+  "ordem": 50,
+  "titulo": "SQL Server: bloqueio, cadeia de lock e deadlock",
+  "quando_usar": "Aplicacao travada ou lenta em SQL Server, timeout de comando, 'Lock request time out period exceeded' (erro 1222) ou deadlock (erro 1205). Tambem quando o sintoma e 'o banco esta lento' e o wait dominante e da familia LCK_M_*.",
+  "tags": [
+    "sql server",
+    "mssql",
+    "bloqueio",
+    "blocking",
+    "lock",
+    "deadlock",
+    "blocking chain",
+    "sessao bloqueada",
+    "LCK_M_X",
+    "LCK_M_S",
+    "sp_who2",
+    "erro 1205",
+    "erro 1222",
+    "timeout de comando",
+    "transacao aberta",
+    "kill spid"
+  ],
+  "sintomas": [
+    "aplicacao travada no sql server",
+    "lock request time out period exceeded",
+    "transaction was deadlocked on lock resources",
+    "sessao bloqueando outras",
+    "timeout ao gravar",
+    "tudo lento mas a cpu esta baixa"
+  ],
+  "secoes": [],
+  "fontes": [
+    "Microsoft Learn - sys.dm_exec_requests / sys.dm_os_waiting_tasks",
+    "Microsoft Learn - Understand and resolve blocking problems",
+    "Microsoft Learn - DBCC OPENTRAN",
+    "Microsoft Learn - Deadlocks guide e Extended Events system_health"
+  ],
+  "nota": "Bloqueio NAO e deadlock, e confundir os dois leva a conduta errada. Bloqueio e uma fila: alguem segura o lock e os outros esperam - o banco nao resolve sozinho e pode esperar para sempre. Deadlock e um abraco: duas sessoes se esperam em ciclo, o SQL Server DETECTA em segundos e mata uma delas (a 'victim', erro 1205) - o banco ja resolveu, e o trabalho e evitar a reincidencia, nao 'destravar'. A primeira pergunta e sempre a mesma: existe alguem esperando AGORA? Se sim e bloqueio; se o que voce tem e so erro 1205 no log da aplicacao, e deadlock e a investigacao e no system_health, nao no dm_exec_requests.",
+  "passos": [
+    {
+      "titulo": "Existe bloqueio ACONTECENDO agora?",
+      "objetivo": "Separar bloqueio (fila viva) de deadlock (ja resolvido pelo banco) antes de qualquer outra coisa.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT r.session_id,\n       r.blocking_session_id,\n       r.wait_type,\n       r.wait_time / 1000.0 AS wait_s,\n       r.wait_resource,\n       r.status,\n       r.command,\n       DB_NAME(r.database_id) AS banco\nFROM   sys.dm_exec_requests AS r\nWHERE  r.blocking_session_id <> 0\nORDER  BY r.wait_time DESC;",
+      "olhar": "Nenhuma linha = nao ha bloqueio neste instante; se a aplicacao reclama de deadlock (erro 1205), pule para o passo 6. Com linhas, o que importa e blocking_session_id (quem segura) e wait_time: espera de minutos aponta transacao esquecida aberta, nao concorrencia normal. wait_type comecando com LCK_M_ confirma lock; se for PAGEIOLATCH_ o problema e IO e este playbook nao e o certo.",
+      "armadilha": "O sp_who2 mostra o bloqueador imediato, e por isso engana numa cadeia: a sessao que aparece bloqueando pode ela mesma estar bloqueada por uma terceira. Matar o bloqueador do meio nao libera nada e ainda perde a transacao. Suba a cadeia inteira (passo 2) antes de concluir quem e o culpado."
+    },
+    {
+      "titulo": "Subir a cadeia ate a RAIZ do bloqueio",
+      "objetivo": "Achar a unica sessao que nao espera ninguem - e ela que precisa sair para a fila andar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "WITH espera AS (\n    SELECT r.session_id, r.blocking_session_id, r.wait_time\n    FROM   sys.dm_exec_requests AS r\n    WHERE  r.blocking_session_id <> 0\n),\ncadeia AS (\n    SELECT e.session_id, e.blocking_session_id, 1 AS nivel,\n           CAST(e.session_id AS VARCHAR(400)) AS caminho\n    FROM   espera AS e\n    WHERE  e.blocking_session_id NOT IN (SELECT session_id FROM espera)\n    UNION ALL\n    SELECT e.session_id, e.blocking_session_id, c.nivel + 1,\n           CAST(c.caminho + ' <- ' + CAST(e.session_id AS VARCHAR(10)) AS VARCHAR(400))\n    FROM   espera AS e\n    JOIN   cadeia AS c ON e.blocking_session_id = c.session_id\n)\nSELECT nivel, session_id, blocking_session_id, caminho\nFROM   cadeia\nORDER  BY nivel, session_id;",
+      "olhar": "A RAIZ e o blocking_session_id do nivel 1 que nao aparece como session_id em nenhuma linha: e a unica sessao que segura sem esperar. Conte quantas sessoes descendem dela - esse numero e o impacto real, e e o que justifica (ou nao) uma acao de risco. Cadeia com um nivel so e concorrencia pontual; cadeia com cinco niveis e fila parada.",
+      "armadilha": "A raiz costuma estar com status 'sleeping' e command 'AWAITING COMMAND': ela nao esta executando nada, esta com uma TRANSACAO ABERTA e o cliente foi embora ou esqueceu o commit. Como nao consome CPU nem aparece em consulta de 'query cara', quem procura o vilao pelo consumo nunca acha."
+    },
+    {
+      "titulo": "O que a sessao raiz esta fazendo (ou deixou de fazer)",
+      "objetivo": "Identificar aplicacao, host e o ultimo comando antes de decidir qualquer coisa sobre ela.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.session_id,\n       s.login_name,\n       s.host_name,\n       s.program_name,\n       s.status,\n       s.last_request_start_time,\n       s.last_request_end_time,\n       DATEDIFF(SECOND, s.last_request_end_time, GETDATE()) AS ocioso_s,\n       t.text AS ultimo_comando\nFROM   sys.dm_exec_sessions AS s\nOUTER APPLY (\n    SELECT TOP (1) c.most_recent_sql_handle\n    FROM   sys.dm_exec_connections AS c\n    WHERE  c.session_id = s.session_id\n) AS con\nOUTER APPLY sys.dm_exec_sql_text(con.most_recent_sql_handle) AS t\nWHERE  s.session_id = 0;",
+      "olhar": "Troque o 0 pelo session_id da raiz. program_name e host_name dizem QUEM avisar - e quase sempre ha alguem para avisar antes de matar. 'ocioso_s' alto com transacao aberta e a assinatura de cliente que sumiu. Leia o ultimo_comando: se for um UPDATE/DELETE grande, matar a sessao vai custar um rollback do mesmo tamanho.",
+      "armadilha": "most_recent_sql_handle traz o ULTIMO comando, que nem sempre e o que abriu a transacao. Numa sessao ociosa ele pode mostrar um SELECT inocente enquanto o lock veio de um UPDATE anterior no mesmo BEGIN TRAN. Use o passo 4 para saber o tamanho real da transacao."
+    },
+    {
+      "titulo": "Tamanho e idade da transacao aberta",
+      "objetivo": "Medir o custo do rollback ANTES de cogitar matar a sessao. E este numero que decide entre esperar e agir.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT t.session_id,\n       dt.transaction_id,\n       tr.name AS nome,\n       tr.transaction_begin_time,\n       DATEDIFF(SECOND, tr.transaction_begin_time, GETDATE()) AS aberta_s,\n       tr.transaction_state,\n       td.database_transaction_log_bytes_used / 1024 / 1024 AS log_mb\nFROM   sys.dm_tran_session_transactions AS t\nJOIN   sys.dm_tran_active_transactions AS tr ON tr.transaction_id = t.transaction_id\nJOIN   sys.dm_tran_current_transaction AS dt ON 1 = 1\nLEFT   JOIN sys.dm_tran_database_transactions AS td\n       ON td.transaction_id = t.transaction_id\nORDER  BY aberta_s DESC;\n\nDBCC OPENTRAN;",
+      "olhar": "log_mb e a melhor estimativa do custo do rollback: dezenas de MB voltam rapido, dezenas de GB podem levar MAIS tempo que a transacao levou para rodar - e durante todo esse tempo o lock continua segurado. DBCC OPENTRAN confirma a transacao mais antiga do banco e e util quando o log de transacao tambem esta crescendo sem parar.",
+      "armadilha": "Rollback NAO e instantaneo nem interrompivel: depois do KILL, a sessao entra em status 'rollback' e nao ha como cancelar nem acelerar. Matar uma transacao de 40 GB para 'resolver rapido' costuma deixar o bloqueio no lugar por mais tempo do que esperar o commit. Meca antes."
+    },
+    {
+      "titulo": "O bloqueio e cronico ou foi de agora?",
+      "objetivo": "Decidir se o caso termina em acao pontual ou em correcao de aplicacao/indice.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TOP (15)\n       wait_type,\n       waiting_tasks_count,\n       wait_time_ms / 1000.0 AS wait_total_s,\n       (wait_time_ms - signal_wait_time_ms) / 1000.0 AS espera_recurso_s,\n       CASE WHEN waiting_tasks_count > 0\n            THEN wait_time_ms / waiting_tasks_count\n            ELSE 0 END AS media_ms\nFROM   sys.dm_os_wait_stats\nWHERE  wait_type LIKE 'LCK[_]M[_]%'\n   AND waiting_tasks_count > 0\nORDER  BY wait_time_ms DESC;",
+      "olhar": "Estes contadores sao ACUMULADOS desde o ultimo restart (ou desde o ultimo DBCC SQLPERF que os zerou). LCK_M_X dominante indica conflito de escrita; LCK_M_S alto com escrita baixa costuma ser leitura sem READ COMMITTED SNAPSHOT esperando escritor. Compare media_ms: media alta com poucas tarefas e transacao longa; media baixa com muitas tarefas e concorrencia de desenho.",
+      "armadilha": "Numero acumulado sem base de comparacao nao diz nada: um banco no ar ha 200 dias sempre tem milhoes de ms de espera. So conclua 'cronico' comparando com o uptime (sys.dm_os_sys_info.sqlserver_start_time) ou tirando duas leituras com intervalo."
+    },
+    {
+      "titulo": "Se o sintoma e deadlock (erro 1205), a evidencia esta em outro lugar",
+      "objetivo": "Deadlock ja foi resolvido pelo banco - o objetivo aqui e ver o grafo para evitar a reincidencia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TOP (20)\n       CAST(evento.value('(event/@timestamp)[1]', 'DATETIME2') AS DATETIME2) AS quando,\n       evento.query('event/data/value/deadlock') AS grafo\nFROM (\n    SELECT CAST(target_data AS XML) AS dados\n    FROM   sys.dm_xe_session_targets AS st\n    JOIN   sys.dm_xe_sessions AS s ON s.address = st.event_session_address\n    WHERE  s.name = 'system_health'\n      AND  st.target_name = 'ring_buffer'\n) AS x\nCROSS APPLY dados.nodes('//RingBufferTarget/event[@name=\"xml_deadlock_report\"]') AS r(evento)\nORDER  BY quando DESC;",
+      "olhar": "No grafo, leia os dois 'process' e o objeto disputado: quase sempre sao as MESMAS duas tabelas na ordem inversa. A correcao e de aplicacao - acessar os objetos sempre na mesma ordem, encurtar a transacao, ou criar o indice que evita o table scan que amplia o lock. Se os dois lados sao o mesmo SELECT, suspeite de falta de indice.",
+      "armadilha": "O system_health e um ring buffer em memoria: ele gira e PERDE os deadlocks antigos, e zera no restart da instancia. Se o incidente foi ontem e o servidor reiniciou, a evidencia nao existe mais - nao conclua 'nao houve deadlock' a partir de resultado vazio."
+    },
+    {
+      "titulo": "Encerrar a sessao raiz",
+      "objetivo": "Liberar a fila quando o custo de esperar ja superou o custo do rollback - e nao antes.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "comando": "-- confira o alvo mais uma vez antes de executar:\nSELECT session_id, blocking_session_id, status, command\nFROM   sys.dm_exec_requests\nWHERE  blocking_session_id <> 0;\n\n-- KILL <session_id>;\n-- acompanhar o rollback (nao e interrompivel):\n-- KILL <session_id> WITH STATUSONLY;",
+      "antes_de_executar": "1) Confirme pelo passo 2 que a sessao e a RAIZ, e nao um bloqueado no meio da cadeia. 2) Meca o log_mb do passo 4: rollback de transacao grande pode segurar o lock por MAIS tempo que a espera atual. 3) Descubra o dono pelo program_name/host_name do passo 3 e avise - transacao de aplicacao morta volta como erro para o usuario final. 4) Se for um job ou ETL, encerrar pelo orquestrador e melhor que KILL: ele registra a falha e nao deixa o processo achando que terminou bem. 5) Registre a acao no caso: CASO.py <caso> --acao 'KILL da sessao <id> em <host>' --risco alto.",
+      "olhar": "Depois do KILL, reexecute o passo 1: a fila deve esvaziar em segundos. Se a sessao ficar em status 'rollback', acompanhe com KILL ... WITH STATUSONLY - ele estima o percentual concluido. Enquanto o rollback corre, o lock CONTINUA segurado; isso e esperado e nao significa que o comando falhou.",
+      "armadilha": "KILL numa sessao que ja esta em rollback nao faz nada e nao acelera - nao adianta repetir. E matar a raiz sem tratar a causa apenas adia: se a origem e transacao aberta por aplicacao que nao faz commit, o mesmo bloqueio volta no proximo ciclo, agora com o time achando que 'o banco esta instavel'."
+    }
+  ],
+  "verificado": {
+    "nivel": "estrutura",
+    "observacao": "Consultas escritas a partir da documentacao Microsoft Learn. NAO executadas: esta maquina nao tem SQL Server nem sqlcmd. Rode os passos de leitura em homologacao antes de confiar no texto exato das colunas."
+  }
+}

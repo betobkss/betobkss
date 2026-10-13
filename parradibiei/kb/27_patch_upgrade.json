@@ -1,0 +1,141 @@
+{
+  "id": "patch_upgrade",
+  "titulo": "Nivel de patch, opatch e conferencia pos-upgrade",
+  "quando_usar": "Precisa conferir o nivel de patch do ambiente, validar se um Release Update foi aplicado por completo, investigar problema que apareceu depois de patch/upgrade, ou preparar a evidencia de conformidade de patching.",
+  "tags": [
+    "patch",
+    "opatch",
+    "release update",
+    "RU",
+    "psu",
+    "upgrade",
+    "datapatch",
+    "registry$sqlpatch",
+    "dba_registry_sqlpatch",
+    "nivel de patch",
+    "version_full",
+    "pos-upgrade",
+    "utlrp",
+    "objetos invalidos pos patch",
+    "dbms_registry",
+    "componentes do dicionario",
+    "bug",
+    "MOS"
+  ],
+  "sintomas": [
+    "duvida sobre qual RU o banco realmente tem aplicado",
+    "binario atualizado mas o dicionario nao (datapatch nao rodou)",
+    "erro que comecou depois da janela de patch",
+    "componentes do dicionario com status diferente de VALID",
+    "objetos invalidos apos upgrade",
+    "auditoria pedindo evidencia do nivel de patch da frota"
+  ],
+  "secoes": [
+    "Versao e nivel de patch",
+    "OBJETOS INVALIDOS",
+    "Objetos invalidos",
+    "Erros no Alert Log",
+    "Mudancas no ambiente (30d)"
+  ],
+  "erros_ora": [
+    "ORA-00600",
+    "ORA-07445",
+    "ORA-04063",
+    "ORA-01092"
+  ],
+  "fontes": [
+    "Oracle Database Upgrade Guide 19c",
+    "Oracle Support - Datapatch: Database 12c Post Patch SQL Automation (Doc ID 1585822.1)",
+    "Oracle Support - Oracle Database Release Update Introduction (Doc ID 2285040.1)",
+    "Pratica de campo: roteiro de opatch e upgrade aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "A armadilha central do patching moderno: aplicar o patch nos BINARIOS (opatch apply) e apenas metade do trabalho. A outra metade e o DATAPATCH, que atualiza o DICIONARIO. Um banco com opatch lsinventory mostrando o RU novo e DBA_REGISTRY_SQLPATCH sem a linha correspondente esta em estado inconsistente - roda, mas com bugs 'corrigidos' ainda ativos, e o Suporte Oracle vai pedir isso na primeira SR. Este playbook confere os DOIS lados. Nada aqui aplica patch: aplicar patch e projeto com janela, nao troubleshooting.",
+  "passos": [
+    {
+      "titulo": "Descobrir a versao exata que esta rodando",
+      "objetivo": "Estabelecer o nivel real, sem depender de memoria ou planilha.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT instance_name, host_name, status,\n       version,\n       version_full,\n       TO_CHAR(startup_time, 'DD/MM/YYYY HH24:MI') AS no_ar_desde,\n       ROUND(SYSDATE - startup_time) AS dias_no_ar\nFROM   v$instance;\n\n-- em RAC, confirme que TODOS os nos estao no mesmo nivel\nSELECT inst_id, instance_name, version_full, status\nFROM   gv$instance\nORDER  BY inst_id;\n\nSELECT name, cdb, open_mode, database_role,\n       TO_CHAR(created, 'DD/MM/YYYY') AS criado_em\nFROM   v$database;",
+      "olhar": "VERSION_FULL e o unico campo que da o nivel de RU (ex.: 19.31.0.0.0). VERSION devolve 19.0.0.0.0 em TODO 19c, independente do RU - e inutil para conferir patch. Em RAC, versao diferente entre nos e achado critico: significa rolling patch incompleto.",
+      "armadilha": "Um erro comum e usar optimizer_features_enable como 'versao do banco'. Ele devolve 19.1.0 num banco 19.31 e ja levou a conclusao errada em analise real. VERSION_FULL (ou o passo 2) e a fonte correta."
+    },
+    {
+      "titulo": "Conferir o que o DICIONARIO registra como aplicado",
+      "objetivo": "Confirmar se o datapatch rodou - a metade que costuma faltar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT patch_id, patch_type, action, status,\n       description,\n       TO_CHAR(CAST(action_time AS DATE), 'DD/MM/YYYY HH24:MI') AS quando,\n       source_version, target_version\nFROM   dba_registry_sqlpatch\nORDER  BY action_time DESC;\n\n-- resumo: ultimo patch registrado no dicionario e quantos dias faz\nSELECT COUNT(*) AS patches_registrados,\n       MAX(CAST(action_time AS DATE)) AS ultimo_patch,\n       ROUND(SYSDATE - CAST(MAX(action_time) AS DATE)) AS dias_desde_o_ultimo\nFROM   dba_registry_sqlpatch;",
+      "olhar": "Toda linha deve ter STATUS = 'SUCCESS'. 'WITH ERRORS' significa datapatch que falhou no meio: o dicionario esta parcialmente atualizado e isso precisa ser corrigido, nao ignorado. Compare o TARGET_VERSION com o VERSION_FULL do passo 1 - se o dicionario nao conhece o RU que o binario tem, o datapatch nao rodou.",
+      "armadilha": "ACTION_TIME e TIMESTAMP: comparar direto com SYSDATE gera ORA-00932. Use CAST(action_time AS DATE), como acima. Em CDB, esta view mostra o container ATUAL - um PDB pode estar num nivel diferente do CDB$ROOT, e e preciso conferir cada um (passo 4)."
+    },
+    {
+      "titulo": "Conferir os componentes do dicionario",
+      "objetivo": "Detectar componente que ficou pelo caminho num upgrade.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- MODIFIED em DBA_REGISTRY e VARCHAR2, nao DATE: nao use TO_CHAR com mascara\nSELECT comp_id, comp_name, version, version_full, status,\n       modified AS modificado_em\nFROM   dba_registry\nORDER  BY CASE WHEN status <> 'VALID' THEN 0 ELSE 1 END, comp_id;\n\n-- apenas o que exige atencao\nSELECT comp_id, comp_name, version, status\nFROM   dba_registry\nWHERE  status NOT IN ('VALID', 'OPTION OFF', 'REMOVED')\nORDER  BY comp_id;",
+      "olhar": "Componente em 'UPGRADED' ou 'LOADED' quando deveria estar VALID indica upgrade incompleto. Versao de componente diferente da versao do banco tambem: apos upgrade, todos devem acompanhar.",
+      "armadilha": "DBA_REGISTRY.MODIFIED e VARCHAR2 com formato proprio - aplicar TO_CHAR com mascara de data devolve ORA-01722 e trava o script inteiro. Ja no conteudo: 'OPTION OFF' NAO e problema - e opcao nao instalada. O componente RAC aparece como 'OPTION OFF' em TODA instancia single-instance: filtrar apenas por status <> 'VALID' gera falso positivo em todo banco fora de RAC. Por isso o filtro acima exclui OPTION OFF e REMOVED explicitamente."
+    },
+    {
+      "titulo": "Em CDB, conferir PDB por PDB",
+      "objetivo": "Garantir que nenhum PDB ficou num nivel diferente do CDB.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- estado de abertura de cada PDB (PDB fechado nao recebe datapatch)\nSELECT con_id, name, open_mode, restricted, recovery_status\nFROM   v$pdbs\nORDER  BY con_id;\n\n-- patches registrados por container\nSELECT con_id, patch_id, status,\n       TO_CHAR(CAST(action_time AS DATE), 'DD/MM/YYYY') AS quando,\n       target_version\nFROM   cdb_registry_sqlpatch\nORDER  BY con_id, action_time DESC;\n\n-- componentes por container\nSELECT con_id, comp_id, version, status\nFROM   cdb_registry\nWHERE  status NOT IN ('VALID', 'OPTION OFF', 'REMOVED')\nORDER  BY con_id, comp_id;",
+      "olhar": "PDB com RESTRICTED = 'YES' costuma ser consequencia de datapatch pendente ou violacao de plug-in - o banco abre em modo restrito de proposito. Se um PDB nao tem a linha do patch que os outros tem, ele estava fechado quando o datapatch rodou.",
+      "armadilha": "PDB fechado na hora do datapatch e SILENCIOSAMENTE pulado: o patch termina com sucesso e o PDB fica atrasado. Ele volta a abrir normalmente e ninguem nota - ate um bug corrigido se manifestar so naquele PDB. Sempre confira todos os containers depois de patch, nao apenas o CDB$ROOT."
+    },
+    {
+      "titulo": "Ver o inventario dos binarios (opatch)",
+      "objetivo": "Confrontar o lado do sistema de arquivos com o do dicionario.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# nivel de patch nos binarios do ORACLE_HOME do banco\n$ORACLE_HOME/OPatch/opatch lspatches\n\n# inventario completo (mais verboso, traz data de aplicacao)\n$ORACLE_HOME/OPatch/opatch lsinventory -detail | head -60\n\n# versao do proprio opatch (versao antiga causa falha na aplicacao)\n$ORACLE_HOME/OPatch/opatch version\n\n# em ambiente com Grid Infrastructure, o HOME do GRID tem inventario proprio\n# (troque o caminho pelo do seu ambiente)\ncat /etc/oratab",
+      "olhar": "Compare o RU listado aqui com o TARGET_VERSION do passo 2. Iguais = ambiente consistente. Binario a frente do dicionario = datapatch pendente. Confira tambem o HOME do Grid: e comum o banco ser atualizado e o Grid ficar atras.",
+      "armadilha": "opatch tem de rodar com o usuario dono do ORACLE_HOME (normalmente oracle/grid) e com ORACLE_HOME correto no ambiente. Rodar apontando para o HOME errado devolve o inventario de outro produto e leva a conclusao errada - confirme com 'echo $ORACLE_HOME' antes."
+    },
+    {
+      "titulo": "Procurar no alert log o rastro da janela de patch",
+      "objetivo": "Amarrar o problema investigado ao momento do patch.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- erros do banco proximos ao ultimo patch registrado\nSELECT TO_CHAR(originating_timestamp, 'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(REPLACE(REPLACE(message_text, CHR(10), ' '), CHR(13), ' '), 1, 110) AS mensagem\nFROM   v$diag_alert_ext\nWHERE  originating_timestamp > SYSDATE - 30\nAND    REGEXP_LIKE(message_text, 'ORA-[0-9]{4,5}')\nORDER  BY originating_timestamp DESC\nFETCH FIRST 40 ROWS ONLY;\n\n-- reinicios recentes: patch exige restart e ele deve aparecer aqui\nSELECT TO_CHAR(originating_timestamp, 'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(message_text, 1, 90) AS mensagem\nFROM   v$diag_alert_ext\nWHERE  originating_timestamp > SYSDATE - 30\nAND    (message_text LIKE '%Starting ORACLE instance%'\n     OR message_text LIKE '%Shutting down%'\n     OR message_text LIKE '%ALTER DATABASE OPEN%')\nORDER  BY originating_timestamp DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Cruze a data do patch (passo 2) com o primeiro aparecimento do erro investigado. Erro que comeca exatamente depois do restart de patch e forte candidato a regressao do RU - e ai a SR no Suporte Oracle nasce com evidencia.",
+      "armadilha": "O filtro precisa ser ORA-[0-9]{4,5}: com {5} voce perde ORA-600, ORA-1092 e ORA-7445, que sao justamente os que importam depois de patch. E limpe CHR(10)/CHR(13), senao a quebra de linha destroi a formatacao da saida."
+    },
+    {
+      "titulo": "Conferir objetos invalidos apos patch ou upgrade",
+      "objetivo": "Patch costuma invalidar objetos; a recompilacao faz parte do procedimento.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, object_type, COUNT(*) AS invalidos\nFROM   dba_objects\nWHERE  status <> 'VALID'\nGROUP  BY owner, object_type\nORDER  BY invalidos DESC;\n\n-- os objetos de dicionario invalidos sao os mais graves\nSELECT owner, object_name, object_type, status,\n       TO_CHAR(last_ddl_time, 'DD/MM/YYYY HH24:MI') AS ultimo_ddl\nFROM   dba_objects\nWHERE  status <> 'VALID'\nAND    owner IN ('SYS', 'SYSTEM')\nORDER  BY owner, object_type, object_name;\n\n-- erros de compilacao registrados\nSELECT owner, name, type, COUNT(*) AS erros\nFROM   dba_errors\nGROUP  BY owner, name, type\nORDER  BY erros DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Objeto invalido em SYS/SYSTEM depois de patch e o sinal de que o utlrp nao rodou ou nao terminou. Objeto de aplicacao invalido pode ser dependencia que se resolve na primeira execucao, mas em SYS nao se deixa passar.",
+      "armadilha": "Objeto invalido nao necessariamente falha: o Oracle recompila sob demanda no primeiro acesso. Isso mascara o problema e transfere o custo para o usuario (primeira chamada lenta), alem de gerar ORA-04068 em cenarios com estado em pacote. Recompilar de forma controlada e melhor que deixar acontecer no pico."
+    },
+    {
+      "titulo": "Recompilar objetos invalidos",
+      "objetivo": "Fechar a pendencia classica de pos-patch de forma controlada.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) UTL_RECOMP consome CPU e I/O de forma agressiva e invalida cursores: rode fora do pico ou em janela. 2) Ele NAO deve rodar concorrente com a aplicacao em carga alta - a recompilacao pega locks de biblioteca e pode gerar 'library cache pin' em massa. 3) O paralelismo (segundo argumento) acima do numero de CPUs piora: comece com 4. 4) Se houver MUITOS invalidos em SYS, confirme antes se o datapatch terminou (passo 2) - recompilar sem o datapatch concluido pode ter de ser refeito. 5) Registre a contagem de invalidos antes e depois. 6) Backup em dia.",
+      "comando": "-- contagem antes\nSELECT COUNT(*) AS invalidos_antes FROM dba_objects WHERE status <> 'VALID';\n\n-- recompilacao em paralelo (ajuste o grau ao cpu_count)\n-- EXEC UTL_RECOMP.RECOMP_PARALLEL(4);\n\n-- alternativa serial, mais previsivel em ambiente sensivel\n-- EXEC UTL_RECOMP.RECOMP_SERIAL();\n\n-- em CDB, rode em todos os containers:\n-- ALTER SESSION SET CONTAINER = CDB$ROOT;  (e repita por PDB)\n\n-- contagem depois (repita a primeira consulta)\n-- e liste o que resistiu:\nSELECT owner, object_name, object_type FROM dba_objects\nWHERE  status <> 'VALID' ORDER BY owner, object_type;",
+      "olhar": "A contagem deve cair para perto de zero. O que sobrar invalido tem erro real de compilacao (veja DBA_ERRORS no passo 7) e e problema de codigo, nao de patch - encaminhe ao dono do schema.",
+      "armadilha": "UTL_RECOMP exige que o banco esteja em modo normal (nao UPGRADE) e pede SYSDBA. Ele tambem invalida os cursores em cache: espere um pico de hard parse logo depois, o que num banco com shared pool apertado pode gerar ORA-04031. Nao rode no meio do pico de fechamento."
+    },
+    {
+      "titulo": "Consolidar a evidencia do nivel de patch",
+      "objetivo": "Fechar o caso com o retrato que serve para SR, auditoria e comparacao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- retrato em uma consulta: versao, patch e idade\nSELECT (SELECT version_full FROM v$instance)                  AS versao_completa,\n       (SELECT name FROM v$database)                          AS banco,\n       (SELECT host_name FROM v$instance)                     AS host,\n       (SELECT COUNT(*) FROM dba_registry_sqlpatch)           AS patches_no_dicionario,\n       (SELECT TO_CHAR(CAST(MAX(action_time) AS DATE), 'DD/MM/YYYY')\n          FROM dba_registry_sqlpatch)                         AS ultimo_patch,\n       (SELECT ROUND(SYSDATE - CAST(MAX(action_time) AS DATE))\n          FROM dba_registry_sqlpatch)                         AS dias_desde_o_patch,\n       (SELECT COUNT(*) FROM dba_registry_sqlpatch\n         WHERE status <> 'SUCCESS')                           AS patches_com_erro,\n       (SELECT COUNT(*) FROM dba_registry\n         WHERE status NOT IN ('VALID','OPTION OFF','REMOVED')) AS componentes_com_desvio,\n       (SELECT COUNT(*) FROM dba_objects WHERE status <> 'VALID') AS objetos_invalidos\nFROM   dual;",
+      "olhar": "DIAS_DESDE_O_PATCH e o indicador de conformidade: a Oracle publica RU trimestral, e acima de ~180 dias o ambiente esta atrasado. PATCHES_COM_ERRO maior que zero e achado que precisa de acao antes de qualquer nova aplicacao.",
+      "armadilha": "Este retrato vale para UM banco. Nao o transforme em placar de frota: cada banco tem sua janela, seu dono e sua criticidade, e um numero medio esconde exatamente o caso que precisa de atencao. Registre por caso, compare por caso."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

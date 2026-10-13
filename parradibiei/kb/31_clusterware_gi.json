@@ -1,0 +1,123 @@
+{
+  "id": "clusterware_gi",
+  "ordem": 31,
+  "titulo": "Grid Infrastructure: crsctl/srvctl nao respondem ou nao existem",
+  "quando_usar": "srvctl ou crsctl falham, nao sao encontrados, ou reclamam que nao acham o Clusterware home. Antes de qualquer coisa e preciso separar tres mundos que dao mensagens parecidas: (a) o host NAO tem Grid Infrastructure - e single instance puro; (b) tem GI, mas a stack esta parada; (c) tem GI no ar, mas o ambiente do shell aponta para o home errado.",
+  "tags": [
+    "crsctl",
+    "srvctl",
+    "clusterware",
+    "grid infrastructure",
+    "oracle restart",
+    "has",
+    "ohasd",
+    "olr.loc",
+    "ocr.loc",
+    "oratab",
+    "inventory",
+    "single instance",
+    "standalone",
+    "stack parada",
+    "ORACLE_HOME errado"
+  ],
+  "sintomas": [
+    "unable to retrieve oracle clusterware home",
+    "start oracle clusterware stack and try again",
+    "crsctl command not found",
+    "srvctl command not found",
+    "locate crsctl nao acha nada",
+    "nao sei se este servidor e rac ou single",
+    "CRS-4639",
+    "CRS-4535",
+    "PRCD-1229"
+  ],
+  "secoes": [
+    "Topologia",
+    "Cluster",
+    "Saude da instancia"
+  ],
+  "erros_ora": [
+    "CRS-4639",
+    "CRS-4535",
+    "CRS-4000",
+    "ORA-29740",
+    "ORA-01031"
+  ],
+  "fontes": [
+    "Oracle Clusterware Administration and Deployment Guide - crsctl / olsnodes",
+    "Oracle Real Application Clusters Administration and Deployment Guide - srvctl",
+    "Oracle Database Installation Guide - Oracle Restart (standalone Grid Infrastructure)",
+    "Oracle Universal Installer - central inventory (inventory.xml, atributo CRS)"
+  ],
+  "nota": "A armadilha central deste caso e tirar conclusao de ausencia. 'locate crsctl' nao achar nada nao prova que o GI nao existe: o locate depende de uma base (updatedb) que em muito servidor nunca foi atualizada. E 'find -a crsctl' nem chega a rodar - o find exige o caminho ANTES da expressao ('find / -name crsctl'). A prova positiva e barata e esta em /etc/oracle/olr.loc e no ps: use-a antes de sair procurando binario pelo filesystem inteiro. Note tambem que Oracle Restart (GI standalone, um no) usa os mesmos crsctl/srvctl do RAC - ter crsctl NAO significa que o banco e clusterizado.",
+  "passos": [
+    {
+      "titulo": "Provar se existe Grid Infrastructure neste host",
+      "objetivo": "Responder com evidencia positiva, em 5 segundos, se ha GI instalado e se ele e cluster ou Oracle Restart.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "cat /etc/oracle/olr.loc\n\ncat /etc/oracle/ocr.loc\n\nls -l /etc/oracle/scls_scr /etc/init.d/init.ohasd 2>/dev/null",
+      "olhar": "olr.loc AUSENTE = nao ha GI neste host; pare aqui e siga para o passo de single instance. olr.loc PRESENTE = o campo crs_home= e o caminho do GI, e os binarios estao em $crs_home/bin. No ocr.loc, local_only=FALSE indica cluster de verdade (RAC); local_only=TRUE indica Oracle Restart (um no so).",
+      "armadilha": "Nao use 'locate crsctl' para decidir: o locate le a base do mlocate, que em servidor de producao costuma nunca ter rodado updatedb - ele responde 'nao existe' para arquivo que esta la. E a sintaxe do find e 'find <caminho> -name crsctl'; o caminho vem ANTES da expressao, senao o find recusa o comando sem procurar nada."
+    },
+    {
+      "titulo": "Ver o que esta realmente rodando",
+      "objetivo": "O ps decide o caso mais rapido que qualquer arquivo de configuracao: diz se a stack esta no ar agora.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "ps -ef | grep -E 'ohasd|crsd|ocssd|evmd|oraagent|asm_pmon|_pmon_|tnslsnr' | grep -v grep\n\nps -ef | grep -c '(LOCAL=NO)'",
+      "olhar": "ohasd.bin + ocssd.bin + asm_pmon_+ASM no ar = GI ativo. Apenas ora_pmon_<SID> e tnslsnr, sem nenhum ohasd = single instance sem GI, e crsctl/srvctl nao se aplicam. olr.loc existe MAS nao ha ohasd = stack instalada e PARADA: e o unico cenario que justifica o passo de subir a stack.",
+      "armadilha": "asm_pmon no ar nao garante cluster: Oracle Restart tambem sobe ASM num unico no. Quem separa cluster de Restart e o ocr.loc (local_only) e o olsnodes, nao a presenca de ASM."
+    },
+    {
+      "titulo": "Localizar os binarios e os homes registrados",
+      "objetivo": "Achar crsctl/srvctl pelo inventario, nao por varredura de filesystem, e conferir se o shell esta no home certo.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "cat /etc/oratab | grep -v '^#' | grep -v '^$'\n\ncat /etc/oraInst.loc\n# e entao, no inventario apontado acima:\n# grep -i -E 'HOME NAME|CRS=' <inventory_loc>/ContentsXML/inventory.xml\n\n# so se o inventario nao ajudar (custa IO, use por ultimo):\n# find / -xdev -name crsctl -type f 2>/dev/null",
+      "olhar": "No inventory.xml, o home com CRS=\"true\" e o Grid Infrastructure - o caminho dele vale mais que qualquer busca no filesystem. No oratab, uma linha +ASM confirma GI. Compare com o ORACLE_HOME e o ORACLE_SID da SUA sessao: se o ORACLE_HOME for o home do BANCO, o srvctl que voce esta chamando e o do banco, e ele so funciona quando consegue ler o olr.loc - que e exatamente a mensagem 'Unable to retrieve Oracle Clusterware home'.",
+      "armadilha": "Rodar 'find /' sem -xdev em servidor com NFS ou filesystem montado de storage pode demorar muito e gerar carga de IO desnecessaria. Deixe a varredura por ultimo, depois que olr.loc e inventory.xml ja falharam."
+    },
+    {
+      "titulo": "Perguntar ao proprio banco o que ele acha que e",
+      "objetivo": "Fechar a topologia pelo lado do banco, que e read-only e nao depende de acesso ao SO.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT i.instance_name, i.host_name, i.version, i.status,\n       i.database_status,\n       TO_CHAR(i.startup_time,'DD/MM/YYYY HH24:MI') AS subiu_em\nFROM   gv$instance i\nORDER  BY i.inst_id;\n\nSELECT name, db_unique_name, database_role, open_mode, log_mode, cdb\nFROM   v$database;\n\nSELECT name, value\nFROM   v$parameter\nWHERE  name IN ('cluster_database','cluster_database_instances',\n                'instance_number','spfile','local_listener');",
+      "olhar": "cluster_database=FALSE e uma unica linha em gv$instance: single instance, e a ausencia de crsctl e coerente. cluster_database=TRUE com UMA linha: ou RAC One Node, ou RAC com no caido - so o srvctl config do passo seguinte separa os dois. Um spfile em +DATA/... prova ASM, logo prova GI, mesmo que voce nao tenha achado o crsctl.",
+      "armadilha": "gv$instance so mostra quem esta NO AR: um no fora do cluster nao aparece como linha 'DOWN', ele simplesmente nao vem. Por isso a contagem tem de ser comparada com cluster_database_instances, nunca lida sozinha."
+    },
+    {
+      "titulo": "Com o GI localizado, ler o estado da stack",
+      "objetivo": "Saber o que esta OFFLINE antes de pensar em mexer em qualquer recurso.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# &crs_home = o valor de crs_home= lido no /etc/oracle/olr.loc (passo 1)\n&crs_home/bin/crsctl check crs\n&crs_home/bin/crsctl stat res -t\n&crs_home/bin/crsctl stat res -t -init\n\n&crs_home/bin/olsnodes -n -i -s\n\n&crs_home/bin/srvctl config database\n&crs_home/bin/srvctl status database -d <db_unique_name>",
+      "olhar": "Em 'crsctl check crs', os quatro daemons devem estar online. Em 'stat res -t', olhe o que esta OFFLINE e se e recurso de aplicacao ou de infraestrutura (ora.asm, ora.DATA.dg, ora.LISTENER). Em 'srvctl config database', 'Type: RACOneNode' explica uma unica instancia no ar sem que haja incidente; 'Type: RAC' com um no no ar significa no caido.",
+      "armadilha": "'crsctl check crs' respondendo CRS-4639 ('Could not contact Oracle High Availability Services') e o mesmo sintoma para stack parada e para permissao insuficiente. Rode como root ou como o dono do GI (tipicamente grid) antes de concluir que a stack caiu."
+    },
+    {
+      "titulo": "Sem Grid Infrastructure: conduzir como single instance",
+      "objetivo": "Quando o passo 1 provou que nao ha GI, srvctl e crsctl deixam de ser o caminho - e preciso trocar o ferramental, nao insistir.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "lsnrctl status\nlsnrctl services\n\ncat /etc/oratab | grep -v '^#' | grep -v '^$'",
+      "olhar": "Se o lsnrctl responde e o banco atende (passo 4), o ambiente esta saudavel e a mensagem do srvctl era apenas ferramenta errada para a topologia: aqui o equivalente a 'srvctl status database' e o proprio v$instance, e subir/descer passa a ser sqlplus ou dbstart/dbshut. No oratab, a terceira coluna 'Y' e o que faz o banco subir junto com o servidor - confirme se ela esta como voce espera.",
+      "armadilha": "Em single instance o listener NAO e gerenciado pelo Clusterware: ele nao volta sozinho depois de um reboot se ninguem configurou isso. Mais de um 'banco fora do ar' pos-manutencao e so listener que nao subiu."
+    },
+    {
+      "titulo": "Subir a stack do Grid Infrastructure",
+      "objetivo": "Unico passo de acao deste playbook, e so vale para o cenario 'GI instalado e parado' comprovado nos passos 1 e 2.",
+      "risco": "mudanca",
+      "onde": "so",
+      "comando": "# como root:\n$CRS_HOME/bin/crsctl start has     # Oracle Restart (um no)\n# ou, em cluster:\n$CRS_HOME/bin/crsctl start crs\n\n# acompanhar ate estabilizar:\n$CRS_HOME/bin/crsctl stat res -t -init\n$CRS_HOME/bin/crsctl check crs",
+      "antes_de_executar": "1) Confirme que a stack esta REALMENTE parada (passo 2: nenhum ohasd.bin), e nao apenas inacessivel por falta de privilegio no seu usuario. 2) Descubra POR QUE ela parou antes de subir: $ORACLE_BASE/diag/crs/<host>/crs/trace/alert.log e ocssd.log. Subir sem ler apaga o contexto e o mesmo evento se repete. 3) Em CLUSTER, subir a stack de um no afeta o cluster inteiro (reconfiguracao, remasterizacao de recursos) - trate como mudanca com janela e avise o time. 4) Se a parada foi por evicao (ORA-29740, CRS-1606), a causa e rede ou voting disk: subir sem corrigir so produz nova evicao. 5) Registre a acao no caso: CASO.py <caso> --acao 'crsctl start crs no <host>' --risco medio.",
+      "olhar": "Depois de 'start', o CRS leva alguns minutos para abrir todos os recursos - acompanhe com 'stat res -t -init' ate ohasd/cssd/crsd ficarem ONLINE, e so entao confira 'stat res -t'. Recurso que continua OFFLINE depois disso tem causa propria e precisa ser tratado individualmente, nao com novo start da stack.",
+      "armadilha": "'crsctl start has' e 'crsctl start crs' nao sao intercambiaveis: has e para Oracle Restart (um no) e crs e para cluster. Rodar o errado retorna erro confuso e faz o DBA duvidar do diagnostico correto que ele ja tinha."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

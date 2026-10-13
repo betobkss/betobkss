@@ -1,0 +1,154 @@
+{
+  "id": "reorg_fragmentacao",
+  "titulo": "Espaco desperdicado: fragmentacao, high water mark e reorg",
+  "quando_usar": "O tablespace esta cheio mas os dados nao justificam o tamanho, uma tabela sofreu DELETE massivo e nao devolveu espaco, o full scan ficou lento sem crescer o volume, ou avaliam-se opcoes de reorg antes de pedir storage.",
+  "tags": [
+    "reorg",
+    "reorganizacao",
+    "fragmentacao",
+    "high water mark",
+    "hwm",
+    "shrink",
+    "move",
+    "espaco desperdicado",
+    "delete massivo",
+    "purga",
+    "coalesce",
+    "rebuild indice",
+    "online redefinition",
+    "dbms_redefinition",
+    "row chaining",
+    "migracao de linha",
+    "pctfree",
+    "sysaux grande",
+    "aud$",
+    "espaco"
+  ],
+  "sintomas": [
+    "tablespace cheio mas a soma das linhas nao explica o tamanho",
+    "DELETE de milhoes de linhas nao liberou espaco nenhum",
+    "full scan lento em tabela que nao cresceu",
+    "SYSAUX enorme sem motivo aparente",
+    "indice muito maior que a tabela",
+    "muitas linhas encadeadas ou migradas"
+  ],
+  "secoes": [
+    "Tablespaces",
+    "TOP 10 SEGMENTOS",
+    "Estatisticas de tabelas",
+    "Previsao de capacidade (dias ate encher)",
+    "INDICES UNUSABLE"
+  ],
+  "erros_ora": [
+    "ORA-01653",
+    "ORA-01652",
+    "ORA-10635",
+    "ORA-01555"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide 19c - Reclaiming Unused Space",
+    "Oracle Database Reference 19c - DBMS_SPACE, DBMS_REDEFINITION",
+    "Oracle Support - How to Reclaim Space After Deleting Rows (Doc ID 1360446.1)",
+    "Pratica de campo: roteiro de reorg e recuperacao de espaco aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "DELETE nao devolve espaco: ele libera blocos DENTRO do segmento, mas a high water mark (o ponto mais alto ja usado) nao desce. O segmento continua do mesmo tamanho no dicionario e o full scan continua lendo ate a HWM - por isso a consulta fica lenta mesmo com a tabela 'vazia'. Antes de pedir storage, meca quanto ha de espaco recuperavel. E antes de reorganizar, saiba que TODA opcao tem custo: SHRINK move linhas (muda ROWID e invalida indice), MOVE bloqueia a tabela, e so DBMS_REDEFINITION e realmente online - ao preco de dobrar o espaco durante a operacao.",
+  "passos": [
+    {
+      "titulo": "Comparar o tamanho alocado com o volume real de dados",
+      "objetivo": "Quantificar o desperdicio antes de decidir qualquer acao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.owner, s.segment_name, s.segment_type, s.tablespace_name,\n       ROUND(s.bytes/1024/1024)                       AS alocado_mb,\n       t.num_rows,\n       t.avg_row_len,\n       ROUND(t.num_rows * t.avg_row_len / 1024 / 1024) AS dados_estimados_mb,\n       ROUND(s.bytes/1024/1024\n           - t.num_rows * t.avg_row_len / 1024 / 1024) AS desperdicio_estimado_mb,\n       ROUND((1 - (t.num_rows * t.avg_row_len) / NULLIF(s.bytes, 0)) * 100, 1) AS pct_desperdicio,\n       TO_CHAR(t.last_analyzed, 'DD/MM/YYYY') AS estatistica_de\nFROM   dba_segments s\nJOIN   dba_tables   t ON t.owner = s.owner AND t.table_name = s.segment_name\nWHERE  s.segment_type = 'TABLE'\nAND    s.bytes > 100 * 1024 * 1024\nAND    t.num_rows IS NOT NULL\nORDER  BY desperdicio_estimado_mb DESC NULLS LAST\nFETCH FIRST 25 ROWS ONLY;",
+      "olhar": "PCT_DESPERDICIO acima de 40% em segmento grande e candidato real a reorg. Confira ESTATISTICA_DE: se a estatistica e antiga, num_rows nao reflete a realidade e a conta inteira perde valor.",
+      "armadilha": "num_rows * avg_row_len IGNORA o overhead de bloco (cabecalho, PCTFREE, ITL). O desperdicio verdadeiro e sempre menor que esta estimativa - tipicamente 10 a 20% do tamanho e overhead legitimo. Use este passo para RANQUEAR candidatos, e o passo 2 para medir de verdade."
+    },
+    {
+      "titulo": "Ver o que o Segment Advisor do proprio Oracle recomenda",
+      "objetivo": "Usar a medicao que o banco ja faz sozinho, em vez de estimar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- recomendacoes do Segment Advisor (tarefa automatica do banco).\n-- IMPACT vem em BYTES quando IMPACT_TYPE fala de espaco recuperavel.\nSELECT o.attr1                        AS owner,\n       o.attr2                        AS segmento,\n       o.attr3                        AS particao,\n       o.type                         AS tipo,\n       f.impact_type,\n       ROUND(f.impact/1024/1024)      AS recuperavel_mb,\n       SUBSTR(f.message,   1, 80)     AS achado,\n       SUBSTR(f.more_info, 1, 80)     AS detalhe\nFROM   dba_advisor_findings f\nJOIN   dba_advisor_objects  o\n       ON  o.task_id   = f.task_id\n       AND o.object_id = f.object_id\nWHERE  o.type IN ('TABLE', 'TABLE PARTITION', 'INDEX', 'LOB')\nORDER  BY f.impact DESC NULLS LAST\nFETCH FIRST 25 ROWS ONLY;\n\n-- as tarefas de space advisor que rodaram e quando\nSELECT task_name, status,\n       TO_CHAR(created,     'DD/MM/YYYY HH24:MI') AS criada_em,\n       TO_CHAR(last_modified,'DD/MM/YYYY HH24:MI') AS atualizada_em\nFROM   dba_advisor_tasks\nWHERE  advisor_name = 'Segment Advisor'\nORDER  BY created DESC\nFETCH FIRST 10 ROWS ONLY;",
+      "olhar": "RECUPERAVEL_MB e a estimativa do proprio Oracle - mais confiavel que a conta do passo 1, porque considera o overhead de bloco. Confira a data da tarefa: recomendacao de meses atras pode nao valer mais.",
+      "armadilha": "O Segment Advisor automatico so avalia os segmentos que ele escolheu na janela de manutencao - a ausencia do seu candidato aqui NAO significa que nao ha espaco a recuperar, significa que ninguem mediu. Alem disso, DBA_ADVISOR_* exige Diagnostics Pack; sem licenca, fique na estimativa do passo 1 e na comparacao do passo 3."
+    },
+    {
+      "titulo": "Localizar a high water mark comparando alocado com usado",
+      "objetivo": "Separar o espaco acima da HWM (barato de devolver) do abaixo (exige reorg).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- DBA_SEGMENTS.BLOCKS = alocado ao segmento\n-- DBA_TABLES.BLOCKS   = blocos ate a high water mark (vem da estatistica)\n-- DBA_TABLES.EMPTY_BLOCKS = acima da HWM (so preenchido por ANALYZE)\nSELECT s.owner, s.segment_name, s.tablespace_name,\n       s.blocks                                   AS blocos_alocados,\n       t.blocks                                   AS blocos_ate_hwm,\n       s.blocks - NVL(t.blocks, 0)                AS blocos_acima_hwm,\n       ROUND(s.bytes/1024/1024)                   AS alocado_mb,\n       ROUND(t.blocks * ts.block_size/1024/1024)  AS ate_hwm_mb,\n       ROUND((s.blocks - NVL(t.blocks, 0)) * ts.block_size/1024/1024) AS acima_hwm_mb,\n       ROUND(NVL(t.blocks, 0)/NULLIF(s.blocks, 0)*100, 1) AS pct_ate_hwm,\n       TO_CHAR(t.last_analyzed, 'DD/MM/YYYY')     AS estatistica_de\nFROM   dba_segments   s\nJOIN   dba_tables     t  ON t.owner = s.owner\n                        AND t.table_name = s.segment_name\nJOIN   dba_tablespaces ts ON ts.tablespace_name = s.tablespace_name\nWHERE  s.segment_type = 'TABLE'\nAND    s.bytes > 100 * 1024 * 1024\nORDER  BY blocos_acima_hwm DESC NULLS LAST\nFETCH FIRST 25 ROWS ONLY;",
+      "olhar": "BLOCOS_ACIMA_HWM sai com um simples DEALLOCATE UNUSED: sem mover linha, sem invalidar indice - e a acao mais barata deste playbook. O espaco ABAIXO da HWM (a diferenca entre ate_hwm_mb e o volume real de dados do passo 1) so sai com SHRINK, MOVE ou REDEFINITION.",
+      "armadilha": "DBA_TABLES.BLOCKS vem da ESTATISTICA, nao do segmento: com estatistica velha esta conta mente nas duas direcoes. Confira ESTATISTICA_DE antes de decidir. E lembre que depois de um DELETE o espaco acima da HWM costuma ser pequeno - o DELETE deixa buracos ABAIXO dela, e e por isso que 'a tabela esta vazia mas continua enorme'."
+    },
+    {
+      "titulo": "Verificar linhas encadeadas e migradas",
+      "objetivo": "Identificar o outro custo da fragmentacao: leitura extra por linha.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, table_name, num_rows, chain_cnt,\n       ROUND(chain_cnt / NULLIF(num_rows, 0) * 100, 2) AS pct_encadeadas,\n       pct_free, pct_used, avg_row_len,\n       TO_CHAR(last_analyzed, 'DD/MM/YYYY') AS estatistica_de\nFROM   dba_tables\nWHERE  chain_cnt > 0\nAND    num_rows  > 1000\nORDER  BY chain_cnt DESC\nFETCH FIRST 20 ROWS ONLY;\n\n-- confirmacao no sistema: leitura extra causada por encadeamento\nSELECT name, value\nFROM   v$sysstat\nWHERE  name IN ('table fetch continued row', 'table scan rows gotten',\n                'table fetch by rowid');",
+      "olhar": "PCT_ENCADEADAS acima de 5% ja pesa. 'table fetch continued row' alto em relacao a 'table fetch by rowid' confirma que o banco esta gastando duas leituras onde deveria gastar uma. Reorg com PCTFREE maior resolve o caso de linha MIGRADA (linha que cresceu e nao caberia mais no bloco).",
+      "armadilha": "CHAIN_CNT so e preenchido por ANALYZE TABLE ... LIST CHAINED ROWS ou por estatistica antiga - DBMS_STATS moderno NAO atualiza essa coluna. Valor zero aqui pode significar 'nunca foi medido', nao 'nao ha encadeamento'. E linha genuinamente encadeada (mais de 255 colunas, LOB inline) nao se resolve com reorg nenhum."
+    },
+    {
+      "titulo": "Avaliar indices inflados",
+      "objetivo": "Indice fragmentado costuma desperdicar mais que a tabela.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT i.owner, i.index_name, i.table_name,\n       ROUND(si.bytes/1024/1024)  AS indice_mb,\n       ROUND(st.bytes/1024/1024)  AS tabela_mb,\n       ROUND(si.bytes / NULLIF(st.bytes, 0), 2) AS razao_indice_tabela,\n       i.blevel, i.num_rows, i.distinct_keys, i.status,\n       TO_CHAR(i.last_analyzed, 'DD/MM/YYYY') AS estatistica_de\nFROM   dba_indexes  i\nJOIN   dba_segments si ON si.owner = i.owner AND si.segment_name = i.index_name\nJOIN   dba_segments st ON st.owner = i.table_owner AND st.segment_name = i.table_name\nWHERE  si.bytes > 100 * 1024 * 1024\nAND    st.segment_type = 'TABLE'\nORDER  BY si.bytes DESC\nFETCH FIRST 20 ROWS ONLY;\n\n-- indices que o banco nunca usou (candidatos a remocao, nao a rebuild)\nSELECT owner, index_name, table_name, monitoring, used,\n       start_monitoring, end_monitoring\nFROM   dba_object_usage\nWHERE  used = 'NO';",
+      "olhar": "BLEVEL acima de 4 em indice grande, ou razao indice/tabela acima de 1, sao sinais de indice inflado por DELETE em coluna sequencial (o classico: chave crescente com purga do inicio). Indice com USED='NO' nao merece rebuild - merece analise para remocao.",
+      "armadilha": "Rebuild de indice virou reflexo e quase sempre e desnecessario: o B-tree do Oracle reaproveita blocos sozinho. Rebuild se justifica quando ha DELETE massivo em faixa de chave que nunca sera reinserida. Fora disso, o indice volta ao mesmo tamanho em semanas e voce gastou janela, redo e I/O por nada."
+    },
+    {
+      "titulo": "Investigar SYSAUX grande antes de mexer nele",
+      "objetivo": "SYSAUX inflado tem causas conhecidas e solucao propria - nao e reorg.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- quem ocupa o SYSAUX, por componente\nSELECT occupant_name, schema_name, space_usage_kbytes,\n       ROUND(space_usage_kbytes/1024) AS mb,\n       move_procedure\nFROM   v$sysaux_occupants\nWHERE  space_usage_kbytes > 0\nORDER  BY space_usage_kbytes DESC;\n\n-- retencao do AWR (a causa mais comum de SYSAUX enorme)\nSELECT snap_interval, retention, topnsql\nFROM   dba_hist_wr_control;\n\n-- trilha de auditoria dentro do SYSAUX/SYSTEM\nSELECT owner, segment_name, tablespace_name,\n       ROUND(bytes/1024/1024) AS mb\nFROM   dba_segments\nWHERE  segment_name IN ('AUD$', 'FGA_LOG$', 'WRH$_ACTIVE_SESSION_HISTORY',\n                        'WRH$_SQLSTAT', 'WRH$_SYSMETRIC_HISTORY')\nOR     segment_name LIKE 'WRH$%'\nORDER  BY bytes DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Se o topo e SM/AWR, a acao e reduzir a retencao do AWR (DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS) e nao reorganizar. Se e AUD$, a acao e a rotina de purga da auditoria (DBMS_AUDIT_MGMT). A coluna MOVE_PROCEDURE diz o procedimento oficial para mover cada ocupante.",
+      "armadilha": "NUNCA faca MOVE ou TRUNCATE direto em tabela WRH$* ou AUD$ - sao objetos do dicionario com dependencias internas, e mexer a mao corrompe o repositorio do AWR ou a trilha de auditoria de forma dificil de reverter. Use sempre as APIs (DBMS_WORKLOAD_REPOSITORY, DBMS_AUDIT_MGMT) ou o MOVE_PROCEDURE indicado."
+    },
+    {
+      "titulo": "Devolver apenas o espaco acima da HWM",
+      "objetivo": "A acao de menor risco: liberar extents nunca usados, sem mover linha.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme no passo 3 que ha espaco relevante acima da HWM - senao a operacao nao devolve nada. 2) Nao invalida indice e nao muda ROWID, mas pega um lock breve no segmento: prefira fora do pico. 3) Se a tabela volta a crescer logo, o Oracle realoca os extents e o ganho e temporario - avalie se vale. 4) Registre o tamanho antes e depois. 5) Backup em dia (regra geral para qualquer DDL).",
+      "comando": "-- tamanho antes\nSELECT ROUND(bytes/1024/1024) AS mb FROM dba_segments\nWHERE  owner = 'MEU_SCHEMA' AND segment_name = 'MINHA_TABELA';\n\n-- devolve os extents acima da HWM\n-- ALTER TABLE meu_schema.minha_tabela DEALLOCATE UNUSED;\n\n-- variante que preserva uma folga (evita realocar na proxima insercao)\n-- ALTER TABLE meu_schema.minha_tabela DEALLOCATE UNUSED KEEP 100M;\n\n-- tamanho depois (repita a primeira consulta)",
+      "olhar": "O tamanho em DBA_SEGMENTS deve cair pelo valor de 'acima da HWM' medido no passo 3. Nenhum indice deve mudar de status.",
+      "armadilha": "DEALLOCATE UNUSED nao resolve o caso do DELETE massivo, porque o buraco esta ABAIXO da HWM. Se voce esperava recuperar os 40% medidos no passo 2 e recuperou 2%, o diagnostico esta certo: o caminho e SHRINK/MOVE/REDEFINITION, nao este comando."
+    },
+    {
+      "titulo": "Reorganizar com SHRINK SPACE (baixa a HWM)",
+      "objetivo": "Recuperar o espaco abaixo da HWM movendo linhas dentro do segmento.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Exige ROW MOVEMENT habilitado e tablespace com ASSM. Habilitar row movement e por si uma mudanca de comportamento: a aplicacao nao pode depender de ROWID estavel (alguns frameworks e triggers dependem). 2) SHRINK ... COMPACT so compacta (pode rodar em horario normal, gera lock curto e repetido); SHRINK SPACE sem COMPACT baixa a HWM e pede lock exclusivo no fim - faca em janela. 3) Gera MUITO redo e undo (cada linha movida e um DML): confirme espaco em undo e archive antes, senao voce troca um problema de espaco por ORA-30036/ORA-00257. 4) Indices sao mantidos automaticamente, mas o processo os fragmenta - avalie rebuild depois. 5) Nao funciona em tabela com LOB em alguns cenarios, nem em tabela com coluna LONG. 6) Registre tamanho antes/depois e a duracao.",
+      "comando": "-- 1) requisito: row movement\nSELECT owner, table_name, row_movement FROM dba_tables\nWHERE  owner = 'MEU_SCHEMA' AND table_name = 'MINHA_TABELA';\n\n-- ALTER TABLE meu_schema.minha_tabela ENABLE ROW MOVEMENT;\n\n-- 2) fase compact (lock curto, pode ser interrompida e retomada)\n-- ALTER TABLE meu_schema.minha_tabela SHRINK SPACE COMPACT;\n\n-- 3) fase final: baixa a HWM (lock exclusivo breve) - em janela\n-- ALTER TABLE meu_schema.minha_tabela SHRINK SPACE;\n\n-- 4) incluir os segmentos dependentes (indices, LOB)\n-- ALTER TABLE meu_schema.minha_tabela SHRINK SPACE CASCADE;\n\n-- 5) acompanhar o progresso em outra sessao\nSELECT sid, opname, target, sofar, totalwork,\n       ROUND(sofar/NULLIF(totalwork,0)*100, 1) AS pct,\n       elapsed_seconds, time_remaining\nFROM   gv$session_longops\nWHERE  totalwork > 0 AND sofar < totalwork;",
+      "olhar": "Rode o passo 2 novamente depois: os blocos FS1 devem cair muito. O tamanho em DBA_SEGMENTS deve reduzir. Colete estatisticas depois - o plano de acesso muda quando o numero de blocos muda.",
+      "armadilha": "SHRINK muda o ROWID das linhas movidas. Qualquer coisa que guarde ROWID (indice funcional em alguns casos, aplicacao que faz SELECT ... FOR UPDATE por rowid, materialized view com ROWID) quebra ou precisa ser reconstruida. E a fase final exige lock exclusivo: com sessao ativa na tabela, o comando espera e pode ficar pendurado - tenha o horario combinado."
+    },
+    {
+      "titulo": "Reorganizar com MOVE ou redefinicao online",
+      "objetivo": "Reconstruir o segmento inteiro quando o SHRINK nao serve.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) ALTER TABLE ... MOVE bloqueia a tabela para ESCRITA durante toda a operacao (em tabela grande, horas) e deixa TODOS os indices UNUSABLE - a tabela fica inutilizavel ate o rebuild terminar. Se alguem consultar nesse intervalo, recebe erro ou full scan. 2) Precisa do DOBRO do espaco durante a operacao (segmento antigo + novo). Confirme antes, senao a operacao falha no meio. 3) MOVE ONLINE (19c, tabela nao particionada) evita o bloqueio mas exige espaco extra e mais redo. 4) DBMS_REDEFINITION e a opcao verdadeiramente online, porem tem pre-requisitos (chave primaria ou coluna de rastreio) e mais passos - use quando a tabela nao pode parar. 5) Combine JANELA e APROVACAO formais com o dono da aplicacao. Backup validado antes. 6) Tenha o rollback definido: se a operacao falhar no meio, qual e o plano? 7) Liste os indices ANTES para saber exatamente o que reconstruir.",
+      "comando": "-- 0) espaco: ha o dobro disponivel no tablespace de destino?\nSELECT df.tablespace_name,\n       ROUND(NVL(fs.livre_mb, 0))              AS livre_mb,\n       (SELECT ROUND(bytes/1024/1024) FROM dba_segments\n        WHERE owner='MEU_SCHEMA' AND segment_name='MINHA_TABELA') AS tabela_mb\nFROM   (SELECT tablespace_name FROM dba_data_files GROUP BY tablespace_name) df\nLEFT   JOIN (SELECT tablespace_name, SUM(bytes)/1024/1024 AS livre_mb\n             FROM dba_free_space GROUP BY tablespace_name) fs\n       ON fs.tablespace_name = df.tablespace_name\nWHERE  df.tablespace_name = 'MEU_TABLESPACE';\n\n-- 1) inventario dos indices que ficarao UNUSABLE (guarde esta saida!)\nSELECT owner, index_name, index_type, status, tablespace_name\nFROM   dba_indexes\nWHERE  table_owner = 'MEU_SCHEMA' AND table_name = 'MINHA_TABELA';\n\n-- 2) gera os comandos para revisao (nao executa nada)\nSELECT 'ALTER INDEX ' || owner || '.' || index_name || ' REBUILD ONLINE;' AS rebuild_gerado\nFROM   dba_indexes\nWHERE  table_owner = 'MEU_SCHEMA' AND table_name = 'MINHA_TABELA';\n\n-- 3) o MOVE (executar apenas na janela aprovada):\n-- ALTER TABLE meu_schema.minha_tabela MOVE ONLINE;\n-- ou, para trocar de tablespace:\n-- ALTER TABLE meu_schema.minha_tabela MOVE TABLESPACE novo_ts;\n\n-- 4) DEPOIS do move: reconstruir os indices e recoletar estatistica\n-- (rode os comandos gerados no item 2)\n-- EXEC DBMS_STATS.GATHER_TABLE_STATS('MEU_SCHEMA','MINHA_TABELA',CASCADE=>TRUE);\n\n-- 5) conferir que nenhum indice ficou UNUSABLE\nSELECT owner, index_name, status FROM dba_indexes\nWHERE  table_owner = 'MEU_SCHEMA' AND table_name = 'MINHA_TABELA'\nAND    status <> 'VALID';",
+      "olhar": "Ao fim, TODOS os indices devem estar VALID e as estatisticas recoletadas. Compare o tamanho com o do passo 1 e registre o ganho. Valide com a aplicacao que as consultas criticas voltaram ao tempo normal.",
+      "armadilha": "Esquecer o rebuild dos indices e o desastre classico do MOVE: a tabela fica no ar, aparentemente saudavel, mas todo acesso vira full scan (indice UNUSABLE e ignorado silenciosamente em algumas configuracoes ou gera ORA-01502 em outras). O sistema 'funciona' e fica lentissimo, e a causa raiz demora dias para ser encontrada. Guarde a lista de indices ANTES do move e confira um por um DEPOIS - e por isso que o passo 1 vem antes do comando."
+    },
+    {
+      "titulo": "Confirmar o ganho e prevenir a reincidencia",
+      "objetivo": "Fechar o caso com numero e evitar a mesma reorg em seis meses.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ganho por segmento (compare com o passo 1)\nSELECT owner, segment_name, segment_type, tablespace_name,\n       ROUND(bytes/1024/1024) AS mb_agora\nFROM   dba_segments\nWHERE  owner = 'MEU_SCHEMA'\nORDER  BY bytes DESC\nFETCH FIRST 15 ROWS ONLY;\n\n-- folga recuperada no tablespace\nSELECT df.tablespace_name,\n       ROUND(df.alocado_mb)        AS alocado_mb,\n       ROUND(NVL(fs.livre_mb, 0))  AS livre_mb,\n       ROUND((df.alocado_mb - NVL(fs.livre_mb, 0))/df.alocado_mb*100, 1) AS pct_usado\nFROM   (SELECT tablespace_name, SUM(bytes)/1024/1024 AS alocado_mb\n        FROM dba_data_files GROUP BY tablespace_name) df\nLEFT   JOIN (SELECT tablespace_name, SUM(bytes)/1024/1024 AS livre_mb\n             FROM dba_free_space GROUP BY tablespace_name) fs\n       ON fs.tablespace_name = df.tablespace_name\nORDER  BY pct_usado DESC;\n\n-- ha politica de purga/particionamento nas tabelas que mais crescem?\nSELECT owner, table_name, partitioned, num_rows,\n       TO_CHAR(last_analyzed, 'DD/MM/YYYY') AS estatistica_de\nFROM   dba_tables\nWHERE  owner = 'MEU_SCHEMA'\nAND    num_rows > 10000000\nORDER  BY num_rows DESC;",
+      "olhar": "Registre no caso: MB recuperados, duracao da operacao e janela usada. Tabela enorme com PARTITIONED='NO' e purga manual e a receita para repetir esta reorg todo semestre - a recomendacao estrutural e particionar por data e usar DROP PARTITION, que devolve espaco instantaneamente e sem reorg.",
+      "armadilha": "Reorg sem mudar a causa e trabalho recorrente: se a aplicacao continua fazendo DELETE massivo mensal, o desperdicio volta no mesmo ritmo. Encerre o caso com a recomendacao estrutural registrada (particionamento ou politica de retencao), mesmo que ela fique para depois - assim o proximo plantao nao redescobre o problema."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

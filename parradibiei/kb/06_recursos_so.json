@@ -1,0 +1,108 @@
+{
+  "id": "recursos_so",
+  "ordem": 6,
+  "titulo": "Recursos do servidor: CPU, memoria e I/O",
+  "quando_usar": "O banco esta lento mas nenhum SQL explica; espera dominada por 'CPU' ou 'User I/O'; suspeita de swap, saturacao de CPU ou storage lento. Tambem quando o banco divide o host com outros servicos.",
+  "tags": [
+    "so",
+    "sistema operacional",
+    "cpu",
+    "memoria",
+    "swap",
+    "io",
+    "linux",
+    "saturacao"
+  ],
+  "sintomas": [
+    "banco lento sem SQL culpado",
+    "load average alto",
+    "swap em uso",
+    "log file sync alto",
+    "db file sequential read lento"
+  ],
+  "secoes": [
+    "Sistema operacional",
+    "Host",
+    "I/O",
+    "CPU",
+    "Memoria",
+    "Tendencia de carga",
+    "serie diaria por metrica",
+    "Latencia"
+  ],
+  "fontes": [
+    "Metodo USE (Brendan Gregg): utilizacao, saturacao, erros por recurso",
+    "Tanel Poder - abordagem de correlacionar espera do banco com metrica de SO",
+    "Oracle Database Reference - V$OSSTAT, V$SYSMETRIC"
+  ],
+  "nota": "Regra: o banco so pode ser tao rapido quanto o servidor abaixo dele. Mas cuidado com a inversao de causa - CPU alta costuma ser CONSEQUENCIA de um SQL ruim, nao a causa. Use este playbook junto com o de SQL lento, nunca isolado.",
+  "passos": [
+    {
+      "titulo": "Ver o host pela otica do banco (sem sair do SQL*Plus)",
+      "objetivo": "Em Citrix ou sem acesso ao SO, esta e a unica visao disponivel - e ja resolve boa parte.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT stat_name, value,\n       CASE WHEN stat_name LIKE '%MEMORY%' OR stat_name LIKE '%BYTES%'\n            THEN ROUND(value/1024/1024/1024,2) END AS gb\nFROM v$osstat\nWHERE stat_name IN ('NUM_CPUS','NUM_CPU_CORES','PHYSICAL_MEMORY_BYTES',\n                    'FREE_MEMORY_BYTES','LOAD','BUSY_TIME','IDLE_TIME',\n                    'VM_IN_BYTES','VM_OUT_BYTES');",
+      "olhar": "LOAD proximo ou acima de NUM_CPUS = fila de CPU. VM_IN/VM_OUT diferentes de zero e CRESCENDO = swap ativo, o pior cenario para banco. FREE_MEMORY_BYTES baixo com swap = memoria estourada.",
+      "armadilha": "V$OSSTAT e do HOST inteiro, nao so do banco. Num host com varias instancias ou outros servicos, CPU alta pode nao ser sua. Compare com o passo 3."
+    },
+    {
+      "titulo": "Metricas do banco no ultimo minuto",
+      "objetivo": "Numeros ja calculados pelo proprio Oracle, sem precisar de pack nem de SO.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT metric_name, ROUND(value,2) AS valor, metric_unit\nFROM v$sysmetric\nWHERE group_id = 2\n  AND metric_name IN ('Host CPU Utilization (%)',\n                      'Database CPU Time Ratio',\n                      'Database Wait Time Ratio',\n                      'Average Active Sessions',\n                      'Physical Read Total Bytes Per Sec',\n                      'Physical Write Total Bytes Per Sec',\n                      'Logons Per Sec', 'Executions Per Sec')\nORDER BY metric_name;",
+      "olhar": "Average Active Sessions (AAS) acima do numero de CPUs = o banco pede mais CPU do que existe. Database Wait Time Ratio alto = o tempo esta indo para espera, nao para trabalho: procure a classe de espera dominante.",
+      "armadilha": "Host CPU Utilization inclui tudo no host. Se estiver alta mas o Database CPU Time Ratio estiver baixo, quem consome CPU nao e o seu banco."
+    },
+    {
+      "titulo": "Onde o banco esta esperando (a pergunta que ordena tudo)",
+      "objetivo": "Antes de culpar o hardware, veja a classe de espera dominante. E ela que diz qual recurso investigar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT wait_class, ROUND(time_waited/100,1) AS seg,\n       ROUND(100*RATIO_TO_REPORT(time_waited) OVER (),1) AS pct\nFROM v$system_wait_class\nWHERE wait_class <> 'Idle'\nORDER BY time_waited DESC;\n\n-- as 10 maiores esperas individuais:\nSELECT event, wait_class, total_waits,\n       ROUND(time_waited_micro/1e6) AS seg_total,\n       ROUND(time_waited_micro/1e6/NULLIF(total_waits,0)*1000,2) AS ms_medio\nFROM v$system_event\nWHERE wait_class <> 'Idle'\nORDER BY time_waited_micro DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "'User I/O' dominante -> storage (passo 5). 'Concurrency'/'Application' -> lock (outro playbook). 'System I/O' com log file sync/parallel write alto -> disco de redo. 'Scheduler'/'CPU' -> CPU.",
+      "armadilha": "V$SYSTEM_EVENT e acumulado DESDE O STARTUP. Num banco com meses de uptime, ele mostra a media historica e esconde o problema de agora. Para o agora, use V$SYSMETRIC ou duas leituras com intervalo e faca a diferenca."
+    },
+    {
+      "titulo": "Memoria: o banco cabe no servidor?",
+      "objetivo": "Swap em servidor de banco derruba a performance de forma brutal e silenciosa.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT (SELECT ROUND(SUM(value)/1024/1024/1024,2) FROM v$sga) AS sga_gb,\n       (SELECT ROUND(value/1024/1024/1024,2) FROM v$pgastat\n         WHERE name='total PGA allocated') AS pga_gb,\n       (SELECT ROUND(value/1024/1024/1024,2) FROM v$osstat\n         WHERE stat_name='PHYSICAL_MEMORY_BYTES') AS ram_host_gb,\n       (SELECT COUNT(*) FROM gv$instance) AS instancias_no_host\nFROM dual;",
+      "olhar": "SGA + PGA nao deve passar de ~70-80% da RAM do host, deixando folga para SO e processos de servidor. Com varias instancias, some TODAS.",
+      "armadilha": "PGA e alvo, nao limite: pga_aggregate_target pode ser ultrapassado sob carga (sort/hash grandes). Use pga_aggregate_limit para ter teto real, e lembre que cada sessao dedicada consome memoria propria."
+    },
+    {
+      "titulo": "I/O: o storage esta respondendo?",
+      "objetivo": "Separar 'faz muito IO' (problema de SQL) de 'o IO esta lento' (problema de storage).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT event,\n       ROUND(time_waited_micro/1e6/NULLIF(total_waits,0)*1000,2) AS ms_medio,\n       total_waits\nFROM v$system_event\nWHERE event IN ('db file sequential read','db file scattered read',\n                'log file parallel write','log file sync',\n                'direct path read','direct path write')\nORDER BY ms_medio DESC;\n\n-- por arquivo, para achar o datafile/disco lento:\nSELECT SUBSTR(f.file_name,-40) AS arquivo, s.phyrds, s.phywrts,\n       ROUND(s.readtim/NULLIF(s.phyrds,0)*10,2) AS ms_leitura\nFROM v$filestat s JOIN dba_data_files f ON f.file_id = s.file#\nWHERE s.phyrds > 1000\nORDER BY ms_leitura DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "'db file sequential read' acima de ~10 ms em storage moderno indica lentidao. Em all-flash, acima de 2-3 ms ja e suspeito. Muitos waits com ms baixo = volume de IO (culpa do SQL), poucos waits com ms alto = storage.",
+      "armadilha": "'log file sync' alto nem sempre e disco: pode ser commit excessivo da aplicacao (um commit por linha num loop). Compare com 'log file parallel write' - se este esta rapido e o sync esta lento, o problema e a aplicacao, nao o storage."
+    },
+    {
+      "titulo": "Confirmar no sistema operacional",
+      "objetivo": "Fechar o diagnostico com a visao do SO, quando ha acesso ao servidor.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "uptime\nvmstat 1 5\nfree -m\niostat -xz 1 5\ntop -b -n 1 | head -25\ndf -h",
+      "olhar": "vmstat: coluna 'r' acima do numero de CPUs = fila; 'si'/'so' diferentes de zero = swap ativo. iostat: '%util' perto de 100 com 'await' alto = disco saturado. free -m: 'available' baixo e o que importa, nao 'free'.",
+      "armadilha": "A primeira linha do vmstat/iostat e a media desde o boot - ignore-a e olhe as seguintes. Erro classico que leva a conclusao errada."
+    },
+    {
+      "titulo": "Decidir: e recurso ou e carga?",
+      "objetivo": "Fechar o raciocinio. Adicionar CPU para resolver SQL ruim e caro e nao resolve.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- quem consome a CPU do banco:\nSELECT sql_id, COUNT(*) AS amostras,\n       ROUND(100*RATIO_TO_REPORT(COUNT(*)) OVER (),1) AS pct\nFROM gv$active_session_history\nWHERE sample_time > SYSDATE - 1/24\n  AND session_state = 'ON CPU' AND sql_id IS NOT NULL\nGROUP BY sql_id ORDER BY amostras DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "Se 2 ou 3 sql_id respondem pela maior parte da CPU, o problema e de SQL: va para o playbook de SQL lento. Se a CPU esta distribuida entre centenas de SQL, ai sim e capacidade.",
+      "armadilha": "gv$active_session_history exige Diagnostics Pack. Sem licenca, use o check de amostragem do framework (session_sampling), que amostra gv$session e chega a mesma conclusao."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

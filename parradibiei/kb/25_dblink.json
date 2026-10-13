@@ -1,0 +1,142 @@
+{
+  "id": "dblink",
+  "titulo": "DB link com falha, lento ou vazando sessao",
+  "quando_usar": "Consulta atraves de database link falha, fica pendurada, ficou lenta de repente, ou o banco remoto acumula sessoes originadas por link.",
+  "tags": [
+    "dblink",
+    "db link",
+    "database link",
+    "link",
+    "ORA-02019",
+    "ORA-12154",
+    "ORA-01017",
+    "ORA-02068",
+    "ORA-03135",
+    "ORA-02020",
+    "open_links",
+    "banco remoto",
+    "consulta remota",
+    "distribuido",
+    "global_names",
+    "ORA-01555 remoto"
+  ],
+  "sintomas": [
+    "ORA-02019: connection description for remote database not found",
+    "ORA-02068 / ORA-03135: conexao com o banco remoto caiu no meio",
+    "consulta com link que era rapida ficou lenta sem mudanca de codigo",
+    "sessao pendurada em 'SQL*Net message from dblink'",
+    "ORA-02020: too many database links in use",
+    "banco remoto com sessoes acumuladas vindas por link"
+  ],
+  "secoes": [
+    "Sessoes",
+    "Sessoes e processos",
+    "Distribuicao de esperas (ASH)",
+    "Conexao",
+    "Topologia do ambiente"
+  ],
+  "erros_ora": [
+    "ORA-02019",
+    "ORA-02068",
+    "ORA-03135",
+    "ORA-02020",
+    "ORA-12154",
+    "ORA-01017"
+  ],
+  "fontes": [
+    "Oracle Database Administrator's Guide 19c - Managing Database Links",
+    "Oracle Database Reference 19c - DBA_DB_LINKS, V$DBLINK, OPEN_LINKS",
+    "Oracle Support - Troubleshooting ORA-02019 and Database Link Issues",
+    "Pratica de campo: roteiro de diagnostico de database link aplicado inumeras vezes em ambientes diversos"
+  ],
+  "nota": "Link e um ponto cego: o problema quase nunca esta no banco onde voce recebeu a reclamacao. A regra deste playbook e provar em qual lado esta a falha ANTES de mexer em qualquer coisa - resolucao de nome, autenticacao, rede ou o SQL remoto. Nunca extraia senha de link de sys.link$ para 'documentar': isso expõe credencial em texto no seu terminal e no historico. Use DBMS_METADATA, que devolve a senha cifrada.",
+  "passos": [
+    {
+      "titulo": "Inventariar os links existentes",
+      "objetivo": "Saber quais links existem, de quem sao e para onde apontam.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, db_link, username AS conecta_como, host AS destino,\n       TO_CHAR(created, 'DD/MM/YYYY') AS criado_em\nFROM   dba_db_links\nORDER  BY owner, db_link;\n\n-- quantos links o banco permite abrir por sessao\nSELECT name, value FROM v$parameter\nWHERE  name IN ('open_links', 'open_links_per_instance', 'global_names');",
+      "olhar": "OWNER = 'PUBLIC' significa que qualquer usuario usa o link - risco de seguranca e de uso nao rastreavel. USERNAME nulo indica link com autenticacao do usuario corrente (connected user link), que falha se a conta nao existir igual no remoto.",
+      "armadilha": "HOST pode ser um alias do tnsnames OU uma descricao de conexao completa. Se for alias, a resolucao depende do tnsnames.ora do SERVIDOR (nao do seu cliente) - e essa e a causa numero um de ORA-02019 que 'funciona na minha maquina'."
+    },
+    {
+      "titulo": "Testar o link com o teste mais barato possivel",
+      "objetivo": "Separar 'link quebrado' de 'consulta remota lenta' em um comando.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- troque MEU_LINK pelo nome do link. Este e o teste minimo: se falhar,\n-- o problema e de conexao/credencial, nao do SQL da aplicacao.\nSELECT * FROM dual@MEU_LINK;\n\n-- se passou, confirme QUAL banco respondeu (evita link apontando para o lugar errado)\nSELECT global_name FROM global_name@MEU_LINK;\n\nSELECT instance_name, host_name, status,\n       TO_CHAR(startup_time, 'DD/MM/YYYY HH24:MI') AS no_ar_desde\nFROM   v$instance@MEU_LINK;",
+      "olhar": "Se SELECT * FROM dual@LINK responde rapido, o link esta saudavel e o problema e a consulta. Confirme o GLOBAL_NAME: link que aponta para o ambiente errado (homologacao apontando para producao, ou vice-versa) e um achado grave e mais comum do que parece.",
+      "armadilha": "Este teste ABRE o link na sua sessao e ele fica aberto ate COMMIT/ROLLBACK ou fechamento explicito. Testar varios links na mesma sessao pode estourar OPEN_LINKS e gerar ORA-02020 - fechando a falsa impressao de que os links estao ruins. Feche com ALTER SESSION CLOSE DATABASE LINK ou reconecte."
+    },
+    {
+      "titulo": "Ver quem esta usando link agora",
+      "objetivo": "Detectar vazamento de link e sessao remota acumulada.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- ATENCAO: V$DBLINK mostra SO os links abertos pela SUA PROPRIA sessao.\n-- Serve para conferir se o seu teste deixou link aberto, nao para auditar\n-- a instancia inteira.\nSELECT db_link, logged_on, heterogeneous, protocol,\n       open_cursors, in_transaction, update_sent\nFROM   v$dblink;\n\n-- Para ver as OUTRAS sessoes usando link, o caminho e a espera:\nSELECT s.inst_id, s.sid, s.serial#, s.username,\n       SUBSTR(s.machine, 1, 25) AS maquina,\n       SUBSTR(s.module,  1, 30) AS modulo,\n       s.event, s.seconds_in_wait AS s_esperando, s.sql_id\nFROM   gv$session s\nWHERE  s.event LIKE '%dblink%'\nORDER  BY s.seconds_in_wait DESC;\n\n-- E as transacoes distribuidas abertas (link com transacao em curso):\nSELECT s.inst_id, s.sid, s.username, s.module,\n       t.xid,\n       TO_CHAR(t.start_date, 'DD/MM HH24:MI:SS') AS transacao_desde,\n       ROUND((SYSDATE - t.start_date) * 24 * 60) AS minutos_aberta\nFROM   gv$transaction t\nJOIN   gv$session s ON s.inst_id = t.inst_id AND s.saddr = t.ses_addr\nORDER  BY t.start_date;",
+      "olhar": "IN_TRANSACTION = 'YES' no V$DBLINK significa transacao distribuida em curso na sua sessao. Nas outras sessoes, o sinal e a espera '%dblink%' com muitos segundos. Transacao distribuida aberta ha muito tempo e candidata ao playbook de transacao distribuida (ORA-01591).",
+      "armadilha": "E tentador tentar juntar GV$DBLINK com GV$SESSION para contar links por sessao - nao funciona: V$DBLINK e visivel APENAS para a sessao que abriu os links, e a coluna OWNER_ID nao e endereco de sessao (o join com SADDR devolve ORA-00932). Nao existe view que liste os links abertos por TODAS as sessoes; para auditar vazamento, use a espera em GV$SESSION e o numero de sessoes no banco REMOTO."
+    },
+    {
+      "titulo": "Medir onde o tempo esta sendo gasto",
+      "objetivo": "Confirmar se a sessao espera o banco remoto ou trabalha localmente.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.inst_id, s.sid, s.serial#, s.username,\n       SUBSTR(s.module, 1, 25) AS modulo,\n       s.event,\n       s.wait_class,\n       s.seconds_in_wait AS s_esperando,\n       s.sql_id,\n       ROUND(s.last_call_et/60) AS min_na_chamada\nFROM   gv$session s\nWHERE  s.event LIKE '%dblink%'\nOR     s.event LIKE '%SQL*Net%from dblink%'\nORDER  BY s.seconds_in_wait DESC;\n\n-- historico: quanto do tempo do banco foi gasto esperando link (4h)\nSELECT ash.event,\n       COUNT(*) AS amostras,\n       COUNT(DISTINCT ash.session_id) AS sessoes,\n       COUNT(DISTINCT ash.sql_id)     AS sqls\nFROM   gv$active_session_history ash\nWHERE  ash.sample_time > SYSTIMESTAMP - INTERVAL '4' HOUR\nAND    (ash.event LIKE '%dblink%' OR ash.event LIKE '%SQL*Net%')\nGROUP  BY ash.event\nORDER  BY amostras DESC;",
+      "olhar": "'SQL*Net message from dblink' com muitos segundos = seu banco esta PARADO esperando o remoto. A investigacao continua NO OUTRO BANCO, com o SQL_ID de lá. Insistir no banco local aqui e perder tempo.",
+      "armadilha": "'SQL*Net message from dblink' e espera IDLE em algumas classificacoes, e por isso costuma ser filtrada dos relatorios de performance. Numa investigacao de link ela e exatamente o sinal que interessa - nao a descarte."
+    },
+    {
+      "titulo": "Achar a sessao correspondente no banco remoto",
+      "objetivo": "Fechar a ponte entre os dois lados e ver o que o remoto esta fazendo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- 1) no banco LOCAL: identifique a transacao distribuida\nSELECT s.sid, s.serial#, s.username, t.xid,\n       t.start_time, s.sql_id\nFROM   gv$session s\nJOIN   gv$transaction t ON t.ses_addr = s.saddr AND t.inst_id = s.inst_id\nWHERE  s.event LIKE '%dblink%';\n\n-- 2) no banco REMOTO: sessoes que chegaram por link\n--    (rode conectado no remoto, ou use @LINK nas views)\nSELECT s.sid, s.serial#, s.username, s.status,\n       SUBSTR(s.program, 1, 30) AS programa,\n       s.event, s.seconds_in_wait, s.sql_id,\n       ROUND(s.last_call_et/60) AS min_na_chamada\nFROM   v$session@MEU_LINK s\nWHERE  s.program LIKE '%oracle%'\nAND    s.type = 'USER'\nORDER  BY s.last_call_et DESC\nFETCH FIRST 20 ROWS ONLY;",
+      "olhar": "No remoto, sessao vinda por link normalmente aparece com PROGRAM contendo 'oracle@<host_de_origem>'. Ache o SQL_ID dela e analise-o como um SQL comum - o playbook de SQL lento vale integralmente ali.",
+      "armadilha": "Consultar v$session@LINK abre mais um link e a saida ja inclui a SUA propria sessao de consulta - facil confundir o observador com o observado. Prefira conectar direto no banco remoto quando tiver acesso."
+    },
+    {
+      "titulo": "Verificar se o plano da consulta remota degradou",
+      "objetivo": "Explicar 'ficou lento sem mudar nada' - normalmente e o plano distribuido.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- o SQL local que usa o link\nSELECT sql_id, plan_hash_value, executions,\n       ROUND(elapsed_time/1000000)                       AS total_s,\n       ROUND(elapsed_time/1000000/NULLIF(executions,0),2) AS s_por_exec,\n       ROUND(rows_processed/NULLIF(executions,0))         AS linhas_por_exec,\n       SUBSTR(sql_text, 1, 60) AS sql_text\nFROM   v$sql\nWHERE  UPPER(sql_text) LIKE '%@%'\nAND    executions > 0\nORDER  BY elapsed_time DESC\nFETCH FIRST 15 ROWS ONLY;\n\n-- historico de planos do SQL suspeito (troque o sql_id)\nSELECT plan_hash_value,\n       COUNT(DISTINCT snap_id) AS snapshots,\n       SUM(executions_delta)   AS execucoes,\n       ROUND(SUM(elapsed_time_delta)/1000000/\n             NULLIF(SUM(executions_delta),0), 3) AS s_por_exec\nFROM   dba_hist_sqlstat\nWHERE  sql_id = 'abcd1234efgh5'\nGROUP  BY plan_hash_value\nORDER  BY 2 DESC;",
+      "olhar": "Mais de um PLAN_HASH_VALUE com tempos por execucao muito diferentes = regressao de plano. Em consulta distribuida, o otimizador local decide o que trafega pela rede: um plano que puxa a tabela remota inteira para filtrar localmente e o desastre classico.",
+      "armadilha": "O otimizador local NAO conhece bem as estatisticas do objeto remoto. Se a linha remota foi crescendo, o plano que era bom vira ruim sem nenhuma mudanca no seu banco. A pista e linhas_por_exec estavel com s_por_exec subindo - o tempo esta na rede, nao no resultado."
+    },
+    {
+      "titulo": "Extrair a DDL do link sem expor a senha",
+      "objetivo": "Documentar ou recriar o link com seguranca.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- DDL com a senha CIFRADA (jeito correto)\nSELECT DBMS_METADATA.GET_DDL('DB_LINK', db_link, owner) AS ddl\nFROM   dba_db_links\nWHERE  db_link = 'MEU_LINK';\n\n-- se precisar de todos:\nSELECT DBMS_METADATA.GET_DDL('DB_LINK', db_link, owner) AS ddl\nFROM   dba_db_links\nORDER  BY owner, db_link;",
+      "olhar": "A DDL sai com IDENTIFIED BY VALUES '<hash>', que recria o link sem ninguem precisar conhecer a senha em claro. Guarde no caso como evidencia da configuracao anterior a qualquer mudanca.",
+      "armadilha": "NAO use os scripts antigos que leem sys.link$ para montar o CREATE DATABASE LINK: em versoes antigas a coluna PASSWORD trazia a senha em TEXTO CLARO, e o resultado ia para o terminal, o spool e o historico. Em 19c a coluna existe mas vem nula/inutil - o metodo correto e DBMS_METADATA. Acesso a sys.link$ tambem exige privilegio que o usuario de leitura nao deve ter."
+    },
+    {
+      "titulo": "Fechar link pendurado na sessao (paliativo local)",
+      "objetivo": "Liberar links abertos que estao consumindo o limite ou o remoto.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) CLOSE DATABASE LINK falha se houver transacao distribuida aberta - resolva a transacao primeiro (COMMIT/ROLLBACK do dono, ou o playbook de transacao distribuida). 2) Fechar link de uma sessao de aplicacao ativa pode gerar erro na aplicacao na proxima chamada: combine com o time dono. 3) Isto e paliativo: se a aplicacao vaza link, o consumo volta. 4) Registre no caso qual link e qual sessao.",
+      "comando": "-- na PROPRIA sessao (nao ha comando para fechar link de outra sessao):\nCOMMIT;  -- ou ROLLBACK: transacao aberta impede o fechamento\nALTER SESSION CLOSE DATABASE LINK MEU_LINK;\n\n-- para links de OUTRAS sessoes, o caminho e agir sobre a sessao.\n-- gera o comando para revisao (nao executa nada):\nSELECT 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial#\n       || ',@' || s.inst_id || ''' IMMEDIATE;' AS comando_gerado,\n       s.username, s.machine, s.module, COUNT(*) AS links_abertos\nFROM   gv$dblink d\nJOIN   gv$session s ON s.inst_id = d.inst_id AND s.saddr = d.owner_id\nGROUP  BY s.inst_id, s.sid, s.serial#, s.username, s.machine, s.module\nHAVING COUNT(*) > 1\nORDER  BY links_abertos DESC;",
+      "olhar": "Depois de fechar, GV$DBLINK deve perder a linha. Confirme tambem no banco remoto que a sessao correspondente encerrou - link fechado no local com sessao viva no remoto indica conexao meio-morta e e assunto de rede.",
+      "armadilha": "Nao existe comando para fechar o link de OUTRA sessao: a unica alavanca e a sessao inteira. Matar a sessao no lado local pode deixar a sessao remota orfa ate o dead connection detection agir (minutos a horas). Em vez de matar em serie, trate o vazamento na aplicacao."
+    },
+    {
+      "titulo": "Fechar a causa: rede, nome ou credencial",
+      "objetivo": "Encerrar o caso com a origem identificada, nao com o link recriado por reflexo.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# 1) o nome resolve no SERVIDOR do banco (nao no seu desktop)?\ntnsping MEU_ALIAS\n\n# 2) o listener do remoto responde e publica o servico?\nlsnrctl status\n\n# 3) a rota existe e a latencia e sadia?\nping -c 4 host-remoto\n\n# 4) o nome resolve em DNS?\nnslookup host-remoto\n\n# 5) o tnsnames do servidor tem a entrada?\ngrep -i -A5 MEU_ALIAS $ORACLE_HOME/network/admin/tnsnames.ora",
+      "olhar": "tnsping falhando explica ORA-12154/ORA-02019 sem nenhuma investigacao no banco. Latencia alta e instavel explica lentidao intermitente que nenhuma analise de SQL vai resolver. Se tudo aqui passa e o erro persiste, o problema e credencial (ORA-01017) ou privilegio no remoto.",
+      "armadilha": "Recriar o link 'para ver se resolve' apaga a evidencia e nao trata a causa. E se o link for PUBLIC e usado por varios sistemas, recria-lo com um erro de digitacao derruba todos eles de uma vez - inclusive os que estavam funcionando. Documente a DDL atual (passo 7) antes de qualquer alteracao."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18",
+    "nao_verificados": 4
+  }
+}

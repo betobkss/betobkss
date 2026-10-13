@@ -1,0 +1,142 @@
+{
+  "id": "db2_log_cheio",
+  "plataforma": "db2",
+  "ordem": 55,
+  "titulo": "Db2: log de transacao alto ou a 100% - e nem sempre e log cheio",
+  "quando_usar": "Alerta de Transaction Log High Usage, log utilization acima do threshold, ou SQL0964C no log de aplicacao. Use ANTES de aumentar LOGSECOND ou matar sessao: as duas reacoes automaticas deste alerta costumam ser erradas, e uma delas pode travar o banco.",
+  "tags": [
+    "db2",
+    "transaction log",
+    "log cheio",
+    "log utilization",
+    "logsecond",
+    "logprimary",
+    "logfilsiz",
+    "logarchmeth1",
+    "infinite logging",
+    "SQL0964C",
+    "SQL1224N",
+    "falso positivo",
+    "monitoracao"
+  ],
+  "sintomas": [
+    "alerta de transaction log acima do threshold",
+    "log utilization em 100%",
+    "SQL0964C transaction log full",
+    "aplicacao falhando em commit",
+    "log de transacao crescendo sem parar"
+  ],
+  "secoes": [
+    "Espaco",
+    "Recuperabilidade",
+    "Capacidade",
+    "Monitoracao"
+  ],
+  "fontes": [
+    "IBM Db2 11.5 Knowledge Center - Log file management, LOGSECOND, infinite active log space",
+    "IBM Db2 - SYSIBMADM.LOG_UTILIZATION administrative view",
+    "IBM Db2 - db2pd -logs e db2pd -transactions",
+    "Caso real (09/2026): alerta de 100% num banco que usava 38 KB de log"
+  ],
+  "nota": "Log cheio em Db2 quase nunca e falta de tamanho: e algo IMPEDINDO a liberacao do log. As quatro causas, em ordem de frequencia, sao transacao aberta antiga, arquivamento falhando, HADR sem confirmacao e, so por ultimo, dimensionamento. E existe uma quinta que nao e problema de banco nenhum: com LOGSECOND = -1 o Db2 nao consegue calcular percentual e devolve NULO - monitor que converte nulo em 100% gera alarme permanente sem nada acontecendo. Separar isso custa tres comandos.",
+  "passos": [
+    {
+      "titulo": "Existe impacto real, ou so alerta?",
+      "objetivo": "Saber se a aplicacao esta falhando agora. Isso define se ha espaco para diagnosticar ou se e incidente ativo.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2diag -H 30m | grep -i -E \"SQL0964|SQL1224|log full|transaction log\"\ndb2diag -H 30d | grep -i -E \"SQL0964|log full\"",
+      "olhar": "SQL0964C presente = incidente ativo, a aplicacao ja nao escreve. Ausente = risco iminente, ha tempo de diagnosticar antes de agir.",
+      "armadilha": "Ausencia de SQL0964C com o painel em 100% e o primeiro indicio de que a metrica, e nao o banco, esta com problema. Se o log ativo estivesse realmente esgotado haveria erro no db2diag. Atencao: o db2diag pode estar rotacionado e nao reter os 30 dias pedidos - confira a data da primeira linha antes de concluir 'nunca aconteceu'."
+    },
+    {
+      "titulo": "O numero que o monitor esta lendo",
+      "objetivo": "Ver a metrica na fonte, em vez de confiar no painel.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT db_name, log_utilization_percent, total_log_used_kb,\n       total_log_available_kb, total_log_used_top_kb, member\nFROM   SYSIBMADM.LOG_UTILIZATION;",
+      "olhar": "Compare total_log_used_kb com o que o alerta afirma. Um banco com dezenas de KB em uso e alerta de 100% nao tem problema de log - tem problema de metrica.",
+      "armadilha": "log_utilization_percent e total_log_available_kb vem NULOS quando LOGSECOND = -1, porque nao existe total finito contra o qual calcular. Monitor que trata nulo como 100% dispara para sempre. E total_log_used_top_kb e o pico DESDE A ATIVACAO do banco, nao historico absoluto: num banco reiniciado ha dois dias ele nao viu o fechamento mensal."
+    },
+    {
+      "titulo": "Estado do log e do arquivamento",
+      "objetivo": "Uma saida que responde de uma vez: quanto do log esta em uso e se o arquivamento esta acompanhando.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2pd -db <BANCO> -logs",
+      "olhar": "Method 1 Archive Status deve ser Success e Next Log to Archive deve estar igual ou proximo do Current Log Number. Na lista de arquivos, StartLSN diferente de zero marca os logs REALMENTE em uso - os com 0x0 estao apenas pre-alocados.",
+      "armadilha": "Contar as linhas da lista e confundir log alocado com log usado: o Db2 pre-aloca LOGPRIMARY arquivos na ativacao, e todos aparecem ali. Um banco com 50 linhas e 49 StartLSN zerados esta usando UM log, nao cinquenta. Se Next Log to Archive ficou muito atras do Current Log, o arquivamento e a causa - e ai aumentar LOGSECOND piora, porque os logs novos enchem o filesystem."
+    },
+    {
+      "titulo": "A transacao que esta segurando o log",
+      "objetivo": "Achar a causa mais frequente: uma unica sessao sem commit trava a reutilizacao de todos os logs posteriores a ela.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2pd -db <BANCO> -transactions",
+      "olhar": "Procure o MENOR Firstlsn diferente de zero, e as colunas LogSpace e SpaceReserved. Esse AppHandl e o responsavel. Se TODAS as transacoes estiverem em State READ com Firstlsn 0x0 e LogSpace 0, nenhuma retem log e esta causa esta descartada.",
+      "armadilha": "State READ nao significa sessao inofensiva no geral, mas com Firstlsn 0x0 e LogSpace 0 ela comprovadamente nao ocupa log. E nao confunda transacao antiga com conexao antiga: aplicacao com pool mantem conexao por horas sem manter transacao aberta - o que importa e o Firstlsn, nao o tempo de conexao."
+    },
+    {
+      "titulo": "A configuracao, para saber contra qual total o percentual e medido",
+      "objetivo": "Descobrir o teto real do log ativo e para onde ele arquiva.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2 get db cfg for <BANCO> | grep -i -E \"LOGPRIMARY|LOGSECOND|LOGFILSIZ|LOGARCHMETH1|LOGARCHOPT1|FAILARCHPATH|Path to log|Overflow log path\"",
+      "olhar": "Teto do log ativo = (LOGPRIMARY + LOGSECOND) x LOGFILSIZ x 4 KB. Com LOGSECOND = -1 nao ha teto: o limite passa a ser o filesystem. Anote tambem LOGARCHMETH1 (TSM, DISK, VENDOR) e o FAILARCHPATH, que e onde o Db2 despeja o log quando o destino principal falha.",
+      "armadilha": "LOGSECOND = -1 (infinite active log) invalida qualquer alarme baseado em percentual, e e a origem do alarme fantasma. Compare com os OUTROS bancos da mesma instancia antes de decidir: se so um tem -1, ele e a anomalia e padroniza-lo costuma ser melhor que ensinar o monitor a tolerar nulo."
+    },
+    {
+      "titulo": "Espaco do filesystem do log",
+      "objetivo": "Com LOGSECOND = -1 este e o unico limite real. E em instancia com varios bancos, o vizinho pode ser o culpado.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "df -h <caminho do log>\ndf -h\nls -l <FAILARCHPATH>",
+      "olhar": "Se o filesystem do log estiver cheio, o problema nao e do banco que alertou - e de quem o encheu. Liste os bancos ativos da instancia e veja quem compartilha o caminho. FAILARCHPATH com arquivos dentro e sinal de que o arquivamento principal falhou em algum momento.",
+      "armadilha": "O caminho do log costuma NAO ser o mesmo do banco: um pode estar em /db2dbpath e o log em /db2logs01. Conferir o df do diretorio errado produz a conclusao errada com ar de evidencia - leia o 'Path to log files' do passo anterior em vez de supor."
+    },
+    {
+      "titulo": "Destravar o arquivamento",
+      "objetivo": "Quando o log nao pode ser liberado porque nao consegue ser arquivado, a correcao e no destino de archive.",
+      "risco": "mudanca",
+      "onde": "db2",
+      "antes_de_executar": "1) Confirmar pelo db2pd -logs que Next Log to Archive esta atrasado e que ha First Failure registrado. 2) Tratar a causa no destino (TSM fora, filesystem cheio, credencial expirada) ANTES de mexer no banco. 3) Registrar a acao.",
+      "comando": "-- forcar nova tentativa de arquivamento\ndb2 \"CALL SYSPROC.ADMIN_CMD('ARCHIVE LOG FOR DATABASE <BANCO>')\"\n\n-- conferir o resultado\ndb2pd -db <BANCO> -logs",
+      "olhar": "Next Log to Archive deve voltar a acompanhar o Current Log Number, e o Archive Status voltar a Success.",
+      "armadilha": "Aumentar LOGSECOND com o arquivamento travado troca 'log cheio' por 'filesystem cheio', que e pior de recuperar - o Db2 passa a criar arquivos que tambem nao conseguem ser arquivados. Trate o destino primeiro. E nao apague log a mao do diretorio ativo: log nao arquivado apagado e recuperabilidade perdida em silencio."
+    },
+    {
+      "titulo": "Alivio emergencial via LOGSECOND",
+      "objetivo": "Comprar espaco quando a causa e realmente dimensionamento e a aplicacao esta parando.",
+      "risco": "mudanca",
+      "onde": "db2",
+      "antes_de_executar": "1) Arquivamento confirmado saudavel (passo 3) - senao isto piora. 2) Espaco livre confirmado no filesystem do log (passo 6). 3) Registrar a acao. 4) Anotar o valor anterior para reverter.",
+      "comando": "db2 get db cfg for <BANCO> | grep -i LOGSECOND\ndb2 update db cfg for <BANCO> using LOGSECOND <novo valor>\ndb2 get db cfg for <BANCO> | grep -i LOGSECOND",
+      "olhar": "LOGSECOND e dinamico: vale na hora, sem desativar o banco. Confirme em SYSIBMADM.LOG_UTILIZATION que total_log_available_kb subiu e o percentual caiu.",
+      "armadilha": "LOGPRIMARY e LOGFILSIZ NAO sao dinamicos - exigem desativar o banco para valer, e por isso nao servem como alivio emergencial. Alterar os tres de uma vez achando que todos aplicam na hora e erro comum. E alivio nao e correcao: se a causa era transacao aberta, o log volta a encher com mais espaco do que antes."
+    },
+    {
+      "titulo": "Padronizar LOGSECOND quando o -1 for anomalia",
+      "objetivo": "Fazer o alarme voltar a medir algo, removendo a configuracao que impede o calculo.",
+      "risco": "mudanca",
+      "onde": "db2",
+      "antes_de_executar": "1) Comparar com os outros bancos da instancia: so vale se o -1 for exceção, nao o padrao. 2) Descobrir POR QUE alguem definiu -1 - se houve incidente com batch grande estourando o log, o -1 foi deliberado e a correcao pertence ao monitor. 3) Dimensionar o novo teto com folga larga sobre o pico observado. 4) Registrar a acao.",
+      "comando": "-- comparar a instancia inteira antes de decidir\ndb2 list active databases\ndb2 get db cfg for <OUTRO BANCO> | grep -i LOGSECOND\n\n-- padronizar\ndb2 update db cfg for <BANCO> using LOGSECOND <valor dos demais>",
+      "olhar": "Confirme em SYSIBMADM.LOG_UTILIZATION que log_utilization_percent saiu de NULO para um numero, e que total_log_available_kb passou a mostrar o teto. Ai o alarme volta a significar algo.",
+      "armadilha": "Fazer isso apenas para calar o alarme, sem conferir o pico de uso, troca logging infinito por um teto REAL - e um batch maior que o teto passa a derrubar a aplicacao com SQL0964C. Seria criar um problema para silenciar um aviso. Confira total_log_used_top_kb e lembre que ele so cobre o periodo desde a ativacao do banco: um banco reiniciado ha dois dias nao viu o fechamento mensal."
+    },
+    {
+      "titulo": "Fechar olhando a frota, nao so o banco",
+      "objetivo": "Se a causa foi metrica, ela se repete em todo banco com a mesma configuracao.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2 list active databases\n\n# para cada banco da instancia\ndb2 get db cfg for <BANCO> | grep -i LOGSECOND",
+      "olhar": "Liste quais bancos tem LOGSECOND = -1. Cada um deles gera o mesmo alarme permanente e consome plantao a cada disparo.",
+      "armadilha": "Fechar o chamado tratando so o banco que alertou deixa os vizinhos disparando na semana seguinte, e o proximo plantonista refaz a investigacao inteira. Uma varredura de dois minutos resolve todos - e se o -1 for intencional em algum deles, a saida ali e trocar o alarme de percentual por alarme de espaco no filesystem."
+    }
+  ],
+  "verificado": {
+    "nivel": "estrutura",
+    "em": "2026-09-23",
+    "observacao": "Nivel 'estrutura' porque nao existe cliente Db2 neste projeto: o VALIDAR_KB nao consegue executar nada aqui, e o carimbo automatico e a unica prova que a ferramenta aceita. Fica o registro honesto do que aconteceu fora dela: os passos 1 a 6, 9 e 10 foram executados por um DBA num caso real de producao em 23/09/2026 (Db2 11.5.9.0), com as saidas conferidas comando por comando - inclusive o LOG_UTILIZATION saindo de percentual NULO para 0.00 apos padronizar LOGSECOND. Os passos 7 e 8 (destravar arquivamento e alivio via LOGSECOND) NAO foram exercitados: o arquivamento estava saudavel e nao houve necessidade de alivio. Esses dois vieram da documentacao IBM - confira o texto exato antes de confiar neles."
+  }
+}

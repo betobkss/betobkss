@@ -1,0 +1,108 @@
+{
+  "id": "checklist_diario",
+  "ordem": 1,
+  "titulo": "Check list diario do banco (visao geral em 2 minutos)",
+  "quando_usar": "Comeco de turno, ou primeira coisa a fazer quando abrem um chamado sem sintoma claro ('o banco esta lento'). Da o retrato do ambiente antes de qualquer hipotese.",
+  "tags": [
+    "checklist",
+    "diario",
+    "visao geral",
+    "instancia",
+    "sessoes",
+    "sga",
+    "pga"
+  ],
+  "sintomas": [
+    "banco lento sem detalhe",
+    "chamado generico",
+    "inicio de turno"
+  ],
+  "secoes": [
+    "Saude da instancia",
+    "Sessoes",
+    "Topologia do ambiente"
+  ],
+  "fontes": [
+    "Pratica de campo: rotina de check list diario aplicada inumeras vezes em ambientes diversos, revisada e corrigida",
+    "Oracle Database Reference - V$INSTANCE, V$SGA, V$RESOURCE_LIMIT"
+  ],
+  "nota": "Este playbook consolida a rotina de check list diario em PL/SQL. Dois itens foram corrigidos aqui depois de conferencia pratica em ambiente real - estao marcados como 'armadilha' nos passos 3 e 4. O equivalente automatizado e: COLETAR.py <caso> --conn <banco> --rapido",
+  "passos": [
+    {
+      "titulo": "Identificar onde voce esta",
+      "objetivo": "Nunca diagnostique sem saber a instancia, o host e o papel. Em RAC/CDB e facil estar olhando o no ou o container errado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT i.instance_name, i.host_name, i.status, i.database_status,\n       TO_CHAR(i.startup_time,'DD/MM/YYYY HH24:MI:SS') AS startup,\n       d.name AS db_name, d.database_role, d.open_mode,\n       SYS_CONTEXT('USERENV','CON_NAME') AS container\nFROM v$instance i, v$database d;",
+      "olhar": "status=OPEN e database_status=ACTIVE. Se database_role nao for PRIMARY, voce esta num standby - nao aplique nada de escrita. Se container nao for CDB$ROOT, boa parte dos checks de instancia nao vai enxergar o que voce espera.",
+      "armadilha": "Startup recente que voce nao esperava significa que o banco reiniciou: v ao alert log ANTES de investigar performance, porque o cache esta frio e os numeros vao enganar."
+    },
+    {
+      "titulo": "Uptime e reinicios recentes",
+      "objetivo": "Reinicio nao planejado explica sozinho lentidao, plano diferente e cache frio.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT instance_number,\n       TO_CHAR(startup_time,'DD/MM/YYYY HH24:MI:SS') AS startup,\n       version, db_name, instance_name, host_name\nFROM dba_hist_database_instance\nORDER BY startup_time DESC FETCH FIRST 10 ROWS ONLY;",
+      "olhar": "Varias linhas com startup diferente em poucos dias = instabilidade. Em RAC, mostra tambem o chaveamento entre nos.",
+      "armadilha": "DBA_HIST_* exige Diagnostics Pack. Sem licenca, use V$INSTANCE.STARTUP_TIME (so o atual) ou o alert log."
+    },
+    {
+      "titulo": "Memoria: SGA e PGA de verdade",
+      "objetivo": "Saber quanta memoria o banco realmente usa, para comparar com a RAM do servidor.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT (SELECT ROUND(SUM(value)/1024/1024,2) FROM v$sga) AS sga_mb,\n       (SELECT ROUND(value/1024/1024,2) FROM v$pgastat\n         WHERE name='total PGA allocated') AS pga_alocada_mb,\n       (SELECT ROUND(value/1024/1024,2) FROM v$parameter\n         WHERE name='sga_target') AS sga_target_mb,\n       (SELECT ROUND(value/1024/1024,2) FROM v$parameter\n         WHERE name='pga_aggregate_target') AS pga_target_mb,\n       (SELECT ROUND(value/1024/1024,2) FROM v$parameter\n         WHERE name='memory_target') AS memory_target_mb\nFROM dual;",
+      "olhar": "SGA + PGA alocada perto da RAM do host = risco de swap. Compare com 'free -m' no SO (passo do playbook de recursos do SO).",
+      "armadilha": "ARMADILHA REAL, corrigida deste check list: tirar o 'tamanho da SGA' de v$sgastat WHERE name='fixed_sga' esta ERRADO - isso e so a area fixa. Conferido em banco real: reportava 8,76 MB quando a SGA era 5.120 MB (0,17% do valor). Use SUM(value) de V$SGA."
+    },
+    {
+      "titulo": "Versao e nivel de patch",
+      "objetivo": "A primeira pergunta da Oracle num SR. Tambem diz se voce esta exposto a bug ja corrigido.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT version, version_full FROM v$instance;\n\nSELECT description, TO_CHAR(action_time,'YYYY-MM-DD') AS aplicado_em\nFROM dba_registry_sqlpatch ORDER BY action_time DESC FETCH FIRST 5 ROWS ONLY;",
+      "olhar": "version_full traz o Release Update (ex.: 19.31.0.0.0). E ele que importa, nao o 19.0.0.0.0.",
+      "armadilha": "ARMADILHA REAL, corrigida deste check list: usar o parametro optimizer_features_enable como 'versao do Oracle' engana - ele e a versao de COMPORTAMENTO do otimizador e pode ter sido rebaixado de proposito. Conferido: dizia 19.1.0 num banco 19.31."
+    },
+    {
+      "titulo": "Sessoes e processos contra o limite",
+      "objetivo": "Chegar no limite de processes/sessions derruba login novo - e o erro aparece na aplicacao, nao no banco.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no CDB$ROOT (ou em banco nao-CDB):\nSELECT resource_name, current_utilization, max_utilization, limit_value,\n       CASE WHEN TRIM(limit_value) = 'UNLIMITED' THEN NULL\n            ELSE ROUND(100*current_utilization\n                       /NULLIF(TO_NUMBER(TRIM(limit_value)),0),1) END AS pct\nFROM v$resource_limit\nWHERE resource_name IN ('processes','sessions','transactions');\n\n-- dentro de um PDB a view acima vem VAZIA; use esta:\nSELECT (SELECT value FROM v$parameter WHERE name='processes') AS lim_processes,\n       (SELECT COUNT(*) FROM v$process) AS processos_agora,\n       (SELECT value FROM v$parameter WHERE name='sessions')  AS lim_sessions,\n       (SELECT COUNT(*) FROM v$session) AS sessoes_agora\nFROM dual;",
+      "olhar": "max_utilization e o PICO desde o startup: se ele encostou no limit_value, ja houve recusa de conexao mesmo que agora esteja tranquilo. Na consulta alternativa nao ha pico - so o instante atual.",
+      "armadilha": "ARMADILHA CONFIRMADA na pratica: dentro de um PDB, V$RESOURCE_LIMIT retorna ZERO LINHAS - nem os nomes dos recursos. Nao e 'valor diferente', e vazio, e passa despercebido como se estivesse tudo bem. processes/sessions sao recursos da INSTANCIA: para o pico, conecte no CDB$ROOT."
+    },
+    {
+      "titulo": "Sessoes por status e por usuario",
+      "objetivo": "Ver se ha acumulo anormal de sessao (INACTIVE que nao volta costuma ser pool da aplicacao vazando).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT NVL(username,'[BACKGROUND]') AS usuario, status,\n       COUNT(*) AS qtd\nFROM gv$session\nGROUP BY NVL(username,'[BACKGROUND]'), status\nORDER BY qtd DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "Muita sessao INACTIVE de um mesmo usuario/maquina = pool de conexao mal dimensionado ou aplicacao que nao devolve conexao.",
+      "armadilha": "INACTIVE nao quer dizer 'pode matar'. INACTIVE com transacao aberta segura undo e lock. Ver o playbook de sessoes e locks antes de matar qualquer coisa."
+    },
+    {
+      "titulo": "Espaco: tablespaces e diskgroups",
+      "objetivo": "Tablespace cheia para a aplicacao; diskgroup de archive cheio para o banco inteiro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, state, total_mb, free_mb,\n       ROUND((1-free_mb/NULLIF(total_mb,0))*100,2) AS pct_usado\nFROM v$asm_diskgroup ORDER BY pct_usado DESC;",
+      "olhar": "Diskgroup de ARCH acima de 85% e alarme: quando enche, o banco PARA (ORA-00257). Va direto para o playbook de archive.",
+      "armadilha": "V$ASM_DISKGROUP so retorna linha se a instancia enxerga o ASM. Em filesystem, use DBA_DATA_FILES/DBA_FREE_SPACE e 'df -h' no SO."
+    },
+    {
+      "titulo": "Erros recentes no alert log",
+      "objetivo": "Fecha o retrato: o que o banco vem reclamando nas ultimas horas.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(originating_timestamp,'DD/MM HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),CHR(13),' ')),1,140) AS mensagem\nFROM v$diag_alert_ext\nWHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(24,'HOUR')\n  AND REGEXP_LIKE(message_text,'ORA-[0-9]{4,5}')\nORDER BY originating_timestamp DESC FETCH FIRST 30 ROWS ONLY;",
+      "olhar": "Qualquer ORA-00600/ORA-07445 (erro interno) ou ORA-01578 (corrupcao) muda a prioridade de tudo: pare o diagnostico de performance e trate isso.",
+      "armadilha": "ARMADILHA REAL, conferida em banco: o filtro 'ORA-[0-9]{5}' (5 digitos) PERDE ORA-600, ORA-1092 e ORA-7445, que o banco escreve sem os zeros. Use ORA-[0-9]{4,5}. No mesmo teste, o filtro de 5 digitos achou 1 ocorrencia onde havia 2."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

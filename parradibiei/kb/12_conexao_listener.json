@@ -1,0 +1,131 @@
+{
+  "id": "conexao_listener",
+  "ordem": 12,
+  "titulo": "Aplicacao nao conecta (listener, TNS e limite de sessoes)",
+  "quando_usar": "Aplicacao recebe ORA-12154, ORA-12541, ORA-12514, ORA-12520 ou ORA-00020. Tambem quando 'o banco caiu' segundo a aplicacao, mas o banco esta no ar.",
+  "tags": [
+    "listener",
+    "tns",
+    "conexao",
+    "ORA-12154",
+    "ORA-12541",
+    "ORA-12514",
+    "processes",
+    "pool"
+  ],
+  "sintomas": [
+    "aplicacao nao conecta",
+    "TNS no listener",
+    "could not resolve connect identifier",
+    "listener does not know of service",
+    "maximum number of processes"
+  ],
+  "erros_ora": [
+    "ORA-12154",
+    "ORA-12541",
+    "ORA-12514",
+    "ORA-12520",
+    "ORA-12528",
+    "ORA-00020",
+    "ORA-12170"
+  ],
+  "secoes": [
+    "Conexao",
+    "Listener",
+    "Sessoes",
+    "Servicos"
+  ],
+  "fontes": [
+    "Oracle Database Net Services Administrator's Guide - Testing Connections, Troubleshooting",
+    "Oracle Database Reference - V$RESOURCE_LIMIT, V$SERVICES, V$LISTENER_NETWORK"
+  ],
+  "nota": "Cada erro aponta um ponto DIFERENTE do caminho, e isso economiza horas: ORA-12154 = o cliente nao resolveu o nome (problema no tnsnames/EZConnect do CLIENTE, o banco nem foi procurado). ORA-12541 = achou o endereco mas nao ha listener escutando. ORA-12514 = o listener atendeu mas nao conhece o SERVICE pedido. ORA-12520/12528 = o listener conhece mas nao ha handler disponivel (banco em MOUNT, ou saturado). ORA-00020 = chegou no banco e bateu no limite de processes.",
+  "passos": [
+    {
+      "titulo": "Confirmar se o banco esta realmente no ar",
+      "objetivo": "Antes de investigar rede, elimine o obvio. Nem sempre 'nao conecta' significa listener.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT instance_name, host_name, status, database_status,\n       TO_CHAR(startup_time,'DD/MM/YYYY HH24:MI:SS') AS startup,\n       logins\nFROM v$instance;\n\nSELECT name, open_mode, database_role FROM v$database;",
+      "olhar": "status deve ser OPEN e logins = ALLOWED. Se status for MOUNTED, o listener responde mas recusa conexao de aplicacao (ORA-12528). Se logins = RESTRICTED, so DBA entra - e a causa que mais engana.",
+      "armadilha": "Voce chegou ate aqui por SQL*Plus, entao a sua conexao funciona. Isso NAO significa que a da aplicacao funciona: usuario, service name e origem de rede podem ser diferentes."
+    },
+    {
+      "titulo": "Ver os servicos que o banco registra",
+      "objetivo": "ORA-12514 quase sempre e service name errado - do lado do cliente ou do lado do registro.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, network_name, creation_date, pdb\nFROM v$services ORDER BY name;\n\nSELECT value AS service_names FROM v$parameter WHERE name='service_names';\nSELECT value AS local_listener  FROM v$parameter WHERE name='local_listener';",
+      "olhar": "O service que a aplicacao usa TEM de aparecer aqui, escrito exatamente igual. Em CDB, cada PDB tem seu proprio service - conectar no service do CDB nao da acesso ao PDB.",
+      "armadilha": "SID e SERVICE NAME sao coisas diferentes. String de conexao antiga com ':SID' em vez de '/SERVICE' funciona em alguns casos e falha em outros (especialmente em RAC e CDB). O padrao do ambiente e host:1529/SERVICE."
+    },
+    {
+      "titulo": "Perguntar ao listener o que ele conhece",
+      "objetivo": "Ver o mundo pela otica do listener, que e quem recusa a conexao.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "lsnrctl status\nlsnrctl services",
+      "olhar": "Em 'services', cada service precisa ter pelo menos um handler com status READY. 'BLOCKED' significa banco em MOUNT (ORA-12528). Se o service nem aparece, o banco nao se registrou no listener.",
+      "armadilha": "Registro dinamico (PMON) leva ate ~60 segundos apos o startup. Um service ausente logo depois de subir o banco pode ser so espera - confira de novo antes de mexer em configuracao. Se persistir, o suspeito e o parametro local_listener."
+    },
+    {
+      "titulo": "Testar a resolucao de nome do lado do cliente",
+      "objetivo": "ORA-12154 e problema do CLIENTE: ele nem chegou a falar com o servidor.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "tnsping <alias_ou_host:porta/service>\nping <host_do_banco>\nnslookup <host_do_banco>",
+      "olhar": "tnsping OK prova que o alias resolve e o listener responde. Se o tnsping falha mas o ping funciona, o problema e TNS (alias/porta/service), nao rede.",
+      "armadilha": "tnsping usa o tnsnames.ora do TNS_ADMIN daquela maquina e daquele usuario do SO. Testar no seu terminal nao prova nada sobre o servidor de aplicacao: o teste tem de ser feito de ONDE a aplicacao roda."
+    },
+    {
+      "titulo": "Verificar o limite de sessoes e processos",
+      "objetivo": "ORA-00020 e recusa por saturacao, nao por configuracao. O sintoma na aplicacao e identico.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT resource_name, current_utilization, max_utilization,\n       initial_allocation, limit_value\nFROM v$resource_limit\nWHERE resource_name IN ('processes','sessions','transactions');\n\n-- de onde vem a maior parte das conexoes:\nSELECT NVL(machine,'[?]') AS origem, NVL(username,'[BACKGROUND]') AS usuario,\n       status, COUNT(*) AS sessoes\nFROM gv$session\nGROUP BY machine, username, status\nORDER BY sessoes DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "max_utilization encostando em limit_value confirma que ja houve recusa. Uma unica maquina com centenas de sessoes INACTIVE e pool de conexao mal configurado ou vazando.",
+      "armadilha": "Aumentar 'processes' parece a solucao, mas cada processo dedicado consome memoria no servidor: subir o limite sem RAM leva a swap e derruba o banco inteiro em vez de recusar algumas conexoes. Trate o pool antes do parametro."
+    },
+    {
+      "titulo": "Procurar erros de conexao registrados no banco",
+      "objetivo": "O alert log e o listener log guardam a recusa com horario e origem.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(originating_timestamp,'DD/MM HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),\n                           CHR(13),' ')),1,160) AS mensagem\nFROM v$diag_alert_ext\nWHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(2,'DAY')\n  AND REGEXP_LIKE(message_text,'ORA-0*(20|125[0-9][0-9]|12170)|TNS-')\nORDER BY originating_timestamp DESC FETCH FIRST 30 ROWS ONLY;",
+      "olhar": "Concentracao de recusas num horario aponta pico de carga ou restart do servidor de aplicacao (tempestade de reconexao). Sem nada aqui, a recusa aconteceu ANTES de chegar ao banco: e listener ou rede.",
+      "armadilha": "O listener tem log proprio (listener.log, no ADR do Grid/OH), que NAO aparece nesta consulta. ORA-12514 e ORA-12541 tipicamente so estao la."
+    },
+    {
+      "titulo": "Ver o listener log pelo ADRCI",
+      "objetivo": "Onde ficam registradas as tentativas que o listener recusou, com IP de origem.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "adrci exec=\"show homes\"\nadrci exec=\"set homepath diag/tnslsnr/<host>/listener; show alert -tail 100\"",
+      "olhar": "Procure TNS-12514 (service desconhecido), TNS-12520 (sem handler) e o campo HOST= das linhas de conexao: identifica de qual servidor de aplicacao vem a tentativa que falha.",
+      "armadilha": "Em ambiente com Grid Infrastructure, o listener roda do Grid Home e o ADR dele fica separado do banco. Rodar 'show homes' primeiro evita procurar no lugar errado."
+    },
+    {
+      "titulo": "Registrar o banco no listener manualmente",
+      "objetivo": "Quando o service nao aparece no listener e o banco esta OPEN, forcar o registro imediato.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme que o banco esta OPEN (passo 1) e que o service existe (passo 2) - senao nao ha o que registrar. 2) Confirme o parametro local_listener apontando para o listener certo. 3) O comando e leve e reversivel (nao derruba conexao existente), mas ainda e ALTER SYSTEM: registre a acao. 4) Se o registro cair de novo depois, o problema e local_listener ou o listener nao estar no ar - trate a causa.",
+      "comando": "SHOW PARAMETER local_listener\n\nALTER SYSTEM REGISTER;",
+      "olhar": "Repita 'lsnrctl services' (passo 3): o service deve aparecer com handler READY em segundos.",
+      "armadilha": "ALTER SYSTEM REGISTER resolve o sintoma. Se o service some toda vez que o banco reinicia, o local_listener esta errado ou o listener sobe depois do banco - a correcao e de configuracao, nao esse comando."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Recusa de conexao em massa quase sempre e pool de aplicacao, nao banco.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- sessoes ociosas ha muito tempo, por origem (pool vazando):\nSELECT machine, program, COUNT(*) AS sessoes,\n       ROUND(AVG(last_call_et)/60) AS media_min_ocioso,\n       ROUND(MAX(last_call_et)/60) AS max_min_ocioso\nFROM gv$session\nWHERE status = 'INACTIVE' AND username IS NOT NULL\nGROUP BY machine, program\nHAVING COUNT(*) > 5\nORDER BY sessoes DESC;",
+      "olhar": "Muitas sessoes ociosas ha horas, vindas da mesma maquina, indicam pool dimensionado acima do necessario ou conexao que a aplicacao nao devolve. A correcao e no pool (tamanho maximo, timeout de ocioso), nao no banco.",
+      "armadilha": "Matar essas sessoes 'para liberar' costuma piorar: o pool reconecta em rajada e voce troca sessoes ociosas por uma tempestade de login. Ajuste o pool com o time de aplicacao."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

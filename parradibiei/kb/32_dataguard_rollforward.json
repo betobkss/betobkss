@@ -1,0 +1,176 @@
+{
+  "id": "dataguard_rollforward",
+  "ordem": 32,
+  "titulo": "Standby com gap irresolvivel - roll-forward incremental (em vez de recriar)",
+  "quando_usar": "O broker acusa ORA-16724/ORA-16783 ou v$database.switchover_status = UNRESOLVABLE GAP, e os archives que faltam nao existem mais nem no primario nem em backup. Use ANTES de cogitar DROP DATABASE + DUPLICATE: se os datafiles do standby estao integros, reconstruir e desproporcional.",
+  "tags": [
+    "dataguard",
+    "standby",
+    "gap",
+    "unresolvable",
+    "roll-forward",
+    "incremental",
+    "recover from service",
+    "duplicate",
+    "broker",
+    "cdb"
+  ],
+  "sintomas": [
+    "UNRESOLVABLE GAP em v$database.switchover_status",
+    "broker com erro cannot resolve gap",
+    "MRP0 parado em WAIT_FOR_GAP",
+    "gap de centenas ou milhares de sequencias",
+    "archives do gap apagados do disco e da fita"
+  ],
+  "erros_ora": [
+    "ORA-16724",
+    "ORA-16783",
+    "ORA-16854",
+    "ORA-19554",
+    "ORA-27000",
+    "ORA-19511"
+  ],
+  "secoes": [
+    "Data Guard",
+    "Standby",
+    "Recuperabilidade",
+    "RMAN"
+  ],
+  "fontes": [
+    "Oracle Data Guard Concepts and Administration - Resolving Archive Gaps",
+    "Oracle Database Backup and Recovery User's Guide - Rolling Forward a Physical Standby Using RMAN Incremental Backups",
+    "Caso real (09/2026): CDB de 6,1 TB, gap de 1.668 sequencias, resolvido em 37 minutos por roll-forward"
+  ],
+  "nota": "A regra de ouro: gap grande NAO significa standby quebrado. Antes de decidir, separe as duas perguntas - 'quanto falta?' (tamanho do atraso) e 'os datafiles estao integros?' (v$datafile_header). Se os datafiles estao ONLINE e sem erro, o standby esta ATRASADO, nao corrompido, e o roll-forward transfere so os blocos alterados. Um DUPLICATE joga fora datafiles saudaveis para copia-los de novo pela rede.",
+  "passos": [
+    {
+      "titulo": "Confirmar em que host e em que papel voce esta",
+      "objetivo": "Toda operacao daqui em diante e no standby. Executar no primario por engano e perda total.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT SYS_CONTEXT('USERENV','SERVER_HOST') AS host,\n       db_unique_name, database_role, open_mode,\n       switchover_status, protection_mode, dbid\nFROM   v$database;",
+      "olhar": "database_role tem de ser PHYSICAL STANDBY e o host tem de ser o do standby. switchover_status = UNRESOLVABLE GAP confirma o cenario deste playbook.",
+      "armadilha": "Inventario e roteiro antigo envelhecem: um switchover troca os papeis sem avisar ninguem. NUNCA confie no nome do host, no titulo do runbook ou no que o time disse - confie no SELECT. No caso real, o inventario de 8 dias antes dizia que aquele banco era o standby; era o primario."
+    },
+    {
+      "titulo": "Medir o gap dos dois lados",
+      "objetivo": "Saber o tamanho do buraco e se o primario ainda tem como preenche-lo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no STANDBY:\nSELECT * FROM v$archive_gap;\nSELECT thread#, MAX(sequence#) AS ultima_aplicada\nFROM   v$archived_log WHERE applied = 'YES' GROUP BY thread#;\n\n-- no PRIMARIO:\nSELECT thread#, MIN(sequence#) AS menor_em_disco, MAX(sequence#) AS maior\nFROM   v$archived_log\nWHERE  deleted = 'NO' AND standby_dest = 'NO' GROUP BY thread#;\nSELECT thread#, MAX(sequence#) AS sequencia_atual FROM v$log GROUP BY thread#;",
+      "olhar": "Se a menor sequencia em disco no primario for MAIOR que a que o standby precisa, o FAL nao tem de onde buscar - e por isso que o gap e 'irresolvivel'.",
+      "armadilha": "O broker tambem mostra 'Transport Lag' e 'Apply Lag'. Se os dois forem IDENTICOS, o transporte morreu (nao e apply lento) - e a hora da quebra e 'agora menos o lag'. Esse numero costuma corrigir a linha do tempo que voce montou por outros indicios."
+    },
+    {
+      "titulo": "Provar que o standby esta integro - a decisao entre roll-forward e DUPLICATE",
+      "objetivo": "Este e o passo que evita reconstruir um banco inteiro sem necessidade.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no STANDBY:\nSELECT status, COUNT(*) FROM v$datafile_header GROUP BY status;\nSELECT file#, status, error FROM v$datafile_header WHERE error IS NOT NULL;\nSELECT * FROM v$recover_file;\n\n-- tamanho, para dimensionar o que um DUPLICATE custaria:\nSELECT ROUND(SUM(bytes)/1024/1024/1024,1) AS db_gb FROM v$datafile;",
+      "olhar": "Todos ONLINE e 'no rows selected' nos erros = datafiles integros = roll-forward. Datafile faltando, OFFLINE ou com erro = ai sim avalie DUPLICATE.",
+      "armadilha": "Compare o db_gb com o volume de blocos alterados no periodo do gap. No caso real eram 6,1 TB de banco para 6 dias de mudancas: o DUPLICATE transferiria 6.256 GB, o roll-forward levou 37 minutos. Faca essa conta ANTES de aceitar um roteiro de reconstrucao."
+    },
+    {
+      "titulo": "Conferir os pre-requisitos sem precisar de senha",
+      "objetivo": "O transporte via servico autentica pelo password file. Os arquivos precisam ser identicos - nao e preciso saber a senha.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# nos DOIS hosts, comparar os password files:\nmd5sum $ORACLE_HOME/dbs/orapw<db_unique_name>\n\n# resolucao de nome dos dois lados:\ntnsping <primario>    # rodado no host do standby\ntnsping <standby>     # rodado no primario",
+      "olhar": "md5 identico = autenticacao garantida. Se diferir, COPIE o do primario para o standby (scp) e renomeie - nunca recrie com orapwd no primario.",
+      "armadilha": "tnsping so prova que UM listener respondeu; ele nao valida SID nem autentica. Com ADDRESS_LIST e FAILOVER=ON apontando os dois hosts, o tnsping do standby pode dar OK contatando o listener do primario. A prova real de autenticacao e o destino estar VALID em v$archive_dest_status - se o password file estivesse errado, o erro seria ORA-16191, nao gap."
+    },
+    {
+      "titulo": "Desligar o apply PELO BROKER",
+      "objetivo": "O RECOVER exige o MRP parado (RMAN-05150). Parar pelo sqlplus nao adianta quando ha broker.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Confirme que esta no standby (passo 1). 2) O standby sai de servico para consulta read-only - avise quem usa a replica. 3) Registre a acao no caso.",
+      "comando": "dgmgrl /\n  SHOW DATABASE <standby>;\n  EDIT DATABASE <standby> SET STATE='APPLY-OFF';\n  SHOW DATABASE <standby>;\n\n-- confirmar no sqlplus que o MRP morreu:\nSELECT process, status FROM v$managed_standby WHERE process LIKE 'MRP%';",
+      "olhar": "Intended State: APPLY-OFF no broker e 'no rows selected' na consulta do MRP.",
+      "armadilha": "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL nao segura: o broker tem o estado pretendido APPLY-ON e reinicia o MRP sozinho, inclusive apos um restart de instancia. Quem manda e a camada de cima - fale a lingua dela."
+    },
+    {
+      "titulo": "Levar o standby a MOUNT pelo srvctl",
+      "objetivo": "O roll-forward exige MOUNT. Com Oracle Restart / CRS, o shutdown manual e revertido.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Anote a opcao de inicio configurada - e para ela que voce volta no fim. 2) Confirme que nenhuma aplicacao consulta a replica.",
+      "comando": "srvctl config database -d <standby> | grep -i -E 'start option|role|spfile'\n\nsrvctl stop database  -d <standby>\nsrvctl start database -d <standby> -startoption MOUNT\nsrvctl status database -d <standby>\n\n-- confirmar:\nSELECT db_unique_name, database_role, open_mode FROM v$database;",
+      "olhar": "open_mode = MOUNTED. O -startoption vale so para este start; a configuracao permanente continua a mesma.",
+      "armadilha": "Se 'Start options' for 'read only' (Active Data Guard) e voce der SHUTDOWN IMMEDIATE pelo sqlplus, o agente do CRS reabre o banco em READ ONLY - exatamente o estado do qual voce esta tentando sair. Use srvctl."
+    },
+    {
+      "titulo": "Salvaguardas baratas antes de mexer",
+      "objetivo": "O roll-forward nao destroi datafile, mas reescreve controlfile e spfile. Guardar os dois custa segundos.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "Banco ja em MOUNT. Confirme espaco no diretorio de destino (o controlfile de um CDB grande pode ter mais de 100 MB).",
+      "comando": "# no SO, o spfile:\ncp -p $ORACLE_HOME/dbs/spfile<sid>.ora $ORACLE_HOME/dbs/spfile<sid>.ora.pre_rollforward\n\n-- no sqlplus, o controlfile (exige MOUNT):\nALTER DATABASE BACKUP CONTROLFILE TO '<caminho>/ctl_<sid>_pre_rollforward.bkp';",
+      "olhar": "Confira tamanho e timestamp dos dois arquivos. E o que transforma 'deu errado' em 'volta em 5 minutos'.",
+      "armadilha": "Nao pule por achar que o procedimento e seguro. Ele e - para os datafiles. Controlfile e spfile sao justamente os arquivos que o comando altera, e sao pequenos e triviais de guardar."
+    },
+    {
+      "titulo": "Atualizar o controlfile do standby a partir do primario",
+      "objetivo": "O controlfile antigo nao conhece o que mudou no primario durante o gap. Sem ele, o roll-forward fica incompleto.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Standby em MOUNT, MRP desligado. 2) Salvaguardas do passo anterior feitas. 3) Registre a acao.",
+      "comando": "rman target /\nRESTORE STANDBY CONTROLFILE FROM SERVICE '<primario>';\nALTER DATABASE MOUNT STANDBY DATABASE;\n\n-- re-catalogar os datafiles que ja existem no standby:\nCATALOG START WITH '+<DISKGROUP>/<DB>/DATAFILE/' NOPROMPT;\nSWITCH DATABASE TO COPY;",
+      "olhar": "As linhas 'cataloged datafile copy' sao a prova de que os datafiles existentes serao REAPROVEITADOS - nenhum dos TB esta sendo copiado.",
+      "armadilha": "O controlfile carrega junto a configuracao de RMAN do PRIMARIO - inclusive CONFIGURE DEFAULT DEVICE TYPE e os canais SBT com o optfile do primario. Qualquer ajuste de device type feito ANTES deste passo e perdido aqui. Ajuste DEPOIS (proximo passo)."
+    },
+    {
+      "titulo": "Forcar dispositivo DISK antes do roll-forward",
+      "objetivo": "Impedir que o RMAN tente alocar canal de fita num host onde a media manager nao responde.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "Fazer SEMPRE depois do restore do controlfile, nunca antes.",
+      "comando": "rman target /\nSHOW ALL;\nCONFIGURE DEFAULT DEVICE TYPE TO DISK;\nSHOW DEFAULT DEVICE TYPE;",
+      "olhar": "Anote tambem CONFIGURE ARCHIVELOG DELETION POLICY - se estiver TO NONE, voce acabou de achar a causa raiz do incidente (veja o ultimo passo).",
+      "armadilha": "Nao limpe a configuracao de SBT: ela nao atrapalha enquanto nao for o padrao, e apagar configuracao alheia e como se perdem coisas. Mude so o DEFAULT. Atencao tambem se o ambiente usa catalogo: 'rman target /' grava no controlfile, nao no catalogo, e a divergencia volta no proximo resync - anote como pendencia."
+    },
+    {
+      "titulo": "Executar o roll-forward incremental pela rede",
+      "objetivo": "Transferir apenas os blocos alterados desde o ponto em que o standby parou.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Standby em MOUNT, MRP OFF, device type DISK, salvaguardas feitas. 2) Rode em sessao que sobreviva a queda do SSH (nohup com cmdfile, ou tmux) - em banco grande sao dezenas de minutos e perder a conexao custa a janela. 3) Combine janela: a leitura acontece no PRIMARIO e concorre por IO. 4) Registre a acao.",
+      "comando": "# arquivo de comandos (fica como registro do que foi executado):\ncat rollforward.rman\nRUN {\n  ALLOCATE CHANNEL c1 DEVICE TYPE DISK;\n  ALLOCATE CHANNEL c2 DEVICE TYPE DISK;\n  ALLOCATE CHANNEL c3 DEVICE TYPE DISK;\n  ALLOCATE CHANNEL c4 DEVICE TYPE DISK;\n  RECOVER DATABASE FROM SERVICE <primario>;\n}\n\nnohup rman target / cmdfile=rollforward.rman log=rollforward.log > /dev/null 2>&1 &\n\n# acompanhar:\ntail -f rollforward.log\nSELECT sid, opname, ROUND(sofar/NULLIF(totalwork,0)*100,1) AS pct\nFROM   v$session_longops WHERE totalwork > 0 AND sofar < totalwork;",
+      "olhar": "'using network backup set from service' confirma que vem do primario pela rede, nao de fita. No fim, 'Finished recover' e 'Recovery Manager complete.'. Se 'media recovery complete, elapsed time: 00:00:00', nenhum archive foi necessario - o incremental cobriu tudo.",
+      "armadilha": "Use RECOVER DATABASE FROM SERVICE, NAO 'RECOVER STANDBY DATABASE FROM SERVICE'. O segundo reinicia a instancia e restaura o controlfile A CADA EXECUCAO - ou seja, desfaz no primeiro passo o CONFIGURE ... TO DISK de que ele precisa no segundo, e falha em loop com ORA-19554/ORA-27000 onde houver SBT configurado. O log parecer congelado e normal: o RMAN so escreve quando cada datafile termina; confirme progresso por v$session_longops e pelo evento 'RMAN backup & recovery I/O' com seconds_in_wait = 0."
+    },
+    {
+      "titulo": "Validar os headers por container antes de religar o apply",
+      "objetivo": "Garantir que todos os datafiles avancaram, e distinguir atraso real de PDB$SEED congelado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT (SELECT COUNT(*) FROM v$datafile)        AS no_controlfile,\n       (SELECT COUNT(*) FROM v$datafile_header) AS com_header FROM dual;\n\nSELECT con_id, COUNT(*) AS qtd,\n       MIN(checkpoint_change#) AS scn_min,\n       MAX(checkpoint_change#) AS scn_max\nFROM   v$datafile_header GROUP BY con_id ORDER BY con_id;\n\nSELECT file#, con_id, checkpoint_change#, status\nFROM   v$datafile_header WHERE checkpoint_change# < <scn_novo> ORDER BY file#;",
+      "olhar": "no_controlfile = com_header (nenhum arquivo sem resposta). Dentro de cada con_id, scn_min e scn_max praticamente iguais. Se sobrar algum atrasado, compare o mesmo con_id no PRIMARIO antes de concluir que ha problema.",
+      "armadilha": "Em CDB, MIN(checkpoint_change#) NAO mede o atraso do standby: ele devolve o SCN congelado do PDB$SEED (con_id 2), que e read-only e nunca avanca. Quebre sempre por con_id. Se voce usar esse MIN como 'FROM SCN' no metodo classico, faz um incremental muito maior que o necessario. E numero de datafile nao e contagem: a numeracao tem lacunas, 'datafile 47' pode ser o 29o arquivo."
+    },
+    {
+      "titulo": "Religar o apply e devolver o standby ao estado de projeto",
+      "objetivo": "Fechar o ciclo: MRP aplicando em tempo real e o banco no modo em que estava.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "Passo de validacao concluido sem pendencia. Registre a acao.",
+      "comando": "dgmgrl /\n  EDIT DATABASE <standby> SET STATE='APPLY-ON';\n  SHOW DATABASE <standby>;\n\n-- confirmar o MRP e a ausencia de gap:\nSELECT process, status, thread#, sequence# FROM v$managed_standby WHERE process LIKE 'MRP%';\nSELECT * FROM v$archive_gap;\nSELECT name, value, time_computed FROM v$dataguard_stats WHERE name LIKE '%lag%';\n\n# voltar ao modo configurado (ex.: Active Data Guard):\nsrvctl stop database  -d <standby>\nsrvctl start database -d <standby>",
+      "olhar": "MRP0 em APPLYING_LOG com sequence#/block# avancando entre duas consultas, v$archive_gap vazio, apply lag +00 00:00:00 e broker em SUCCESS.",
+      "armadilha": "ORA-16854 'apply lag could not be determined' logo apos religar e transitorio: o broker precisa de duas medidas para calcular. Espere alguns minutos e, principalmente, reabra em READ ONLY - so ai 'Real Time Query' volta a ON. No srvctl final NAO passe -startoption: deixe o CRS usar a opcao configurada."
+    },
+    {
+      "titulo": "Corrigir a causa raiz - politica de delecao de archive",
+      "objetivo": "Sem isto, o mesmo incidente se repete. O roll-forward trata o sintoma.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Esta mudanca e no PRIMARIO. 2) Combine ANTES o alarme de espaco do item da armadilha - a correcao troca um risco por outro. 3) Aprovacao formal, e mudanca de politica de backup.",
+      "comando": "-- no PRIMARIO:\nRMAN> SHOW ARCHIVELOG DELETION POLICY;\nRMAN> CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;",
+      "olhar": "Com a politica ativa, o RMAN se RECUSA a apagar archive nao aplicado na replica, mesmo obsoleto pela janela de retencao. O gap continua podendo existir, mas continua RESOLVIVEL.",
+      "armadilha": "Efeito colateral real: se o standby ficar parado, os archives param de ser apagados e o destino enche - ORA-00257 no primario, que trava escrita em producao. A politica troca 'gap silencioso' por 'alarme de espaco'. So faca a mudanca junto com o alarme de espaco no destino de archive E o alarme de lag de Data Guard. Note ainda que RECOVERY WINDOW governa a obsolescencia dos BACKUPS, nao a remocao dos archives do disco - quem apaga o archive costuma ser o job de backup com DELETE INPUT."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-21"
+  }
+}

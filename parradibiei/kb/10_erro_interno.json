@@ -1,0 +1,130 @@
+{
+  "id": "erro_interno",
+  "ordem": 10,
+  "titulo": "Erro interno do Oracle (ORA-00600 / ORA-07445)",
+  "quando_usar": "ORA-00600, ORA-07445 ou ORA-00700 no alert log. Muda a prioridade de tudo: pare o diagnostico de performance e trate isto primeiro.",
+  "tags": [
+    "ORA-600",
+    "ORA-7445",
+    "erro interno",
+    "bug",
+    "trace",
+    "adrci",
+    "incident",
+    "SR",
+    "MOS"
+  ],
+  "sintomas": [
+    "ORA-00600",
+    "ORA-07445",
+    "erro interno",
+    "sessao morrendo",
+    "instancia reiniciando sozinha"
+  ],
+  "erros_ora": [
+    "ORA-00600",
+    "ORA-07445",
+    "ORA-00700",
+    "ORA-03113"
+  ],
+  "secoes": [
+    "Alert log",
+    "Erros do banco",
+    "Integridade"
+  ],
+  "fontes": [
+    "MOS Doc ID 153788.1 - ORA-600/ORA-7445/ORA-700 Error Look-up Tool",
+    "Oracle - Troubleshooting Internal Errors (blogs.oracle.com/connect)",
+    "ORACLE-BASE - ORA-00600/ORA-07445/ORA-00700: How to Diagnose and Fix Them",
+    "Oracle Database Administrator's Guide - Automatic Diagnostic Repository (ADR)"
+  ],
+  "nota": "A DIFERENCA IMPORTA: ORA-00600 e um erro que a Oracle PREVIU e tratou - o codigo detectou uma inconsistencia e abortou de proposito. ORA-07445 e o sistema operacional matando o processo (violacao de memoria); nao foi previsto. O que resolve o caso e o PRIMEIRO ARGUMENTO entre colchetes - e ele que se pesquisa, nao o numero do erro, que e generico.",
+  "passos": [
+    {
+      "titulo": "Extrair o erro e o primeiro argumento",
+      "objetivo": "O argumento entre colchetes e a chave de tudo. Sem ele nao ha pesquisa possivel.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(originating_timestamp,'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),\n                           CHR(13),' ')),1,200) AS mensagem\nFROM v$diag_alert_ext\nWHERE REGEXP_LIKE(message_text,'ORA-0*(600|7445|700)')\n  AND originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(30,'DAY')\nORDER BY originating_timestamp DESC FETCH FIRST 30 ROWS ONLY;",
+      "olhar": "Anote o texto exato: ORA-00600: internal error code, arguments: [<PRIMEIRO ARGUMENTO>], [...]. Esse primeiro argumento (ex.: kdsgrp1, qctcte1, 17147) e o que identifica o bug. Conte tambem QUANTAS vezes ocorreu - uma vez ha 3 meses e diferente de 40 vezes hoje.",
+      "armadilha": "O banco escreve 'ORA-600' (sem zeros) no alert log e 'ORA-00600' na documentacao. Filtro que so procura uma das formas perde metade das ocorrencias - por isso o regex acima aceita as duas."
+    },
+    {
+      "titulo": "Localizar o trace e o incidente no ADR",
+      "objetivo": "O trace tem a pilha de chamadas que a Oracle precisa. Sem ele nao ha SR util.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, value FROM v$diag_info;",
+      "olhar": "'Diag Trace' e a pasta dos traces; 'Diag Alert' o alert log em XML; 'Default Trace File' o trace da sua sessao. Anote o ADR Home - e o que o adrci vai usar.",
+      "armadilha": "Em RAC, cada no tem seu proprio ADR home. O incidente pode estar em outro no que nao o que voce conectou."
+    },
+    {
+      "titulo": "Listar os incidentes registrados",
+      "objetivo": "O Oracle cria um 'incident' para cada erro interno, com todo o material ja agrupado.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "adrci exec=\"show homes\"\nadrci exec=\"set homepath diag/rdbms/<db>/<instancia>; show incident\"\nadrci exec=\"set homepath diag/rdbms/<db>/<instancia>; show problem\"",
+      "olhar": "SHOW PROBLEM agrupa por chave (ex.: 'ORA 600 [kdsgrp1]') e mostra quantos incidentes existem e desde quando. E o retrato do quanto o bug esta ativo.",
+      "armadilha": "O ADR faz purga automatica (padrao 30 dias para incidentes, 1 ano para metadados). Se o erro e antigo, o trace pode ja ter sido apagado - colete ANTES de qualquer limpeza."
+    },
+    {
+      "titulo": "Avaliar o impacto real",
+      "objetivo": "Decidir a urgencia. Erro interno que derruba a instancia e P1; erro numa sessao isolada, nao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- a instancia reiniciou junto?\nSELECT instance_name, status,\n       TO_CHAR(startup_time,'DD/MM/YYYY HH24:MI:SS') AS startup\nFROM v$instance;\n\n-- outros erros graves na mesma janela:\nSELECT TO_CHAR(originating_timestamp,'DD/MM HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(message_text,CHR(10),' ')),1,140) AS mensagem\nFROM v$diag_alert_ext\nWHERE originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(2,'DAY')\n  AND REGEXP_LIKE(message_text,'ORA-[0-9]{4,5}')\nORDER BY originating_timestamp DESC FETCH FIRST 40 ROWS ONLY;",
+      "olhar": "Startup logo apos o ORA-600 = a instancia caiu por causa dele. ORA-01578 ou ORA-00600 [kdsgrp1] na mesma janela apontam CORRUPCAO - mude para o playbook de corrupcao de bloco.",
+      "armadilha": "Erro interno em processo de background (SMON, PMON, LGWR) e muito mais grave que na sessao de um usuario: costuma derrubar a instancia. Veja no trace qual processo gerou."
+    },
+    {
+      "titulo": "Verificar se ha corrupcao associada",
+      "objetivo": "Boa parte dos ORA-600 mais assustadores e consequencia de bloco corrompido, nao de bug de codigo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT file#, block#, blocks, corruption_change#, corruption_type\nFROM v$database_block_corruption;",
+      "olhar": "Qualquer linha aqui muda o caso: pare este playbook e va para o de corrupcao de bloco. Vazio nao prova ausencia - a view so lista o que ja foi detectado por RMAN/leitura.",
+      "armadilha": "Vazio da falsa seguranca. Se o ORA-600 tem argumento tipico de corrupcao (kdsgrp1, ktbdchk1, kcbzib), rode o RMAN VALIDATE do playbook de corrupcao mesmo com a view vazia."
+    },
+    {
+      "titulo": "Pesquisar o primeiro argumento no MOS",
+      "objetivo": "Descobrir se e bug conhecido, com patch ou workaround publicado - o caminho mais rapido para a solucao.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "# Nao ha comando: e consulta ao My Oracle Support.\n# 1. support.oracle.com -> buscar \"600.1\" ou Doc ID 153788.1\n#    (ORA-600/ORA-7445/ORA-700 Error Look-up Tool)\n# 2. Escolher o tipo (ORA-600 / ORA-7445 / ORA-700)\n# 3. Informar o PRIMEIRO ARGUMENTO (o de dentro do primeiro [ ])\n# 4. Informar a versao EXATA: SELECT version_full FROM v$instance;",
+      "olhar": "Se o bug e conhecido, a ferramenta aponta a nota com workaround ou o patch. Confira se o patch ja esta no seu Release Update antes de pedir - o check patch_level do framework mostra o RU atual.",
+      "armadilha": "Pesquisar 'ORA-00600' no Google traz milhares de casos que NAO sao o seu: o numero e generico, o argumento e que identifica. Aplicar workaround de outro argumento pode piorar."
+    },
+    {
+      "titulo": "Empacotar o incidente para o SR",
+      "objetivo": "Se nao ha bug conhecido, o caminho e abrir SR - e ele so anda com o pacote de diagnostico completo.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "adrci exec=\"set homepath diag/rdbms/<db>/<instancia>; ips pack incident <id> in /tmp\"\n\n# alternativa, se o Oracle AHF/TFA estiver instalado (colhe os dois nos do RAC):\ntfactl diagcollect -srdc ora600\ntfactl diagcollect -srdc ora7445",
+      "olhar": "O comando gera um .zip com trace, alert log e metadados do periodo. Confira o tamanho e o conteudo antes de anexar ao SR.",
+      "armadilha": "Isto LE do banco mas ESCREVE um pacote no filesystem: confirme espaco em /tmp (ou aponte outro diretorio). Em incidente grande o zip passa facil de 1 GB, e encher o filesystem de trace piora a situacao."
+    },
+    {
+      "titulo": "Decidir sobre reiniciar a instancia",
+      "objetivo": "Reiniciar as vezes e necessario, mas e a acao que mais destroi evidencia. So depois de coletar.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) COLETE PRIMEIRO (passos 3 e 7): o restart limpa a memoria e voce perde o estado que a Oracle pediria no SR. 2) Confirme que o erro NAO e corrupcao em disco - restart nao conserta corrupcao e pode impedir a abertura do banco. 3) Se o erro derruba a instancia repetidamente, subir de novo sem entender pode entrar em laco de crash. 4) Aprovacao formal: e indisponibilidade planejada. 5) Tenha o plano de contorno pronto caso o banco NAO volte a abrir.",
+      "comando": "-- executado pelo procedimento padrao de parada/subida do ambiente\n-- (srvctl em RAC/Grid; SQL*Plus como sysdba em single instance)\nSHUTDOWN IMMEDIATE;\nSTARTUP;",
+      "olhar": "Acompanhe o alert log durante a subida inteira. Se o mesmo ORA-600 reaparecer no startup, a causa esta em disco/dicionario, nao em memoria - nao insista em reiniciar.",
+      "armadilha": "Um banco que caiu por erro interno pode nao voltar a abrir. Nunca reinicie 'para ver se resolve' sem ter backup validado e sem saber o caminho de recuperacao. Este e o erro que transforma um incidente de uma sessao em indisponibilidade de horas."
+    },
+    {
+      "titulo": "Registrar e acompanhar",
+      "objetivo": "Erro interno raramente se resolve no mesmo dia. O caso precisa sobreviver ao turno.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- reincidencia por chave de problema, para saber se ainda esta ativo:\nSELECT TO_CHAR(originating_timestamp,'DD/MM') AS dia, COUNT(*) AS ocorrencias\nFROM v$diag_alert_ext\nWHERE REGEXP_LIKE(message_text,'ORA-0*(600|7445)')\n  AND originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(30,'DAY')\nGROUP BY TO_CHAR(originating_timestamp,'DD/MM')\nORDER BY dia;",
+      "olhar": "Curva subindo = bug ativo e agravando, justifica escalonamento. Ocorrencia unica e antiga pode ser monitorada sem urgencia.",
+      "armadilha": "Registre no caso (CASO.py) o argumento, a versao, o numero do SR e o patch sugerido. Sem isso, daqui a dois meses alguem vai investigar o mesmo erro do zero - e o dicionario de erros do framework marca justamente os que terminam em SR."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "id": "rac_global_cache",
+  "ordem": 18,
+  "titulo": "RAC: contencao de Global Cache e interconnect",
+  "quando_usar": "O relatorio apontou eventos de Global Cache; as esperas da classe Cluster ('gc buffer busy', 'gc cr block busy') estao no topo; a aplicacao ficou lenta so depois de virar RAC ou depois de perder/voltar um no.",
+  "tags": [
+    "rac",
+    "cluster",
+    "global cache",
+    "interconnect",
+    "gc buffer busy",
+    "cache fusion",
+    "gv$",
+    "eviction",
+    "bloco",
+    "service"
+  ],
+  "sintomas": [
+    "gc buffer busy acquire",
+    "gc cr block busy",
+    "gc current block busy",
+    "lentidao so em um no",
+    "no foi evictado",
+    "cluster lento",
+    "aplicacao lenta apos migrar para RAC"
+  ],
+  "secoes": [
+    "Eventos de Global Cache (RAC)",
+    "Global Cache",
+    "RAC",
+    "Cluster"
+  ],
+  "erros_ora": [
+    "ORA-29740",
+    "ORA-00600",
+    "ORA-27504",
+    "ORA-12547"
+  ],
+  "fontes": [
+    "Oracle Real Application Clusters Administration and Deployment Guide - Monitoring Performance",
+    "Oracle Database Reference - GV$INSTANCE_CACHE_TRANSFER, GV$SYSTEM_EVENT, GV$CLUSTER_INTERCONNECTS",
+    "Oracle RAC Performance Tuning - Global Cache Wait Events"
+  ],
+  "nota": "Em RAC a pergunta muda: nao e so 'o que esta lento', e 'por que este bloco esta viajando entre os nos'. Cache Fusion e rapido quando o interconnect e privado e dedicado; vira gargalo quando (a) a mesma faixa de blocos e alterada por sessoes em nos diferentes, ou (b) o interconnect esta na rede publica. E a armadilha classica: 'gc buffer busy' costuma ser SINTOMA de contencao local (hot block, indice sequencial, freelist) amplificada pelo cluster - resolver o hot block resolve o RAC, mexer no cluster nao resolve o hot block.",
+  "passos": [
+    {
+      "titulo": "Confirmar a topologia do cluster",
+      "objetivo": "Saber quantos nos existem, quais estao ativos e desde quando - metade dos casos de 'RAC lento' e um no que caiu.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, instance_number, instance_name, host_name,\n       status, database_status,\n       TO_CHAR(startup_time,'DD/MM/YYYY HH24:MI') AS subiu_em,\n       version_full\nFROM gv$instance\nORDER BY inst_id;",
+      "olhar": "Instancia faltando na lista e no fora do ar - a carga dela foi para os outros e isso sozinho explica lentidao. startup_time recente em um dos nos indica restart ou eviction: cruze com a hora do incidente.",
+      "armadilha": "Em banco single-instance esta consulta devolve uma linha so e todo este playbook nao se aplica - confirme aqui antes de investigar cluster. Rodar em single e inofensivo: as views GV$ existem de qualquer forma."
+    },
+    {
+      "titulo": "Medir o peso real das esperas de cluster",
+      "objetivo": "Confirmar com numero se a classe Cluster e mesmo relevante ou se e ruido.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, event, total_waits,\n       ROUND(time_waited_micro/1000000,1) AS seg_total,\n       ROUND(average_wait*10,2) AS media_ms\nFROM gv$system_event\nWHERE wait_class = 'Cluster'\n  AND total_waits > 0\nORDER BY time_waited_micro DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Media acima de 10 ms em eventos 'gc%' aponta interconnect com problema ou no sob pressao de CPU. Eventos com 'busy' no nome (gc buffer busy acquire/release, gc cr block busy) sao CONTENCAO por bloco quente. Eventos com 'congested' apontam CPU/LMS saturado, nao rede.",
+      "armadilha": "Distinga: 'gc cr block 2-way/3-way' com media baixa e o funcionamento NORMAL do Cache Fusion, mesmo com muitas esperas - nao e problema. O que preocupa e media alta ou eventos 'busy'/'congested'. E lembre que GV$SYSTEM_EVENT e acumulado desde o startup."
+    },
+    {
+      "titulo": "Ver a latencia de transferencia entre os nos",
+      "objetivo": "Separar problema de REDE (latencia alta) de problema de CONTENCAO (bloco disputado).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, instance, class,\n       cr_block, ROUND(cr_block_time/NULLIF(cr_block,0),2)         AS cr_ms_medio,\n       current_block, ROUND(current_block_time/NULLIF(current_block,0),2) AS cur_ms_medio,\n       cr_busy, cr_congested, current_busy, current_congested\nFROM gv$instance_cache_transfer\nWHERE cr_block + current_block > 0\nORDER BY cr_block + current_block DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Tempo medio de transferencia acima de ~10 ms indica interconnect ruim ou no saturado. Colunas 'busy' altas = contencao no bloco. Colunas 'congested' altas = a instancia REMOTA nao conseguiu atender a tempo (CPU/LMS), problema de recurso e nao de rede.",
+      "armadilha": "Nao troque hardware de rede por causa de 'busy': busy e disputa de bloco, e rede nova nao resolve disputa. So 'congested' e latencia media alta em blocos pouco disputados justificam olhar infraestrutura."
+    },
+    {
+      "titulo": "Conferir se o interconnect e mesmo privado",
+      "objetivo": "Achar o erro de configuracao mais caro do RAC: Cache Fusion trafegando pela rede publica.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, name, ip_address, is_public, source\nFROM gv$cluster_interconnects\nORDER BY inst_id, name;\n\nSELECT inst_id, name, value\nFROM gv$parameter\nWHERE name IN ('cluster_interconnects','cluster_database',\n               'cluster_database_instances','instance_number')\nORDER BY inst_id, name;",
+      "olhar": "is_public = YES no interconnect e achado CRITICO: o trafego de Cache Fusion esta competindo com o trafego da aplicacao. source deve indicar configuracao pelo Grid Infrastructure ('cluster_interconnects parameter' ou OCR).",
+      "armadilha": "Definir o parametro cluster_interconnects na mao parece uma correcao e costuma piorar: ele desativa a redundancia (HAIP) que o Grid Infrastructure gerencia. O caminho correto e corrigir a configuracao de rede no GI (oifcfg), nao no banco."
+    },
+    {
+      "titulo": "Descobrir QUAL objeto esta sendo disputado",
+      "objetivo": "Ir do evento generico ao objeto concreto - e aqui que o problema vira acionavel.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT o.owner, o.object_name, o.object_type,\n       ash.event, COUNT(*) AS amostras\nFROM gv$active_session_history ash\nJOIN dba_objects o ON o.object_id = ash.current_obj#\nWHERE ash.sample_time > SYSDATE - 1/24\n  AND ash.event LIKE 'gc%'\nGROUP BY o.owner, o.object_name, o.object_type, ash.event\nORDER BY amostras DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Indice no topo da lista, com evento 'gc buffer busy', e o caso classico: chave sequencial (do tipo NUMBER de sequence) faz todos os nos brigarem pelo mesmo bloco de folha do indice. Tabela com poucos blocos muito acessados tem o mesmo efeito.",
+      "armadilha": "GV$ACTIVE_SESSION_HISTORY exige Diagnostics Pack - se o pack nao estiver licenciado, NAO execute (o framework respeita isso com a flag --pack). Alternativa sem pack: amostrar gv$session repetidamente, como faz o coletor de amostragem."
+    },
+    {
+      "titulo": "Ver as sessoes que estao esperando cluster agora",
+      "objetivo": "Foto do momento, sem depender de pack licenciado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, sid, serial#, username, machine, program, module,\n       event, state, seconds_in_wait AS seg, sql_id, blocking_instance,\n       blocking_session\nFROM gv$session\nWHERE wait_class = 'Cluster'\n   OR event LIKE 'gc%'\nORDER BY seconds_in_wait DESC FETCH FIRST 25 ROWS ONLY;",
+      "olhar": "blocking_instance preenchido mostra o no que esta segurando - a cadeia de bloqueio atravessa nos, e essa e a diferenca em relacao ao single-instance. Concentracao de sessoes com o mesmo sql_id entrega o SQL a tratar.",
+      "armadilha": "Sessao esperando 'gc' pode ser VITIMA de um bloqueio comum (enqueue TX) em outro no. Siga blocking_instance/blocking_session ate o fim da cadeia antes de culpar o cluster."
+    },
+    {
+      "titulo": "Procurar eviction e instabilidade de no",
+      "objetivo": "Confirmar se houve expulsao de no - causa de indisponibilidade que costuma ser lida como 'lentidao'.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "adrci exec=\"set homepath diag/rdbms/<db>/<inst>; show alert -tail 200\"\n\ngrep -Ei \"ORA-29740|evict|reconfiguration|LMON|split brain\" $ORACLE_BASE/diag/rdbms/*/*/trace/alert_*.log | tail -50\n\ncrsctl status resource -t\n\ntail -200 $ORACLE_BASE/diag/crs/`hostname`/crs/trace/ocssd.trc",
+      "olhar": "ORA-29740 e eviction explicita. 'Reconfiguration started/completed' marca entrada ou saida de no - a hora dessas linhas costuma bater exatamente com a reclamacao do usuario. Em ocssd.trc, mensagens de 'network heartbeat' ou 'disk timeout' apontam a causa.",
+      "armadilha": "Reconfiguration com duracao longa congela a atividade do cluster inteiro nesse intervalo. Nao confunda com lentidao continua: e uma parada pontual, e o tratamento e completamente diferente."
+    },
+    {
+      "titulo": "Reduzir a contencao no objeto quente",
+      "objetivo": "Atacar a causa real da maioria dos 'gc buffer busy': bloco disputado por varios nos.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme o objeto pelo passo 5 - mudar estrutura sem evidencia e chute caro. 2) Rebuild de indice exige janela, espaco e lock: em tabela grande, use ONLINE e confirme espaco em tablespace e TEMP. 3) Alteracao de estrutura de objeto de aplicacao precisa de aval do dono do sistema - pode invalidar hints, planos e ate quebrar constraint de negocio. 4) Meça o antes (esperas gc do passo 2) para poder comprovar o ganho. 5) Registre a acao no caso.",
+      "comando": "-- Indice sequencial disputado: transformar em HASH PARTITIONED distribui as insercoes\n-- entre varios blocos de folha em vez de um so.\n-- ALTER INDEX <owner>.<indice> REBUILD ONLINE;   -- so reorganiza\n-- Recriar como hash partitioned (exige planejamento e janela):\n-- CREATE INDEX <owner>.<idx_novo> ON <tabela>(<coluna>)\n--   GLOBAL PARTITION BY HASH (<coluna>) PARTITIONS 16 ONLINE;\n\n-- Sequence usada por varios nos: CACHE maior e NOORDER evitam sincronizacao entre nos\nALTER SEQUENCE &owner..&sequence CACHE 10000 NOORDER;",
+      "olhar": "Depois da mudanca, repita o passo 2 e compare as esperas da classe Cluster. Ganho real aparece como queda em 'gc buffer busy' e no tempo medio.",
+      "armadilha": "ORDER em sequence dentro de RAC forca coordenacao entre os nos a cada valor gerado e e uma das piores configuracoes possiveis para desempenho - so use se o negocio exigir ordem global absoluta. CACHE grande faz 'buracos' na numeracao apos restart: se a aplicacao depende de sequencia sem falhas, alinhe antes."
+    },
+    {
+      "titulo": "Separar a carga por servico (particionamento de aplicacao)",
+      "objetivo": "A correcao mais eficaz e mais subestimada em RAC: fazer cada modulo trabalhar preferencialmente num no, para o bloco parar de viajar.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Mexer em servico altera POR ONDE a aplicacao conecta: exige combinacao com o time de aplicacao e, em geral, mudanca de connect string. 2) Confirme os servicos atuais e quem usa cada um: SELECT inst_id, name FROM gv$active_services; 3) Planeje a disponibilidade: servico com um preferred node so perde a distribuicao de carga - defina available nodes para nao perder HA. 4) Faca em janela e com plano de rollback (srvctl modify service de volta). 5) Registre a acao no caso.",
+      "comando": "-- inventario atual dos servicos e de quem os utiliza:\nSELECT inst_id, name, network_name, blocked\nFROM gv$active_services\nORDER BY inst_id, name;\n\nSELECT inst_id, service_name, module, COUNT(*) AS sessoes\nFROM gv$session\nWHERE service_name IS NOT NULL\nGROUP BY inst_id, service_name, module\nORDER BY sessoes DESC;\n\n-- no SO, direcionar o servico a um no preferencial mantendo o outro como reserva:\n-- srvctl modify service -db <db> -service <svc> -preferred <inst1> -available <inst2>",
+      "olhar": "O objetivo e que cada servico concentre suas sessoes em um no. Depois da mudanca, o passo 3 deve mostrar menos transferencia de bloco entre instancias.",
+      "armadilha": "Nao confunda com desligar o RAC: os outros nos continuam disponiveis para failover. O erro comum e apontar TODOS os servicos para o mesmo no - ai voce paga a licenca do cluster e usa uma maquina so, e o failover fica sem capacidade de absorver a carga."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

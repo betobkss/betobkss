@@ -1,0 +1,141 @@
+{
+  "id": "corrupcao_bloco",
+  "ordem": 11,
+  "titulo": "Corrupcao de bloco (ORA-01578)",
+  "quando_usar": "ORA-01578 no alert log, RMAN acusando bloco corrompido, ORA-00600 com argumento de consistencia, ou consulta que falha sempre no mesmo ponto. Prioridade maxima: e integridade de dado.",
+  "tags": [
+    "corrupcao",
+    "ORA-01578",
+    "bloco",
+    "rman",
+    "dbverify",
+    "integridade",
+    "nologging",
+    "recuperacao"
+  ],
+  "sintomas": [
+    "ORA-01578",
+    "bloco corrompido",
+    "consulta falha sempre na mesma linha",
+    "backup acusando corrupcao",
+    "ORA-26040"
+  ],
+  "erros_ora": [
+    "ORA-01578",
+    "ORA-01110",
+    "ORA-26040",
+    "ORA-08103",
+    "ORA-00600"
+  ],
+  "secoes": [
+    "Integridade",
+    "Corrupcao",
+    "Recuperabilidade",
+    "Alert log"
+  ],
+  "fontes": [
+    "Oracle Database Backup and Recovery User's Guide - Validating Database Files and Backups, Block Media Recovery",
+    "MOS Doc ID 1302539.1 - Best Practices for Avoiding and Detecting Corruption",
+    "Oracle Database Reference - V$DATABASE_BLOCK_CORRUPTION, DBVERIFY"
+  ],
+  "nota": "REGRA DE OURO: corrupcao NAO se resolve com pressa. A primeira coisa e PARAR de piorar - nao rode reorganizacao, nao recrie indice, nao apague nada e nao reinicie 'para ver'. Segunda coisa: descobrir se a corrupcao e FISICA (bloco ilegivel, geralmente storage) ou LOGICA (bloco legivel com conteudo inconsistente, geralmente bug ou NOLOGGING). O tratamento e diferente.",
+  "passos": [
+    {
+      "titulo": "Confirmar a ocorrencia e ler o endereco exato",
+      "objetivo": "O erro traz arquivo e bloco. Sao esses numeros que localizam o objeto afetado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(originating_timestamp,'DD/MM/YYYY HH24:MI:SS') AS quando,\n       SUBSTR(TRIM(REPLACE(REPLACE(message_text,CHR(10),' '),\n                           CHR(13),' ')),1,200) AS mensagem\nFROM v$diag_alert_ext\nWHERE REGEXP_LIKE(message_text,'ORA-0*(1578|26040|8103)')\n  AND originating_timestamp > SYSTIMESTAMP - NUMTODSINTERVAL(30,'DAY')\nORDER BY originating_timestamp DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "A mensagem tem o formato: ORA-01578: ORACLE data block corrupted (file # 7, block # 12345). Anote file# e block# - todo o resto do playbook depende deles.",
+      "armadilha": "ORA-26040 ('data block was loaded using the NOLOGGING option') NAO e corrupcao de storage: e um bloco que nunca foi para o redo e por isso nao pode ser recuperado. Isso acontece quando alguem usou NOLOGGING e depois houve restore, ou no standby quando force_logging esta desligado. A causa e configuracao, nao disco."
+    },
+    {
+      "titulo": "Ver o que o banco ja registrou como corrompido",
+      "objetivo": "Lista consolidada, com o tipo de corrupcao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT file#, block#, blocks, corruption_change#, corruption_type\nFROM v$database_block_corruption ORDER BY file#, block#;\n\n-- corrupcao ja detectada dentro de backups:\nSELECT * FROM v$backup_corruption ORDER BY piece#;\nSELECT * FROM v$copy_corruption;",
+      "olhar": "corruption_type: ALL ZERO (bloco zerado, tipico de storage), FRACTURED (escrita partida ao meio), CHECKSUM (conteudo nao bate), CORRUPT (logica), NOLOGGING (nunca esteve no redo). Cada um aponta uma causa diferente.",
+      "armadilha": "Corrupcao encontrada em V$BACKUP_CORRUPTION significa que o BACKUP tambem esta comprometido. Confirme se ha uma geracao anterior boa ANTES de contar com esse backup para restaurar."
+    },
+    {
+      "titulo": "Descobrir QUAL objeto foi atingido",
+      "objetivo": "Saber se e uma tabela de negocio, um indice ou espaco livre muda completamente a gravidade e a solucao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT owner, segment_name, segment_type, partition_name,\n       tablespace_name\nFROM dba_extents\nWHERE file_id = &file_num\n  AND &block_num BETWEEN block_id AND block_id + blocks - 1;\n\n-- se a consulta acima nao retornar nada, o bloco esta em area livre:\nSELECT tablespace_name, file_id, block_id, blocks\nFROM dba_free_space\nWHERE file_id = &file_num\n  AND &block_num BETWEEN block_id AND block_id + blocks - 1;",
+      "olhar": "Se o bloco esta em DBA_FREE_SPACE, nao ha dado perdido - o alivio e grande, mas o storage continua suspeito. Se e um INDICE, a saida costuma ser simples: recriar o indice. Se e TABELA de negocio, siga com cuidado maximo.",
+      "armadilha": "Bloco em area livre nao encerra o caso. Corrupcao em espaco livre e aviso de que o storage esta com problema e a proxima vez pode cair em cima de dado."
+    },
+    {
+      "titulo": "Medir a extensao real da corrupcao",
+      "objetivo": "Saber se e um bloco isolado ou se o storage esta degradado em varios pontos. Muda a decisao inteira.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> VALIDATE CHECK LOGICAL DATABASE;\n\n-- ou, para restringir a um datafile e ir mais rapido:\nRMAN> VALIDATE CHECK LOGICAL DATAFILE <file#>;",
+      "olhar": "Ao terminar, releia V$DATABASE_BLOCK_CORRUPTION: o VALIDATE popula essa view. Varios datafiles com corrupcao = problema de storage, e acionar a infraestrutura vem ANTES de qualquer recuperacao.",
+      "armadilha": "VALIDATE le o banco inteiro: gera I/O pesado e pode demorar horas. Em producao, combine janela ou restrinja ao datafile suspeito. CHECK LOGICAL e o que detecta corrupcao logica - sem essa clausula, so a fisica e vista."
+    },
+    {
+      "titulo": "Verificar o datafile pelo DBVERIFY (fora do banco)",
+      "objetivo": "Segunda opiniao independente, util quando o banco esta fechado ou quando se suspeita do storage.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "dbv file=/caminho/datafile.dbf blocksize=8192 logfile=/tmp/dbv.log\n\n# em ASM, o dbv precisa de usuario/senha para ler pelo diskgroup:\n# dbv userid=sys/<senha> file=+DADOS/db/datafile/users.271.1234567 blocksize=8192",
+      "olhar": "No fim do relatorio, as linhas 'Total Pages Marked Corrupt' e 'Total Pages Influx'. Zero em ambas significa que o arquivo esta integro do ponto de vista fisico.",
+      "armadilha": "DBVERIFY so ve corrupcao FISICA - um bloco logicamente inconsistente passa limpo por ele. E blocksize errado faz o dbv reportar lixo: confirme com SELECT value FROM v$parameter WHERE name='db_block_size'."
+    },
+    {
+      "titulo": "Verificar se o standby tem o bloco bom",
+      "objetivo": "Com Data Guard, a recuperacao de bloco pode vir do standby - caminho mais rapido e sem depender de backup.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT db_unique_name, database_role, protection_mode, force_logging\nFROM v$database;\n\nSELECT name, value FROM v$dataguard_stats\nWHERE name IN ('transport lag','apply lag');",
+      "olhar": "Se ha standby sincronizado e force_logging = YES, o Block Media Recovery pode buscar o bloco la. Se force_logging = NO, desconfie: o standby pode ter o MESMO bloco corrompido por NOLOGGING.",
+      "armadilha": null
+    },
+    {
+      "titulo": "Se for indice: recriar (o caminho mais simples)",
+      "objetivo": "Indice nao contem dado original - pode ser reconstruido a partir da tabela sem perda nenhuma.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) CONFIRME no passo 3 que o objeto e realmente INDEX, e nao tabela. 2) Confirme que a TABELA correspondente esta integra (VALIDATE do passo 4) - reconstruir indice a partir de tabela corrompida propaga o erro. 3) REBUILD ONLINE exige Enterprise Edition; sem ele, a tabela fica bloqueada para DML durante a operacao - combine janela. 4) Confirme espaco: o rebuild precisa do indice antigo e do novo ao mesmo tempo. 5) Registre a acao no caso.",
+      "comando": "ALTER INDEX <owner>.<indice> REBUILD ONLINE;",
+      "olhar": "Depois, rode VALIDATE novamente no datafile e confirme que a entrada saiu de V$DATABASE_BLOCK_CORRUPTION.",
+      "armadilha": "Se o bloco corrompido esta no indice de uma constraint (PK/UK), o rebuild pode falhar por dado duplicado na tabela - o que revela que a corrupcao ja causou inconsistencia logica. Nesse caso o caso e maior: pare e escale."
+    },
+    {
+      "titulo": "Recuperacao de bloco pelo RMAN (Block Media Recovery)",
+      "objetivo": "Recuperar apenas o bloco afetado, com a tabela ONLINE. E a forma correta de tratar corrupcao em dado.",
+      "risco": "destrutivo",
+      "onde": "rman",
+      "antes_de_executar": "1) Confirme que existe backup VALIDO anterior a corrupcao, mais os archives desde entao (LIST BACKUP / RESTORE ... VALIDATE). Sem a cadeia completa, o comando falha no meio. 2) Confirme que o backup nao tem o mesmo bloco corrompido (V$BACKUP_CORRUPTION, passo 2). 3) Se o corruption_type for NOLOGGING, o RMAN NAO consegue recuperar - o bloco nunca esteve no redo; o caminho e recarregar o dado da origem. 4) Aprovacao explicita e janela combinada. 5) Registre a acao com risco alto. 6) Tenha claro o plano alternativo caso a recuperacao falhe.",
+      "comando": "RMAN> RECOVER DATAFILE <file#> BLOCK <block#>;\n\n-- ou, para tudo que o banco ja marcou como corrompido:\nRMAN> RECOVER CORRUPTION LIST;",
+      "olhar": "Ao terminar, V$DATABASE_BLOCK_CORRUPTION deve ficar vazia para aquele bloco. Confirme com um novo VALIDATE e rodando a consulta da aplicacao que falhava.",
+      "armadilha": "Este comando SOBRESCREVE o bloco em disco com a versao do backup mais o redo aplicado. Se a cadeia de redo estiver incompleta, voce troca um bloco corrompido por um bloco desatualizado - e sem aviso evidente. Por isso a validacao da cadeia no passo 1 dos pre-requisitos nao e formalidade."
+    },
+    {
+      "titulo": "Ultimo recurso: extrair o que da para salvar",
+      "objetivo": "Quando nao ha backup e o bloco e irrecuperavel, salvar o restante da tabela antes de qualquer coisa.",
+      "risco": "destrutivo",
+      "onde": "sql",
+      "antes_de_executar": "1) Isto ACEITA A PERDA das linhas do bloco corrompido - e decisao de negocio, nao tecnica. Precisa de aprovacao formal e registro. 2) Antes, esgote: backup antigo, standby, Flashback, reimportacao da origem. 3) Faca copia da tabela ANTES de mexer nela. 4) DBMS_REPAIR marca o bloco como software corrupt: consultas passam a PULAR essas linhas silenciosamente - documente isso, ou daqui a meses alguem vai investigar 'dado que sumiu'. 5) Registre no caso com risco alto e quantas linhas foram perdidas.",
+      "comando": "-- 1) salvar o que ainda e legivel (pulando o bloco ruim, com DBMS_REPAIR\n--    ja aplicado pelo procedimento aprovado):\nCREATE TABLE <owner>.<tabela>_salva AS SELECT * FROM <owner>.<tabela>;\n\n-- 2) medir a perda comparando com a contagem esperada:\nSELECT COUNT(*) FROM <owner>.<tabela>_salva;",
+      "olhar": "Compare a contagem com num_rows das estatisticas e com o volume esperado pelo negocio. Esse numero e a perda real, e precisa ir para o relatorio do incidente.",
+      "armadilha": "Depois de DBMS_REPAIR.SKIP_CORRUPT_BLOCKS, o banco para de acusar erro e as linhas simplesmente somem das consultas. Perda silenciosa e pior que erro visivel: registre no caso, avise o dono do dado e planeje a reposicao."
+    },
+    {
+      "titulo": "Fechar a causa e prevenir",
+      "objetivo": "Corrupcao tem origem: storage, bug, ou NOLOGGING. Sem tratar a origem, volta.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, value, isdefault FROM v$parameter\nWHERE name IN ('db_block_checking','db_block_checksum',\n               'db_lost_write_protect','db_ultra_safe');\n\nSELECT force_logging FROM v$database;\n\nSELECT tablespace_name, force_logging, contents\nFROM dba_tablespaces WHERE force_logging = 'NO';",
+      "olhar": "As protecoes recomendadas: db_block_checksum = FULL (ou TYPICAL), db_block_checking = MEDIUM/FULL, db_lost_write_protect = TYPICAL com standby. Elas nao impedem a corrupcao no storage, mas fazem o banco DETECTAR cedo em vez de propagar.",
+      "armadilha": "db_block_checking = FULL tem custo de CPU (a Oracle estima algo entre 1% e 10% conforme a carga) - por isso muita gente deixa OFF e so descobre a corrupcao meses depois, quando ja foi para o backup. Avalie com a carga real; o check de conformidade do framework aponta esses parametros. Nota: FORCE_LOGGING por tablespace esta em DBA_TABLESPACES, nao em V$TABLESPACE (essa view nao tem a coluna)."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

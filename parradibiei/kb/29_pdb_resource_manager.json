@@ -1,0 +1,111 @@
+{
+  "id": "pdb_resource_manager",
+  "ordem": 29,
+  "titulo": "Multitenant: PDB contida pelo Resource Manager",
+  "quando_usar": "A PDB ficou lenta sem que o SQL, o plano ou o volume tenham mudado; aparecem esperas 'resmgr: cpu quantum' ou 'resmgr: pq queued'; a mesma consulta e rapida em outra PDB do mesmo CDB; ou alguem alterou o plano de recurso / o cpu_count da PDB.",
+  "tags": [
+    "pdb",
+    "multitenant",
+    "cdb",
+    "container",
+    "resource manager",
+    "resmgr",
+    "recurso",
+    "cpu",
+    "shares",
+    "utilization_limit"
+  ],
+  "sintomas": [
+    "resmgr: cpu quantum",
+    "resmgr: pq queued",
+    "resmgr:become active",
+    "pdb lenta",
+    "lenta so nesta pdb",
+    "cpu_count da pdb",
+    "plano de recurso",
+    "consumer group"
+  ],
+  "secoes": [],
+  "erros_ora": [
+    "ORA-00018",
+    "ORA-00020",
+    "ORA-56735"
+  ],
+  "fontes": [
+    "Oracle Multitenant Administrator's Guide - Managing Resources for PDBs",
+    "Oracle Database Administrator's Guide - Managing Resources with Oracle Database Resource Manager",
+    "Oracle Database Reference - V$RSRC_CONSUMER_GROUP, V$RSRC_PLAN, V$RSRCPDBMETRIC, DBA_CDB_RSRC_PLAN_DIRECTIVES"
+  ],
+  "nota": "Em multitenant a pergunta 'por que esta lento?' ganha uma camada: a PDB pode estar saudavel e mesmo assim ser CONTIDA pelo CDB. O sintoma engana porque o SQL nao mudou - a fatia dele encolheu. Duas leituras erradas sao comuns: (a) tratar 'resmgr: cpu quantum' como CPU saturada e pedir mais core para o host, quando o host pode estar ocioso e o limite ser administrativo; (b) desligar o plano de recurso para 'resolver', o que devolve a velocidade desta PDB tirando-a das outras - e isso e uma decisao de negocio, nao tecnica. O Resource Manager tambem entra sozinho: o autotask do Oracle ativa um plano na janela de manutencao.",
+  "passos": [
+    {
+      "titulo": "Confirmar onde voce esta: CDB, PDB e modo de abertura",
+      "objetivo": "Metade dos casos de 'PDB lenta' se resolve aqui - conectado no container errado, ou PDB aberta em RESTRICTED depois de um restart.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT SYS_CONTEXT('USERENV','CON_NAME')  AS container_atual,\n       SYS_CONTEXT('USERENV','CON_ID')    AS con_id,\n       SYS_CONTEXT('USERENV','CDB_NAME')  AS cdb\nFROM dual;\n\nSELECT con_id, name, open_mode, restricted,\n       TO_CHAR(open_time,'DD/MM/YYYY HH24:MI') AS aberta_em,\n       ROUND(total_size/1024/1024/1024,1) AS gb\nFROM v$pdbs\nORDER BY con_id;",
+      "olhar": "RESTRICTED = YES explica lentidao e recusa de conexao: a PDB abriu com pendencia (violacao de plug, datafile faltando). open_time recente indica restart - cruze com a hora da reclamacao. Se container_atual for CDB$ROOT, voce esta medindo o conjunto, nao a PDB do incidente.",
+      "armadilha": "Consultar V$ conectado ao CDB$ROOT devolve o somatorio de todos os containers, e o gargalo de UMA PDB desaparece na media. Antes de qualquer medicao: ALTER SESSION SET CONTAINER = <pdb>, ou filtre por CON_ID."
+    },
+    {
+      "titulo": "Descobrir se ha plano de recurso ATIVO",
+      "objetivo": "Sem plano ativo, todo este playbook para aqui - e a hipotese passa a ser CPU real do host.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name AS plano_ativo, is_top_plan, cpu_managed,\n       instance_caging, parallel_execution_managed\nFROM v$rsrc_plan;\n\nSELECT inst_id, con_id, name, value, isdefault\nFROM gv$parameter\nWHERE name IN ('resource_manager_plan','cpu_count','sessions',\n               'parallel_servers_target','pga_aggregate_limit')\nORDER BY con_id, inst_id, name;",
+      "olhar": "Plano ativo vazio = Resource Manager desligado, e 'resmgr:' nao pode ser a causa. Plano com nome terminado em '_PLAN' e ativado por janela de manutencao (autotask) - repare se o horario do incidente bate com a janela. cpu_count com isdefault = FALSE numa PDB e instance caging: o teto e administrativo, nao fisico.",
+      "armadilha": "O parametro resource_manager_plan pode vir com prefixo FORCE:, que impede a janela de manutencao de trocar o plano. Ver o parametro nao basta - V$RSRC_PLAN e quem diz o que esta valendo AGORA."
+    },
+    {
+      "titulo": "Medir quanto tempo o Resource Manager esta retendo",
+      "objetivo": "Transformar suspeita em numero: quanto do tempo de resposta e espera administrativa.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT inst_id, con_id, event, total_waits,\n       ROUND(time_waited_micro/1000000,1) AS seg_total,\n       ROUND(average_wait*10,2)           AS media_ms\nFROM gv$system_event\nWHERE event LIKE 'resmgr%'\n  AND total_waits > 0\nORDER BY time_waited_micro DESC;\n\nSELECT con_id, name AS consumer_group,\n       active_sessions, queue_length,\n       ROUND(consumed_cpu_time/1000,1) AS cpu_seg,\n       ROUND(cpu_wait_time/1000,1)     AS espera_resmgr_seg,\n       yields\nFROM v$rsrc_consumer_group\nORDER BY cpu_wait_time DESC;",
+      "olhar": "'resmgr: cpu quantum' com peso alto e a confirmacao: a sessao estava PRONTA para rodar e o Resource Manager a segurou. queue_length > 0 mostra fila no momento. Compare espera_resmgr_seg com cpu_seg: quando a espera se aproxima do consumo, o limite esta apertado demais para a carga.",
+      "armadilha": "Nao confunda 'resmgr: cpu quantum' com CPU do host saturada - sao opostos no diagnostico. Com o host ocioso e esta espera alta, o teto e administrativo e aumentar core nao muda nada. Confirme o host no passo seguinte antes de pedir hardware."
+    },
+    {
+      "titulo": "Ver a fatia de cada PDB no plano do CDB",
+      "objetivo": "Descobrir se a diretiva desta PDB e menor que a necessidade dela - ou se outra PDB esta consumindo o que sobra.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT plan, pluggable_database, shares, utilization_limit,\n       parallel_server_limit, memory_min, memory_limit\nFROM dba_cdb_rsrc_plan_directives\nWHERE plan = (SELECT name FROM v$rsrc_plan WHERE is_top_plan = 'TRUE')\nORDER BY pluggable_database;\n\nSELECT con_id,\n       ROUND(AVG(cpu_utilization_limit),1) AS limite_medio_pct,\n       ROUND(AVG(avg_cpu_utilization),1)   AS uso_medio_pct,\n       ROUND(MAX(avg_cpu_utilization),1)   AS pico_pct,\n       ROUND(AVG(avg_running_sessions),1)  AS sessoes_ativas_medias\nFROM v$rsrcpdbmetric_history\nGROUP BY con_id\nORDER BY uso_medio_pct DESC;",
+      "olhar": "uso_medio_pct encostado no limite_medio_pct e a prova do estrangulamento. Shares desproporcionais entre PDBs mostram quem foi privilegiado. A diretiva ORA$DEFAULT_PDB_DIRECTIVE vale para toda PDB sem diretiva propria - PDB nova cai nela sem ninguem perceber.",
+      "armadilha": "utilization_limit e teto RIGIDO: a PDB nao passa dele nem com o CDB inteiro ocioso. Ja shares so valem na disputa - com folga, quem tem poucos shares roda a vontade. Confundir os dois leva a mexer no parametro que nao esta segurando."
+    },
+    {
+      "titulo": "Confirmar que o host nao e o gargalo real",
+      "objetivo": "Fechar a hipotese alternativa antes de propor mudanca: teto administrativo e CPU saturada pedem acoes opostas.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "uptime\n\nvmstat 3 5\n\nmpstat -P ALL 3 3",
+      "olhar": "Load average bem abaixo do numero de vCPU, com 'resmgr: cpu quantum' alto, fecha o diagnostico: o limite e administrativo. Coluna 'r' do vmstat maior que o total de CPU indica fila real de processador - ai o problema e do host e o Resource Manager esta apenas distribuindo a escassez.",
+      "armadilha": "Em servidor com varias instancias, a CPU pode estar sendo consumida por OUTRO banco no mesmo host. mpstat por core evita a media enganosa do uptime."
+    },
+    {
+      "titulo": "Ajustar a fatia da PDB no plano do CDB",
+      "objetivo": "Dar a PDB a capacidade que a carga exige, sem desligar a protecao das demais.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme pelos passos 3 e 4 que ha espera 'resmgr' relevante E uso encostado no limite - sem os dois, mexer no plano nao devolve nada. 2) ANOTE os valores atuais (shares, utilization_limit) da consulta do passo 4: sao o seu rollback. 3) Capacidade e finita: o que esta PDB ganhar sai das outras na hora da disputa - alinhe com o dono das demais aplicacoes. 4) Execute conectado ao CDB$ROOT. 5) Registre a acao no caso.",
+      "comando": "-- conectado ao CDB$ROOT. Trocar <PLANO> e <PDB> pelos valores do passo 4.\n-- BEGIN\n--   DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();\n--   DBMS_RESOURCE_MANAGER.UPDATE_CDB_PLAN_DIRECTIVE(\n--     plan                  => '<PLANO>',\n--     pluggable_database    => '<PDB>',\n--     new_shares            => 3,\n--     new_utilization_limit => 80);\n--   DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();\n--   DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();\n-- END;\n-- /\n\n-- rollback: repetir o bloco com os valores anotados antes da mudanca.",
+      "olhar": "Depois de aplicar, repita o passo 3: 'resmgr: cpu quantum' deve parar de crescer e queue_length voltar a zero. Se a espera continuar igual, o limite nao era o gargalo - desfaca a mudanca e volte para a hipotese de CPU real ou de SQL.",
+      "armadilha": "Esquecer o SUBMIT_PENDING_AREA deixa a alteracao presa na area pendente: nada muda e parece que o ajuste nao funcionou. E VALIDATE_PENDING_AREA reprova soma de shares incoerente - leia o erro em vez de contornar."
+    },
+    {
+      "titulo": "Suspender o plano de recurso (contorno temporario)",
+      "objetivo": "Devolver a velocidade imediatamente quando o incidente e critico e nao ha tempo para calibrar diretiva.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Isto REMOVE a protecao de TODAS as PDBs do CDB: uma carga pesada em qualquer container passa a poder consumir o host inteiro. E decisao de negocio - obtenha aval. 2) ANOTE o plano atual (SELECT name FROM v$rsrc_plan WHERE is_top_plan='TRUE'): e o rollback. 3) Use SCOPE=MEMORY para que um restart restaure o plano sozinho - com SPFILE, a protecao ficaria desligada para sempre e ninguem lembraria. 4) Combine o horario de reativacao ANTES de desligar. 5) Registre a acao no caso.",
+      "comando": "-- conectado ao CDB$ROOT\nALTER SYSTEM SET resource_manager_plan = '' SCOPE = MEMORY;\n\n-- rollback (reativar o plano anotado):\n-- ALTER SYSTEM SET resource_manager_plan = '<PLANO_ANOTADO>' SCOPE = MEMORY;",
+      "olhar": "A espera 'resmgr' deve cessar em segundos. Se a lentidao PERMANECER com o plano desligado, o Resource Manager nunca foi a causa - reative o plano imediatamente e volte para a hipotese de SQL, plano de execucao ou I/O.",
+      "armadilha": "A janela de manutencao do Oracle reativa o plano sozinha no horario dela (autotask), e o problema 'volta misteriosamente' de madrugada. Deixar desligado nao e solucao: ou se calibra a diretiva do passo 6, ou se assume conscientemente o CDB sem protecao."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

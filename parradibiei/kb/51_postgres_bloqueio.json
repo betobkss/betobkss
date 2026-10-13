@@ -1,0 +1,102 @@
+{
+  "id": "postgres_bloqueio",
+  "plataforma": "postgres",
+  "ordem": 51,
+  "titulo": "PostgreSQL: bloqueio, transacao idle e bloat de XID",
+  "quando_usar": "Aplicacao pendurada em PostgreSQL, comando que nao volta, 'canceling statement due to lock timeout', autovacuum que nao limpa nada, ou tabela que so cresce. Os tres sintomas costumam ter a MESMA origem: uma transacao aberta e esquecida.",
+  "tags": [
+    "postgresql",
+    "postgres",
+    "bloqueio",
+    "lock",
+    "pg_locks",
+    "pg_stat_activity",
+    "idle in transaction",
+    "lock timeout",
+    "deadlock detected",
+    "autovacuum",
+    "bloat",
+    "xid wraparound",
+    "long running transaction",
+    "pg_blocking_pids",
+    "pg_terminate_backend"
+  ],
+  "sintomas": [
+    "comando nao volta no postgres",
+    "idle in transaction",
+    "canceling statement due to lock timeout",
+    "deadlock detected",
+    "autovacuum nao limpa a tabela",
+    "tabela crescendo sem parar",
+    "database is not accepting commands to avoid wraparound"
+  ],
+  "secoes": [],
+  "fontes": [
+    "PostgreSQL Documentation - Monitoring Locks e pg_locks",
+    "PostgreSQL Wiki - Lock Monitoring (consulta de blocking canonica da comunidade)",
+    "PostgreSQL Documentation - Routine Vacuuming / Preventing Transaction ID Wraparound",
+    "pgsql-performance / Robert Haas e Peter Geoghegan - efeito da transacao longa sobre o vacuum"
+  ],
+  "nota": "O que torna o PostgreSQL diferente e que uma transacao aberta nao atrapalha apenas quem quer o mesmo lock: ela segura o horizonte de visibilidade do MVCC e IMPEDE o vacuum de limpar linhas mortas do banco INTEIRO - inclusive de tabelas que a transacao nunca tocou. Por isso o mesmo 'idle in transaction' esquecido aparece como tres problemas diferentes (aplicacao travada, tabela inchando, wraparound se aproximando) e o DBA que trata cada um separadamente nao acha a causa. Sempre olhe a transacao mais ANTIGA do cluster, nao a que esta bloqueando agora.",
+  "verificado": {
+    "nivel": "estrutura",
+    "observacao": "Consultas escritas a partir da documentacao oficial e do PostgreSQL Wiki. NAO executadas: esta maquina nao tem PostgreSQL nem driver. Rode os passos de leitura em homologacao antes de confiar no texto exato das colunas."
+  },
+  "passos": [
+    {
+      "titulo": "Quem esta bloqueado e por quem",
+      "objetivo": "Ver a fila atual. pg_blocking_pids resolve a cadeia sozinho, e e por isso que ele substituiu as consultas antigas com auto-join em pg_locks.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT a.pid,\n       pg_blocking_pids(a.pid) AS bloqueado_por,\n       a.state,\n       a.wait_event_type,\n       a.wait_event,\n       now() - a.query_start AS ha_quanto_tempo,\n       a.usename,\n       a.application_name,\n       left(a.query, 120) AS consulta\nFROM   pg_stat_activity AS a\nWHERE  cardinality(pg_blocking_pids(a.pid)) > 0\nORDER  BY a.query_start;",
+      "olhar": "'bloqueado_por' com mais de um pid significa que a sessao espera varios - cadeia ou lock compartilhado. wait_event_type = 'Lock' confirma bloqueio; se for 'LWLock' ou 'IO' o problema e outro e este playbook nao serve. Nenhuma linha e a aplicacao reclamando: o bloqueio ja passou, e o passo 2 vai mostrar se a causa (transacao aberta) continua la.",
+      "armadilha": "pg_blocking_pids devolve o bloqueador IMEDIATO. Numa cadeia de tres, o pid que aparece pode estar ele proprio esperando - encerrar esse do meio nao libera ninguem e ainda perde a transacao dele. Suba ate o pid que nao aparece bloqueado por ninguem."
+    },
+    {
+      "titulo": "A transacao mais antiga do cluster (a que realmente importa)",
+      "objetivo": "Achar a transacao que segura o horizonte do MVCC - a mesma que trava vacuum, incha tabela e aproxima o wraparound.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT pid,\n       state,\n       now() - xact_start  AS transacao_aberta_ha,\n       now() - state_change AS neste_estado_ha,\n       backend_xid,\n       backend_xmin,\n       usename,\n       application_name,\n       client_addr,\n       left(query, 160) AS ultima_consulta\nFROM   pg_stat_activity\nWHERE  xact_start IS NOT NULL\n  AND  backend_type = 'client backend'\nORDER  BY xact_start\nLIMIT  20;",
+      "olhar": "A PRIMEIRA linha e a que importa. state='idle in transaction' com transacao_aberta_ha em horas e o caso classico: o cliente abriu BEGIN, foi embora e nao fez commit nem rollback. Repare que 'ultima_consulta' aqui mostra o comando ja terminado, nao algo em execucao - nao se deixe enganar por um SELECT inocente. backend_xmin baixo em relacao ao resto e a prova de que essa sessao esta segurando a limpeza.",
+      "armadilha": "'idle' e 'idle in transaction' sao coisas completamente diferentes e a diferenca esta so no texto. 'idle' e conexao ociosa no pool - inofensiva, e normal ter centenas. 'idle in transaction' e transacao aberta segurando recurso. Filtrar por 'idle%' junta os dois e enterra o problema no meio do ruido do pool."
+    },
+    {
+      "titulo": "Que lock exatamente esta sendo disputado",
+      "objetivo": "Saber o objeto e o MODO do lock - e o que diz se a causa e DDL, DML ou um simples SELECT FOR UPDATE.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT l.pid,\n       l.granted,\n       l.mode,\n       l.locktype,\n       COALESCE(c.relname, l.locktype) AS objeto,\n       l.transactionid,\n       a.state,\n       left(a.query, 100) AS consulta\nFROM   pg_locks AS l\nLEFT   JOIN pg_class AS c ON c.oid = l.relation\nLEFT   JOIN pg_stat_activity AS a ON a.pid = l.pid\nWHERE  NOT l.granted\n   OR  l.pid IN (SELECT unnest(pg_blocking_pids(pid)) FROM pg_stat_activity)\nORDER  BY l.granted, objeto;",
+      "olhar": "granted=false e quem espera; granted=true na mesma linha de objeto e quem segura. Modo AccessExclusiveLock aponta DDL (ALTER TABLE, VACUUM FULL, CREATE INDEX sem CONCURRENTLY) - e ele bloqueia ate SELECT. RowExclusiveLock disputado indica UPDATE/DELETE concorrentes na mesma linha. locktype='transactionid' significa que a espera e por outra transacao terminar, nao por um objeto.",
+      "armadilha": "Um ALTER TABLE que espera por AccessExclusiveLock nao apenas espera: ele ENTRA NA FILA na frente e passa a bloquear todos os SELECTs que chegarem depois. Um DDL inocente atras de uma transacao longa derruba a leitura do sistema inteiro - e o sintoma que o time reporta e 'o banco parou', nao 'o ALTER esta lento'."
+    },
+    {
+      "titulo": "O estrago colateral: vacuum travado e idade do XID",
+      "objetivo": "Medir se a transacao longa ja virou risco de wraparound, que e indisponibilidade garantida se chegar ao limite.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT datname,\n       age(datfrozenxid) AS idade_xid,\n       ROUND(100.0 * age(datfrozenxid) / 2000000000, 1) AS pct_do_limite\nFROM   pg_database\nORDER  BY age(datfrozenxid) DESC;\n\nSELECT relname,\n       n_live_tup,\n       n_dead_tup,\n       ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS pct_morto,\n       last_autovacuum,\n       last_vacuum\nFROM   pg_stat_user_tables\nWHERE  n_dead_tup > 1000\nORDER  BY n_dead_tup DESC\nLIMIT  15;",
+      "olhar": "pct_do_limite acima de 50% ja merece acao; perto de 100% o banco PARA de aceitar comandos para se proteger. Na segunda consulta, pct_morto alto com last_autovacuum recente e a assinatura de que o autovacuum RODOU e nao conseguiu limpar - o que so acontece quando alguma transacao antiga segura o horizonte. Se last_autovacuum for nulo ou muito velho, o problema e configuracao do autovacuum, nao bloqueio.",
+      "armadilha": "Aumentar a agressividade do autovacuum nao resolve nada enquanto existir a transacao antiga: o vacuum roda, consome IO e nao remove uma linha sequer, porque as linhas mortas ainda podem ser vistas por aquela transacao. Muito ajuste de autovacuum foi feito para tratar um 'idle in transaction' que ninguem tinha visto."
+    },
+    {
+      "titulo": "Fechar a causa: e recorrente?",
+      "objetivo": "Separar incidente pontual de defeito de aplicacao, que e o desfecho mais comum deste caso.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT application_name,\n       usename,\n       client_addr,\n       count(*) AS sessoes,\n       max(now() - xact_start) AS pior_transacao\nFROM   pg_stat_activity\nWHERE  state = 'idle in transaction'\nGROUP  BY application_name, usename, client_addr\nORDER  BY pior_transacao DESC;\n\nSHOW idle_in_transaction_session_timeout;",
+      "olhar": "Sempre a mesma application_name concentrando 'idle in transaction' aponta defeito de aplicacao - pool que abre transacao ao pegar a conexao, ou codigo sem commit no caminho de excecao. O parametro idle_in_transaction_session_timeout em '0' significa que o banco NUNCA encerra essas sessoes sozinho: definir um valor e a prevencao que resolve a classe inteira do problema, e nao um caso.",
+      "armadilha": "Ativar idle_in_transaction_session_timeout resolve o banco e quebra a aplicacao que depende do comportamento antigo: transacoes serao abortadas e o codigo precisa tratar a reconexao. Combine o valor com o time de desenvolvimento em vez de aplicar de surpresa - senao o incidente de amanha e seu."
+    },
+    {
+      "titulo": "Cancelar a consulta ou encerrar a conexao",
+      "objetivo": "Liberar a fila. Sao dois comandos diferentes e a ordem entre eles importa.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "comando": "-- confira o alvo mais uma vez:\nSELECT pid, state, now() - xact_start AS aberta_ha, left(query, 80)\nFROM   pg_stat_activity WHERE pid = 0;\n\n-- 1) tente CANCELAR primeiro (aborta a consulta, preserva a conexao):\n-- SELECT pg_cancel_backend(<pid>);\n\n-- 2) so se o cancel nao resolver, ENCERRE a conexao:\n-- SELECT pg_terminate_backend(<pid>);",
+      "antes_de_executar": "1) Confirme pelo passo 1 que o pid e a RAIZ da cadeia, e nao um bloqueado. 2) pg_cancel_backend NAO funciona em sessao 'idle in transaction': nao ha consulta a cancelar, so transacao aberta - nesse caso o caminho e terminate. 3) Descubra o dono pelo application_name/client_addr do passo 2 e avise: transacao de aplicacao morta volta como erro para o usuario final. 4) Estime o rollback: UPDATE massivo em andamento vai reverter e pode segurar o lock por mais tempo. 5) Registre a acao: CASO.py <caso> --acao 'pg_terminate_backend no pid X' --risco alto.",
+      "olhar": "Ambas as funcoes devolvem 't' se o sinal foi enviado - e isso NAO garante que a sessao morreu, apenas que o pedido chegou. Confirme reexecutando o passo 1: a fila deve esvaziar. Se o pid continuar em pg_stat_activity depois de alguns segundos, ele esta em rollback ou preso em chamada de sistema.",
+      "armadilha": "Nunca use 'kill -9' no processo do backend pelo sistema operacional: o postmaster interpreta a morte anormal como possivel corrupcao de memoria compartilhada e DERRUBA O CLUSTER INTEIRO para recuperacao. O que parecia encerrar uma sessao vira indisponibilidade total. Use sempre as funcoes SQL."
+    }
+  ]
+}

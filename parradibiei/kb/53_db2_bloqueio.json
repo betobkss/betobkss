@@ -1,0 +1,102 @@
+{
+  "id": "db2_bloqueio",
+  "plataforma": "db2",
+  "ordem": 53,
+  "titulo": "Db2: lock wait, deadlock e lock escalation",
+  "quando_usar": "Aplicacao parada em Db2, SQL0911N (rollback por deadlock ou timeout), SQL0913N (lock nao obtido), transacao pendurada, ou lentidao generalizada com CPU baixa.",
+  "tags": [
+    "db2",
+    "lock wait",
+    "lockwait",
+    "deadlock",
+    "lock escalation",
+    "SQL0911N",
+    "SQL0913N",
+    "MON_GET_LOCKS",
+    "MON_GET_APPL_LOCKWAIT",
+    "db2pd",
+    "locktimeout",
+    "LOCKLIST",
+    "MAXLOCKS",
+    "uncommitted transaction",
+    "application handle"
+  ],
+  "sintomas": [
+    "aplicacao travada no db2",
+    "SQL0911N reason code 2",
+    "SQL0911N reason code 68",
+    "SQL0913N",
+    "transacao aberta sem commit",
+    "lock escalation no db2diag",
+    "lentidao com cpu baixa"
+  ],
+  "secoes": [],
+  "fontes": [
+    "IBM Documentation - MON_GET_APPL_LOCKWAIT e MON_GET_LOCKS",
+    "IBM Documentation - db2pd -locks -transactions -applications",
+    "IBM Documentation - Lock escalation, LOCKLIST e MAXLOCKS",
+    "IBM Documentation - SQL0911N reason codes (2 = deadlock, 68 = lock timeout)"
+  ],
+  "nota": "O reason code do SQL0911N ja separa as duas causas e muita investigacao comeca errada por ignora-lo: reason code 2 e DEADLOCK (o Db2 escolheu uma vitima e desfez a transacao dela - o banco ja resolveu), reason code 68 e LOCK TIMEOUT (ninguem foi vitima, a espera simplesmente estourou o parametro locktimeout - ha uma fila viva la fora). Alem disso o Db2 tem uma terceira causa que nao existe em Oracle nem em SQL Server do mesmo jeito: a LOCK ESCALATION. Quando a memoria de locks (LOCKLIST) aperta, o Db2 troca milhares de locks de linha por UM lock de tabela - e nesse instante uma aplicacao que nunca conflitava passa a bloquear todo mundo. Sempre olhe o db2diag antes de concluir que houve mudanca de comportamento na aplicacao.",
+  "verificado": {
+    "nivel": "estrutura",
+    "observacao": "SQL e comandos escritos a partir da documentacao IBM. NAO executados: esta maquina nao tem cliente Db2 nem o driver ibm_db. Confira as colunas das funcoes MON_GET_* na versao do seu ambiente antes de confiar no texto exato."
+  },
+  "passos": [
+    {
+      "titulo": "Quem espera lock agora, e por quem",
+      "objetivo": "Ver a fila viva. MON_GET_APPL_LOCKWAIT ja liga quem espera a quem segura, sem precisar cruzar snapshots.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT REQ_APPLICATION_HANDLE   AS quem_espera,\n       HLD_APPLICATION_HANDLE   AS quem_segura,\n       LOCK_NAME,\n       LOCK_OBJECT_TYPE,\n       LOCK_MODE                AS modo_pedido,\n       LOCK_CURRENT_MODE        AS modo_atual,\n       LOCK_STATUS,\n       TABSCHEMA,\n       TABNAME\nFROM   TABLE(MON_GET_APPL_LOCKWAIT(NULL, -2))\nORDER  BY HLD_APPLICATION_HANDLE;",
+      "olhar": "Nenhuma linha = nao ha espera NESTE instante; se a aplicacao relatou SQL0911N, vá pelo reason code (passo 5). Com linhas, conte quantos REQ_APPLICATION_HANDLE distintos apontam para o mesmo HLD: esse numero e o impacto real. LOCK_OBJECT_TYPE = 'TABLE' com muitos esperando e forte indicio de lock escalation (passo 4), nao de conflito de linha.",
+      "armadilha": "O -2 no segundo argumento significa 'todos os membros' em ambiente pureScale; em instancia unica ele e inofensivo, mas trocar por -1 traz so o membro atual e a fila do outro no fica invisivel. Em pureScale, concluir 'nao ha bloqueio' olhando um membro so e erro comum."
+    },
+    {
+      "titulo": "Quem e o dono do lock e o que ele estava fazendo",
+      "objetivo": "Identificar aplicacao, usuario e estado antes de qualquer decisao sobre a conexao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT APPLICATION_HANDLE,\n       APPLICATION_NAME,\n       SYSTEM_AUTHID,\n       CLIENT_HOSTNAME,\n       CLIENT_APPLNAME,\n       WORKLOAD_OCCURRENCE_STATE,\n       UOW_START_TIME,\n       TOTAL_APP_COMMITS,\n       TOTAL_APP_ROLLBACKS\nFROM   TABLE(MON_GET_CONNECTION(NULL, -2))\nORDER  BY UOW_START_TIME;",
+      "olhar": "A conexao com o UOW_START_TIME mais ANTIGO e a suspeita principal: unidade de trabalho aberta ha muito tempo e transacao sem commit. WORKLOAD_OCCURRENCE_STATE = 'UOWWAIT' significa que o Db2 esta esperando o CLIENTE mandar o proximo comando - ou seja, a aplicacao abriu a transacao e foi embora. CLIENT_HOSTNAME e CLIENT_APPLNAME dizem quem avisar.",
+      "armadilha": "APPLICATION_HANDLE nao e estavel entre reconexoes: o numero que voce anotou ha dez minutos pode pertencer a outra aplicacao agora. Sempre reconfirme o handle imediatamente antes de qualquer acao sobre ele."
+    },
+    {
+      "titulo": "O detalhe do lock pelo db2pd (sem passar pelo motor)",
+      "objetivo": "db2pd le a memoria compartilhada sem pegar latch - e o que continua respondendo quando o banco esta tao travado que o SQL nao volta.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2pd -db SAMPLE -locks showlocks\ndb2pd -db SAMPLE -transactions\ndb2pd -db SAMPLE -applications\ndb2pd -db SAMPLE -dbcfg",
+      "olhar": "Em -locks, a coluna Sts mostra G (granted) e W (waiting); Mode mostra o tipo (X exclusivo, S compartilhado, IX/IS de intencao). Em -transactions, olhe 'Firstlsn' e a quantidade de locks por transacao - uma transacao com dezenas de milhares de locks e candidata a escalation. Em -dbcfg, confira LOCKTIMEOUT e LOCKLIST.",
+      "armadilha": "Troque SAMPLE pelo nome real do banco. E lembre: db2pd precisa ser executado pelo usuario dono da instancia (tipicamente db2inst1) e no MESMO servidor - nao e comando de cliente remoto. Rodar como outro usuario devolve saida vazia que parece 'nao ha locks'."
+    },
+    {
+      "titulo": "Houve lock escalation?",
+      "objetivo": "Descartar a causa que muda o comportamento do banco sem ninguem ter mudado a aplicacao.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT MEMBER,\n       LOCK_ESCALS,\n       LOCK_TIMEOUTS,\n       DEADLOCKS,\n       LOCK_WAITS,\n       LOCK_WAIT_TIME,\n       LOCK_LIST_IN_USE\nFROM   TABLE(MON_GET_DATABASE(-2));\n\nSELECT NAME, VALUE\nFROM   SYSIBMADM.DBCFG\nWHERE  NAME IN ('locklist', 'maxlocks', 'locktimeout', 'dlchktime');",
+      "olhar": "LOCK_ESCALS maior que zero e o sinal: o Db2 trocou locks de linha por lock de tabela. Compare LOCK_LIST_IN_USE com locklist - perto do limite explica a escalation. locklist = AUTOMATIC significa que o STMM gerencia, e a escalation ainda pode ocorrer em pico. locktimeout = -1 e o padrao em alguns ambientes e quer dizer ESPERAR PARA SEMPRE: sem timeout, o bloqueio nunca se resolve sozinho e vira chamado.",
+      "armadilha": "Estes contadores sao ACUMULADOS desde a ativacao do banco. LOCK_ESCALS = 500 nao diz nada sem saber de quando: um banco ativo ha meses acumula. Tire duas leituras com intervalo, ou cruze com o db2diag do passo 5, que tem a hora exata de cada escalation."
+    },
+    {
+      "titulo": "O que o db2diag registrou",
+      "objetivo": "O reason code e o horario estao no log - e e o log que separa deadlock de timeout e revela a escalation.",
+      "risco": "leitura",
+      "onde": "db2",
+      "comando": "db2diag -H 24h\ndb2diag -g 'msg:=escalation' -H 7d\ndb2diag -l Error -H 24h",
+      "olhar": "Procure 'Lock escalation' com a hora - e cruze com o momento em que a aplicacao comecou a reclamar. Para SQL0911N, o reason code aparece na mensagem: 2 = deadlock (o banco ja resolveu, trabalho e evitar reincidencia), 68 = lock timeout (havia fila viva). Escalation registrada perto do horario do incidente muda completamente a conduta: a correcao e LOCKLIST/MAXLOCKS ou transacao menor, nao matar conexao.",
+      "armadilha": "db2diag sem filtro em servidor antigo despeja megabytes e some com o que interessa. Use sempre -H para limitar a janela; e note que o nivel de diagnostico (DIAGLEVEL) padrao 3 pode NAO registrar todos os eventos de lock - se o log estiver silencioso, confirme o DIAGLEVEL antes de concluir que nada aconteceu."
+    },
+    {
+      "titulo": "Encerrar a conexao que segura o lock",
+      "objetivo": "Liberar a fila quando o custo da espera ja superou o custo do rollback.",
+      "risco": "mudanca",
+      "onde": "db2",
+      "comando": "# confirme o handle AGORA (ele muda entre reconexoes):\ndb2 list applications show detail\n\n# encerrar apenas a aplicacao alvo:\n# db2 \"force application (<application_handle>)\"",
+      "antes_de_executar": "1) Reconfirme o APPLICATION_HANDLE imediatamente antes: o numero e reciclado e voce pode derrubar outra aplicacao. 2) FORCE APPLICATION dispara ROLLBACK - estime o tamanho pela contagem de locks em db2pd -transactions; transacao grande segura o lock durante todo o rollback. 3) NUNCA use 'force application all' para resolver um bloqueio: ele derruba TODAS as conexoes do banco, o que e uma indisponibilidade, e nao uma acao dirigida. 4) Avise o dono (CLIENT_HOSTNAME/CLIENT_APPLNAME do passo 2). 5) Se a causa foi lock escalation, forcar a conexao NAO resolve - a proxima transacao repete. 6) Registre: CASO.py <caso> --acao 'force application <handle>' --risco alto.",
+      "olhar": "FORCE e ASSINCRONO: o comando volta imediatamente dizendo que o pedido foi aceito, e nao que a aplicacao ja saiu. Reexecute 'db2 list applications show detail' e o passo 1 para confirmar que a fila esvaziou. Conexao em rollback longo continua aparecendo - isso e esperado.",
+      "armadilha": "Enquanto a unidade de trabalho faz rollback, os locks CONTINUAM segurados e nao ha como cancelar o rollback. Forcar uma transacao enorme para 'resolver rapido' costuma prolongar o bloqueio em vez de encurta-lo - o mesmo erro que se comete com KILL em Oracle e SQL Server."
+    }
+  ]
+}

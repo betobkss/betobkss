@@ -1,0 +1,119 @@
+{
+  "id": "dataguard_gap",
+  "ordem": 5,
+  "titulo": "Data Guard atrasado ou parado (gap)",
+  "quando_usar": "Standby fora de sincronia, RPO estourado, gap de archive, ou o relatorio apontou atraso de aplicacao. Tambem quando o PRIMARIO trava por causa de um destino remoto.",
+  "tags": [
+    "dataguard",
+    "standby",
+    "gap",
+    "mrp",
+    "replicacao",
+    "rpo",
+    "switchover"
+  ],
+  "sintomas": [
+    "standby atrasado",
+    "gap de archive",
+    "MRP parado",
+    "transport lag crescendo",
+    "primario travado por destino remoto"
+  ],
+  "erros_ora": [
+    "ORA-16038",
+    "ORA-16401",
+    "ORA-00257",
+    "ORA-01031"
+  ],
+  "secoes": [
+    "Data Guard",
+    "Standby",
+    "Archive",
+    "Recuperabilidade"
+  ],
+  "fontes": [
+    "Oracle Data Guard Concepts and Administration - Monitoring and Troubleshooting",
+    "Views V$DATAGUARD_STATS, V$ARCHIVE_GAP, V$DATAGUARD_PROCESS"
+  ],
+  "nota": "Separe sempre TRANSPORT (o redo saiu do primario e chegou?) de APPLY (o standby aplicou?). Sao problemas diferentes, com causas diferentes: transporte e rede/destino; aplicacao e o MRP no standby. Diagnosticar isso errado faz perder horas.",
+  "passos": [
+    {
+      "titulo": "Medir o atraso e separar transporte de aplicacao",
+      "objetivo": "Primeiro numero a olhar. Diz qual metade do problema investigar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- rodar no STANDBY:\nSELECT name, value, TO_CHAR(time_computed,'DD/MM HH24:MI:SS') AS medido_em\nFROM v$dataguard_stats\nWHERE name IN ('transport lag','apply lag','apply finish time',\n               'estimated startup time');",
+      "olhar": "transport lag alto = o redo nao esta CHEGANDO (rede, destino, listener). apply lag alto com transport lag baixo = chegou mas nao esta sendo APLICADO (MRP parado, lentidao de IO no standby).",
+      "armadilha": "time_computed antigo significa que as proprias estatisticas estao paradas - sinal de que o standby nao recebe nada ha tempo. Olhe esse horario antes de confiar nos valores."
+    },
+    {
+      "titulo": "Ver o papel e o estado dos dois lados",
+      "objetivo": "Confirmar quem e primario, quem e standby, e em que modo estao. Evita agir no servidor errado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT db_unique_name, database_role, open_mode, protection_mode,\n       protection_level, switchover_status, force_logging,\n       flashback_on\nFROM v$database;",
+      "olhar": "protection_level DIFERENTE de protection_mode indica que o Data Guard esta degradado. open_mode 'MOUNTED' e normal para standby fisico sem Active Data Guard; 'READ ONLY WITH APPLY' e Active Data Guard.",
+      "armadilha": "force_logging = NO no primario permite operacoes NOLOGGING, que criam blocos corrompidos no standby sem erro nenhum na hora. E um dos desvios que o check de conformidade do framework aponta."
+    },
+    {
+      "titulo": "Verificar se o processo de aplicacao (MRP) esta vivo",
+      "objetivo": "Causa mais comum de apply lag: o MRP simplesmente nao esta rodando.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no STANDBY:\nSELECT process, pid, status, client_process, thread#, sequence#, block#\nFROM v$managed_standby\nWHERE process IN ('MRP0','RFS','ARCH') ORDER BY process;\n\nSELECT name, role, action, sequence#, block#\nFROM v$dataguard_process WHERE role LIKE '%apply%' OR name LIKE '%MRP%';",
+      "olhar": "Sem linha MRP0 = a aplicacao esta PARADA. MRP0 em 'WAIT_FOR_GAP' = falta archive (va para o passo 4). MRP0 em 'APPLYING_LOG' com sequence# avancando = esta trabalhando, so atrasado.",
+      "armadilha": "MRP0 presente nao garante progresso. Rode duas vezes com intervalo e confirme que sequence#/block# AVANCAM. Parado no mesmo bloco = travado, nao aplicando. Nota: V$DATAGUARD_PROCESS nao tem coluna VALUE - as colunas uteis sao NAME, ROLE, ACTION, SEQUENCE# e BLOCK#."
+    },
+    {
+      "titulo": "Identificar o gap exato",
+      "objetivo": "Saber quais sequencias faltam para poder repor exatamente o que falta.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no STANDBY:\nSELECT thread#, low_sequence#, high_sequence# FROM v$archive_gap;\n\n-- ultima sequencia recebida x aplicada:\nSELECT thread#,\n       MAX(CASE WHEN applied = 'YES' THEN sequence# END) AS aplicada,\n       MAX(sequence#) AS recebida\nFROM v$archived_log GROUP BY thread#;\n\n-- no PRIMARIO, a sequencia atual:\nSELECT thread#, MAX(sequence#) AS atual FROM v$archived_log\nWHERE dest_id = 1 GROUP BY thread#;",
+      "olhar": "A diferenca entre 'atual' no primario e 'aplicada' no standby e o tamanho real do atraso em numero de logs.",
+      "armadilha": "v$archive_gap so mostra gap que o standby JA SABE que existe. Se o transporte esta parado ha dias, a view pode vir vazia enquanto o atraso e enorme - por isso compare os dois lados na mao."
+    },
+    {
+      "titulo": "Diagnosticar o transporte (quando o redo nao chega)",
+      "objetivo": "Achar o erro que o primario esta recebendo ao tentar enviar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- no PRIMARIO:\nSELECT dest_id, dest_name, status, target, error,\n       TO_CHAR(MAX(fail_date) OVER (),'DD/MM HH24:MI') AS ultima_falha\nFROM v$archive_dest WHERE destination IS NOT NULL AND target = 'STANDBY';\n\nSELECT dest_id, error_code, TO_CHAR(timestamp,'DD/MM HH24:MI:SS') AS quando,\n       message\nFROM v$dataguard_status\nWHERE severity IN ('Error','Fatal')\nORDER BY timestamp DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "A coluna 'error' costuma dar o diagnostico pronto (ORA-12541 listener fora, ORA-01031 problema de senha/wallet, ORA-16086 redo nao enviado).",
+      "armadilha": "Arquivo de senha (password file) diferente entre primario e standby derruba o transporte com ORA-01031 e e facil de causar sem perceber ao trocar a senha do SYS. Se alguem mudou senha recentemente, e a primeira suspeita. Nota: em V$DATAGUARD_STATUS a coluna e ERROR_CODE (numerica), nao ERROR."
+    },
+    {
+      "titulo": "Religar a aplicacao do redo (MRP)",
+      "objetivo": "Quando o MRP esta parado e o motivo ja foi entendido, retomar a aplicacao.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme que voce esta no STANDBY (v$database.database_role) - rodar isto no primario e erro grave. 2) Entenda por que parou; religar sem saber a causa costuma parar de novo em minutos. 3) Se o gap for grande, o catch-up gera IO pesado no standby - combine janela. 4) Registre a acao no caso.",
+      "comando": "-- parar (se estiver em estado inconsistente):\nALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;\n\n-- religar em background, sem travar a sessao:\nALTER DATABASE RECOVER MANAGED STANDBY DATABASE\n  USING CURRENT LOGFILE DISCONNECT FROM SESSION;",
+      "olhar": "Volte ao passo 3 e confirme que MRP0 aparece e que sequence# avanca. Depois confirme no passo 1 que o apply lag esta CAINDO.",
+      "armadilha": "'USING CURRENT LOGFILE' exige standby redo logs configurados; sem eles o comando falha ou aplica so por archive (mais atraso). Se o ambiente usa Broker (DGMGRL), NAO use SQL direto: mexa pelo Broker, senao a configuracao fica inconsistente com o que o Broker acha que esta valendo."
+    },
+    {
+      "titulo": "Repor archives faltantes",
+      "objetivo": "Quando o gap tem archives que o primario ja nao possui, e preciso repor a partir do backup.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Tenha a lista exata das sequencias faltantes (passo 4). 2) Confirme espaco no standby para receber os archives. 3) Se o gap for grande demais, avalie ROLL FORWARD por incremental SCN em vez de repor log a log - mas isso e procedimento maior, planeje. 4) Registre a acao.",
+      "comando": "-- no PRIMARIO, gerar os archives que faltam:\nRMAN> BACKUP ARCHIVELOG FROM SEQUENCE <low> UNTIL SEQUENCE <high>\n      THREAD <n> FORMAT '/tmp/gap_%s.bkp';\n\n-- copiar para o standby e catalogar/restaurar la:\nRMAN> CATALOG START WITH '/tmp/';\nRMAN> RESTORE ARCHIVELOG FROM SEQUENCE <low> UNTIL SEQUENCE <high>;",
+      "olhar": "Depois de repor, o MRP deve sair de WAIT_FOR_GAP sozinho e retomar a aplicacao.",
+      "armadilha": "Se os archives ja foram apagados no primario E nao existem em backup, nao ha reposicao possivel: o standby precisara de roll forward por incremental ou de recriacao. Este e o desfecho do erro cometido no playbook de archive cheio - apagar archive nao aplicado."
+    },
+    {
+      "titulo": "Verificar o RPO real e fechar",
+      "objetivo": "Traduzir o incidente para a linguagem do negocio: quanto dado se perderia num desastre agora.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, value FROM v$dataguard_stats WHERE name = 'apply lag';\n\nSELECT thread#, sequence#,\n       TO_CHAR(first_time,'DD/MM/YYYY HH24:MI:SS') AS inicio,\n       TO_CHAR(next_time,'DD/MM/YYYY HH24:MI:SS')  AS fim, applied\nFROM v$archived_log\nWHERE applied = 'YES'\nORDER BY next_time DESC FETCH FIRST 5 ROWS ONLY;",
+      "olhar": "O horario do ultimo log aplicado e o seu ponto de recuperacao real. A diferenca para agora e a perda potencial - esse e o numero que vai no relatorio.",
+      "armadilha": "Standby sincronizado nao substitui backup: um DELETE errado replica em segundos. Não relaxe a politica de backup por ter Data Guard."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

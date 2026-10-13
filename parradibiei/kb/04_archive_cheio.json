@@ -1,0 +1,128 @@
+{
+  "id": "archive_cheio",
+  "ordem": 4,
+  "titulo": "Area de archive cheia - banco parado (ORA-00257)",
+  "quando_usar": "Banco nao aceita mais transacao, aplicacao recebe ORA-00257, ou o diskgroup/filesystem de archive passou de 85%. E incidente de indisponibilidade: trate antes de qualquer coisa de performance.",
+  "tags": [
+    "archive",
+    "ORA-00257",
+    "FRA",
+    "indisponibilidade",
+    "espaco",
+    "rman"
+  ],
+  "sintomas": [
+    "banco travou",
+    "nao aceita mais escrita",
+    "diskgroup de arch cheio",
+    "FRA 100%"
+  ],
+  "erros_ora": [
+    "ORA-00257",
+    "ORA-16038",
+    "ORA-19809",
+    "ORA-19815"
+  ],
+  "secoes": [
+    "Archive",
+    "Espaco",
+    "Recuperabilidade",
+    "Destinos de archive"
+  ],
+  "fontes": [
+    "Oracle Database Backup and Recovery User's Guide - Fast Recovery Area",
+    "Oracle Database Administrator's Guide - Managing Archived Redo Log Files"
+  ],
+  "nota": "AVISO CENTRAL: a saida mais rapida (apagar archive no SO) e a que destroi a recuperabilidade e a que quebra o standby. Este playbook existe para voce NAO fazer isso. A ordem e: ganhar folga sem perder nada -> so entao liberar espaco, e sempre pelo RMAN.",
+  "passos": [
+    {
+      "titulo": "Confirmar que e archive, e nao outra coisa",
+      "objetivo": "ORA-00257 tem mais de uma origem: FRA cheia, diskgroup cheio, destino invalido ou limite de espaco logico atingido.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT dest_id, destination, status, binding, error\nFROM v$archive_dest\nWHERE destination IS NOT NULL;\n\nSELECT name, space_limit/1024/1024 AS limite_mb,\n       space_used/1024/1024 AS usado_mb,\n       ROUND(100*space_used/NULLIF(space_limit,0),1) AS pct,\n       number_of_files AS arquivos\nFROM v$recovery_file_dest;",
+      "olhar": "status <> VALID com mensagem em 'error' aponta o destino problematico. Se v$recovery_file_dest esta em ~100%, o limite e LOGICO (db_recovery_file_dest_size), nao necessariamente disco fisico cheio - e isso abre uma saida rapida e segura no passo 4.",
+      "armadilha": "Um destino remoto (standby) inacessivel tambem para o primario quando esta como MANDATORY. Nesse caso o disco esta vazio e o problema e rede - ver o playbook de Data Guard."
+    },
+    {
+      "titulo": "Medir o espaco fisico real",
+      "objetivo": "Separar 'limite logico da FRA' de 'disco realmente cheio'. A acao correta e diferente em cada caso.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, state, type,\n       total_mb, free_mb, usable_file_mb,\n       ROUND((1-free_mb/NULLIF(total_mb,0))*100,2) AS pct_usado\nFROM v$asm_diskgroup ORDER BY pct_usado DESC;",
+      "olhar": "Em ASM, olhe usable_file_mb (ja desconta a redundancia): e o espaco de verdade. Em filesystem, use 'df -h' no ponto de montagem do archive.",
+      "armadilha": "total_mb - free_mb engana em diskgroup NORMAL/HIGH redundancy: cada MB gravado consome 2 ou 3 MB. usable_file_mb negativo significa que voce ja nao consegue perder um disco sem perder dado."
+    },
+    {
+      "titulo": "Descobrir POR QUE encheu (senao enche de novo em horas)",
+      "objetivo": "Encher archive tem sempre uma causa: backup parou, standby parou de consumir, ou houve geracao anormal de redo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- geracao de redo por hora nos ultimos 3 dias:\nSELECT TO_CHAR(first_time,'DD/MM HH24') AS hora, COUNT(*) AS archives,\n       ROUND(SUM(blocks*block_size)/1024/1024) AS mb\nFROM v$archived_log\nWHERE first_time > SYSDATE - 3 AND dest_id = 1\nGROUP BY TO_CHAR(first_time,'DD/MM HH24')\nORDER BY hora DESC FETCH FIRST 30 ROWS ONLY;\n\n-- ha quanto tempo nao ha backup de archive:\nSELECT TO_CHAR(MAX(next_time),'DD/MM/YYYY HH24:MI') AS ultimo_archive_backupeado,\n       ROUND(SYSDATE - MAX(next_time),2) AS dias_atras\nFROM v$backup_redolog;\n\n-- quanto ja foi aplicado no standby (o que sobra e o que trava):\nSELECT COUNT(*) AS nao_aplicados FROM v$archived_log\nWHERE applied = 'NO' AND standby_dest = 'NO' AND deleted = 'NO';",
+      "olhar": "Pico de MB numa hora especifica = carga/reorg/expurgo gerou redo. Ultimo backup de archive antigo = o job de backup falhou e essa e a causa raiz.",
+      "armadilha": "Se a causa foi backup parado, liberar espaco sem religar o backup so adia o incidente para amanha. Nota: V$BACKUP_REDOLOG NAO tem COMPLETION_TIME - ela descreve o archive dentro do backup, entao use NEXT_TIME (fim do log). Para a hora em que o BACKUP rodou, o lugar certo e V$RMAN_BACKUP_JOB_DETAILS."
+    },
+    {
+      "titulo": "SAIDA RAPIDA E SEGURA: aumentar o limite logico da FRA",
+      "objetivo": "Se ha espaco fisico sobrando e o que estourou foi o limite da FRA, isto destrava o banco em segundos sem apagar NADA.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme no passo 2 que existe espaco FISICO livre no diskgroup/filesystem - aumentar o limite sem disco real so troca ORA-19809 por disco cheio de verdade, que e pior. 2) Escolha um valor com folga mas dentro do disco disponivel. 3) Registre a acao: e mudanca de parametro persistente. 4) Para voltar: o mesmo comando com o valor antigo (anote-o antes).",
+      "comando": "-- ANOTE o valor atual antes de mudar:\nSHOW PARAMETER db_recovery_file_dest_size\n\nALTER SYSTEM SET db_recovery_file_dest_size = <novo_valor>G SCOPE=BOTH;",
+      "olhar": "O banco volta a aceitar transacao imediatamente. Confirme com nova consulta a v$recovery_file_dest.",
+      "armadilha": "Isto e ALIVIO, nao solucao. O espaco continua ocupado e vai encher de novo. Siga para o passo 6 ainda hoje."
+    },
+    {
+      "titulo": "Conferir o que o RMAN considera obsoleto (sem apagar)",
+      "objetivo": "Ver, ANTES de qualquer remocao, exatamente o que pode sair sem ferir a politica de retencao.",
+      "risco": "leitura",
+      "onde": "rman",
+      "comando": "RMAN> SHOW RETENTION POLICY;\nRMAN> REPORT OBSOLETE;\nRMAN> LIST ARCHIVELOG ALL COMPLETED BEFORE 'SYSDATE-7';\nRMAN> LIST BACKUP OF ARCHIVELOG ALL SUMMARY;",
+      "olhar": "REPORT OBSOLETE lista o que a POLITICA permite descartar. Se vier vazio, nao ha nada seguro para apagar - va para o passo 4 ou adicione disco.",
+      "armadilha": "REPORT OBSOLETE responde segundo a RETENTION POLICY configurada. Se a politica estiver frouxa (ou for 'NONE'), ele pode listar como obsoleto algo que o negocio ainda precisa. Confira a politica antes de confiar na lista."
+    },
+    {
+      "titulo": "Reconciliar o catalogo com o disco (CROSSCHECK)",
+      "objetivo": "Sincronizar o que o RMAN acha que existe com o que existe de fato. Necessario quando alguem apagou arquivo por fora.",
+      "risco": "mudanca",
+      "onde": "rman",
+      "antes_de_executar": "1) Entenda o que muda: CROSSCHECK NAO apaga arquivo nenhum, mas ESCREVE no catalogo/controlfile marcando como EXPIRED o que nao encontrou. Por isso nao e read-only. 2) Se o storage estiver temporariamente indisponivel (NFS fora, ASM sem montar), o crosscheck marca tudo como EXPIRED indevidamente - confirme que os destinos estao acessiveis ANTES. 3) Registre a acao no caso.",
+      "comando": "RMAN> CROSSCHECK ARCHIVELOG ALL;\nRMAN> CROSSCHECK BACKUP;",
+      "olhar": "Conte quantos vieram EXPIRED. Muitos EXPIRED significa que alguem ja apagou archive por fora do RMAN - sua recuperabilidade pode ja estar comprometida, e isso vira achado do incidente.",
+      "armadilha": "Rodar CROSSCHECK com o storage fora do ar marca backups validos como EXPIRED, e um DELETE EXPIRED depois disso remove do catalogo backups que existiam. Nunca encadeie os dois sem olhar o resultado do primeiro."
+    },
+    {
+      "titulo": "Liberar espaco: backup dos archives com delete input",
+      "objetivo": "A forma CORRETA de liberar: o archive vai para o backup e so entao sai do disco, com o catalogo atualizado.",
+      "risco": "destrutivo",
+      "onde": "rman",
+      "antes_de_executar": "1) Confirme que o destino do backup (fita/disco) tem espaco e esta acessivel. 2) Se ha Data Guard, confirme no passo 3 que os archives ja foram APLICADOS no standby - apagar archive nao aplicado quebra o standby e exige recriar. 3) Combine janela: o backup gera IO e concorre com a producao. 4) Registre a acao no caso (risco alto). 5) NUNCA use 'DELETE ALL INPUT' sem antes ver o REPORT OBSOLETE do passo 5.",
+      "comando": "RMAN> BACKUP ARCHIVELOG ALL NOT BACKED UP 1 TIMES DELETE ALL INPUT;",
+      "olhar": "Acompanhe o espaco liberando em v$recovery_file_dest. Ao fim, confirme que o backup terminou com sucesso ANTES de comemorar - backup que falhou no meio pode ter apagado a entrada sem gravar o destino.",
+      "armadilha": "'DELETE ALL INPUT' apaga de TODOS os destinos de archive. Se um deles alimenta o standby, voce acabou de quebrar a replicacao. Em ambiente com Data Guard, prefira a clausula que respeita a aplicacao no standby e confirme a configuracao ARCHIVELOG DELETION POLICY."
+    },
+    {
+      "titulo": "Ultimo recurso: apagar archive ja com backup",
+      "objetivo": "Quando o backup ja existe e o espaco ainda e critico, remover pelo RMAN mantendo o catalogo consistente.",
+      "risco": "destrutivo",
+      "onde": "rman",
+      "antes_de_executar": "1) Comprove que existe backup valido dos archives que serao removidos (LIST BACKUP OF ARCHIVELOG). 2) Comprove aplicacao no standby, se houver. 3) Aprovacao explicita: isto reduz a janela de recuperacao point-in-time. 4) Registre no caso com risco alto e o motivo. 5) Se houver QUALQUER duvida, pare e adicione disco - disco e barato, recuperabilidade nao.",
+      "comando": "RMAN> DELETE ARCHIVELOG ALL BACKED UP 1 TIMES TO DISK\n      COMPLETED BEFORE 'SYSDATE-3';",
+      "olhar": "O RMAN lista o que vai apagar e pede confirmacao. LEIA a lista antes de responder YES.",
+      "armadilha": "JAMAIS apague archive com 'rm' no SO ou 'asmcmd rm'. O catalogo do RMAN continua achando que o arquivo existe, o backup seguinte falha, e voce descobre isso no pior momento possivel - durante um restore. Se ja fez isso, rode CROSSCHECK ARCHIVELOG ALL e DELETE EXPIRED ARCHIVELOG ALL para reconciliar."
+    },
+    {
+      "titulo": "Fechar a causa raiz",
+      "objetivo": "Sem isto o incidente volta. Archive cheio quase nunca e problema de disco: e job de backup parado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- falhas recentes de backup:\nSELECT TO_CHAR(start_time,'DD/MM HH24:MI') AS inicio, input_type,\n       status, ROUND(elapsed_seconds/60,1) AS min\nFROM v$rman_backup_job_details\nWHERE start_time > SYSDATE - 15 AND status <> 'COMPLETED'\nORDER BY start_time DESC;\n\n-- jobs do scheduler que falharam:\nSELECT owner, job_name, TO_CHAR(log_date,'DD/MM HH24:MI') AS quando,\n       status, additional_info\nFROM dba_scheduler_job_run_details\nWHERE status <> 'SUCCEEDED' AND log_date > SYSDATE - 15\nORDER BY log_date DESC FETCH FIRST 20 ROWS ONLY;",
+      "olhar": "Data da primeira falha de backup costuma bater com o inicio do crescimento do archive. Esse e o relato de causa raiz do incidente.",
+      "armadilha": "O framework ja cobre isto nos checks rman_failures, backup_age e scheduler_failures - se o caso foi coletado, a resposta ja esta no relatorio."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

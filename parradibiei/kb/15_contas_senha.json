@@ -1,0 +1,138 @@
+{
+  "id": "contas_senha",
+  "ordem": 15,
+  "titulo": "Conta expirada, bloqueada ou senha vencendo (ORA-28001 / ORA-28000)",
+  "quando_usar": "O relatorio apontou conta expirando, expirada ou bloqueada; a aplicacao comecou a receber ORA-28001/ORA-28000/ORA-01017; ou voce quer saber quais logins vao quebrar nos proximos dias.",
+  "tags": [
+    "contas",
+    "usuario",
+    "senha",
+    "password",
+    "profile",
+    "expirada",
+    "bloqueada",
+    "seguranca",
+    "login",
+    "ORA-28001",
+    "ORA-28000",
+    "ORA-01017"
+  ],
+  "sintomas": [
+    "the password has expired",
+    "the account is locked",
+    "conta expirada",
+    "senha vencida",
+    "aplicacao nao conecta de repente",
+    "invalid username/password",
+    "login falhando so para um usuario"
+  ],
+  "secoes": [
+    "Contas expirando ou bloqueadas",
+    "Contas",
+    "Usuarios",
+    "Seguranca"
+  ],
+  "erros_ora": [
+    "ORA-28001",
+    "ORA-28000",
+    "ORA-28002",
+    "ORA-01017",
+    "ORA-09925"
+  ],
+  "fontes": [
+    "Oracle Database Security Guide - Configuring Password Protection, Managing Password Policy",
+    "Oracle Database Reference - DBA_USERS, DBA_PROFILES, USER_ASTATUS_MAP",
+    "Oracle Database SQL Language Reference - ALTER USER, CREATE PROFILE"
+  ],
+  "nota": "Este e o achado mais frequente da frota e o mais subestimado: conta que expira derruba aplicacao inteira no meio da madrugada, sem nenhum sintoma previo no banco - nao ha lentidao, nao ha erro no alert log, so o login para de funcionar. O valor deste playbook esta em olhar para FRENTE (quem vence nos proximos 30 dias) e nao so para tras. E cuidado com o inverso: sair dando PASSWORD_LIFE_TIME UNLIMITED para tudo troca um incidente por um problema de seguranca permanente.",
+  "passos": [
+    {
+      "titulo": "Ver o estado de todas as contas",
+      "objetivo": "Separar o que ja quebrou (EXPIRED, LOCKED) do que ainda vai quebrar (EXPIRED(GRACE)).",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT account_status, COUNT(*) AS contas,\n       LISTAGG(username, ', ') WITHIN GROUP (ORDER BY username) AS quais\nFROM dba_users\nGROUP BY account_status\nORDER BY contas DESC;",
+      "olhar": "EXPIRED e LOCKED ja estao quebrando login AGORA. EXPIRED(GRACE) e o aviso mais valioso: a senha venceu, o Oracle esta deixando entrar durante o periodo de graca e vai PARAR de deixar - e o unico estado em que da para agir antes do incidente. LOCKED(TIMED) indica bloqueio por tentativas erradas, nao por expiracao.",
+      "armadilha": "Muitas contas EXPIRED sao contas internas do Oracle que ja nascem trancadas (EXPIRED & LOCKED) e sao inofensivas. O que importa e conta de APLICACAO. Nao saia desbloqueando tudo: desbloquear conta interna do Oracle e abrir superficie de ataque sem necessidade."
+    },
+    {
+      "titulo": "Quem ja venceu e quem vence nos proximos 30 dias",
+      "objetivo": "Transformar a lista em uma agenda: a pergunta util e 'o que quebra esta semana'.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT username, account_status, profile,\n       TO_CHAR(expiry_date,'DD/MM/YYYY HH24:MI') AS expira_em,\n       ROUND(expiry_date - SYSDATE) AS dias_restantes,\n       TO_CHAR(lock_date,'DD/MM/YYYY HH24:MI')  AS bloqueada_em,\n       TO_CHAR(created,'DD/MM/YYYY')            AS criada_em\nFROM dba_users\nWHERE expiry_date IS NOT NULL\n  AND expiry_date < SYSDATE + 30\n  AND username NOT IN ('ANONYMOUS','XS$NULL')\nORDER BY expiry_date;",
+      "olhar": "dias_restantes NEGATIVO significa que a senha JA venceu - se a conta ainda conecta, e o periodo de graca segurando, e ele tem prazo. Priorize por dias_restantes crescente e cruze com 'esta conta e usada por qual sistema'.",
+      "armadilha": "dias_restantes muito negativo (centenas de dias) numa conta com status OPEN nao e um bug do relatorio: e conta cuja senha venceu ha muito tempo e que so nao caiu porque ninguem se reconectou. Ela cai no proximo restart da aplicacao - e ai ninguem vai associar a causa."
+    },
+    {
+      "titulo": "Ler a politica de senha que gerou isso",
+      "objetivo": "A expiracao nao vem da conta, vem do PROFILE. Sem olhar o profile voce trata o sintoma e ele volta.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT profile, resource_name, limit\nFROM dba_profiles\nWHERE resource_name IN ('PASSWORD_LIFE_TIME','PASSWORD_GRACE_TIME',\n                        'FAILED_LOGIN_ATTEMPTS','PASSWORD_LOCK_TIME',\n                        'PASSWORD_REUSE_TIME','PASSWORD_REUSE_MAX',\n                        'PASSWORD_VERIFY_FUNCTION','INACTIVE_ACCOUNT_TIME')\nORDER BY profile, resource_name;",
+      "olhar": "PASSWORD_LIFE_TIME e o relogio: 180 dias e o padrao do DEFAULT profile a partir do 12c e pegou muita gente de surpresa em bancos migrados. FAILED_LOGIN_ATTEMPTS explica LOCKED(TIMED). INACTIVE_ACCOUNT_TIME (12c+) tranca conta que simplesmente nao foi usada - causa classica de conta de contingencia morta na hora que precisa.",
+      "armadilha": "'DEFAULT' como limite nao quer dizer ilimitado: quer dizer 'herda do profile DEFAULT'. Voce precisa ler a linha do profile DEFAULT para saber o valor real - muita gente le 'DEFAULT' e conclui que nao expira."
+    },
+    {
+      "titulo": "Descobrir quem realmente usa a conta antes de mexer",
+      "objetivo": "Saber o impacto: renovar senha de conta de aplicacao exige trocar a senha na aplicacao tambem.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- quem esta conectado com ela agora, e de onde:\nSELECT username, COUNT(*) AS sessoes,\n       COUNT(DISTINCT machine) AS maquinas,\n       LISTAGG(DISTINCT program, ', ') WITHIN GROUP (ORDER BY program) AS programas\nFROM gv$session\nWHERE username IS NOT NULL\nGROUP BY username\nORDER BY sessoes DESC;\n\n-- ultimo login registrado (12c+): conta sem uso recente e candidata a desativacao\nSELECT username, account_status,\n       TO_CHAR(last_login,'DD/MM/YYYY HH24:MI') AS ultimo_login\nFROM dba_users\nWHERE username NOT IN ('ANONYMOUS','XS$NULL')\nORDER BY last_login NULLS FIRST;",
+      "olhar": "Conta com muitas sessoes e varias maquinas e conta de aplicacao: mexer nela sem combinar derruba servico. Conta com last_login nulo ou muito antigo provavelmente nao e usada - o certo e desativar, nao renovar eternamente.",
+      "armadilha": "gv$session mostra quem esta conectado AGORA. Uma aplicacao que so conecta de madrugada (batch) nao aparece de dia e voce conclui que a conta esta ociosa. Confirme com last_login e com o dono do sistema antes de desativar."
+    },
+    {
+      "titulo": "Ver as tentativas de login que estao falhando",
+      "objetivo": "Distinguir 'senha venceu' de 'alguem esta tentando senha errada' - o segundo tranca a conta de novo depois que voce destrancar.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(event_timestamp,'DD/MM HH24:MI') AS quando,\n       dbusername, userhost, authentication_type, return_code\nFROM unified_audit_trail\nWHERE action_name = 'LOGON'\n  AND return_code <> 0\n  AND event_timestamp > SYSTIMESTAMP - INTERVAL '3' DAY\nORDER BY event_timestamp DESC FETCH FIRST 40 ROWS ONLY;",
+      "olhar": "return_code 1017 e senha errada, 28000 e conta bloqueada, 28001 e senha expirada. Muitos 1017 da MESMA maquina apontam para uma aplicacao com senha antiga no arquivo de configuracao - e ela que esta trancando a conta repetidamente.",
+      "armadilha": "Se a auditoria unificada nao estiver habilitada, esta consulta volta vazia - e isso NAO significa que nao ha tentativas. Nesse caso procure no alert log e no listener.log. Cuidado tambem com o volume: sem o filtro de data, unified_audit_trail pode ser gigantesca e a consulta demora."
+    },
+    {
+      "titulo": "Renovar a senha da conta que esta vencendo",
+      "objetivo": "Reiniciar o relogio da expiracao sem trocar a senha em uso, quando a aplicacao nao pode ser alterada agora.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme com o dono do sistema QUEM usa a conta (passo 4) - trocar a senha de conta de aplicacao sem atualizar o lado da aplicacao causa indisponibilidade imediata. 2) Guarde o hash atual antes de mexer: SELECT name, spare4, password FROM sys.user$ WHERE name = '<CONTA>'; ele permite voltar exatamente a senha anterior. 3) Combine janela se a conta for de producao. 4) Registre a acao no caso. 5) NUNCA digite a senha em texto claro em chamado, log ou historico de terminal.",
+      "comando": "-- Opcao A - manter a MESMA senha e so reiniciar o relogio (nao quebra a aplicacao).\n-- Reaproveita o hash atual, entao a senha em uso continua valendo:\nSELECT 'ALTER USER ' || name || ' IDENTIFIED BY VALUES ''' || spare4 || ';' || password || ''';' AS comando_gerado\nFROM sys.user$\nWHERE name = '&conta';\n\n-- Opcao B - senha nova de verdade (exige atualizar a aplicacao junto):\n-- ALTER USER <conta> IDENTIFIED BY \"<senha_nova>\";",
+      "olhar": "Depois de executar o comando gerado, confira: SELECT username, account_status, expiry_date FROM dba_users WHERE username = '<CONTA>'; o status deve voltar para OPEN e expiry_date deve saltar para hoje + PASSWORD_LIFE_TIME.",
+      "armadilha": "A opcao A e a que salva producao de madrugada, mas ela REAPROVEITA a senha antiga - se a conta expirou porque a politica exige troca periodica, voce acabou de burlar a politica. Use como paliativo para restabelecer o servico e agende a troca real. Note ainda que IDENTIFIED BY VALUES depende do formato do hash (10g/11g/12c); em bancos com varios verificadores, copie exatamente o que a consulta gerou."
+    },
+    {
+      "titulo": "Desbloquear a conta",
+      "objetivo": "Restabelecer o login de uma conta trancada por tentativas erradas ou por inatividade.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Descubra POR QUE trancou (passo 5) - se ha uma aplicacao tentando senha errada em loop, ela vai trancar de novo em minutos e voce vai achar que o comando nao funcionou. 2) Confirme que a conta deve mesmo existir e estar ativa: conta trancada ha meses pode ter sido desativada de proposito pela seguranca. 3) Registre a acao e o solicitante no caso.",
+      "comando": "ALTER USER &conta ACCOUNT UNLOCK;",
+      "olhar": "Confira account_status voltando para OPEN. Se voltar a LOCKED(TIMED) sozinha em seguida, o problema e a origem das tentativas erradas, nao a conta.",
+      "armadilha": "Desbloquear conta trancada por FAILED_LOGIN_ATTEMPTS sem corrigir a origem e enxugar gelo. Pior: cada rodada de tentativas erradas de uma aplicacao mal configurada pode ser confundida com ataque - avise a seguranca em vez de so destrancar repetidamente."
+    },
+    {
+      "titulo": "Ajustar a politica no profile (tratar a causa, nao a conta)",
+      "objetivo": "Quando dezenas de contas vencem juntas, o problema e a politica aplicada a contas de servico, nao cada conta.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Isto tem impacto de SEGURANCA e normalmente exige aprovacao formal da area de seguranca da informacao - nao e decisao do DBA sozinho. 2) NAO altere o profile DEFAULT: crie um profile especifico para contas de servico e mova so elas. Mexer no DEFAULT muda a politica de TODO usuario do banco, inclusive os pessoais. 3) Levante antes quais contas usam o profile: SELECT username FROM dba_users WHERE profile = '<PROFILE>'; 4) Registre a justificativa no caso.",
+      "comando": "-- Profile dedicado a contas de servico/aplicacao, que nao podem expirar sem aviso:\nCREATE PROFILE APP_SERVICE LIMIT\n  PASSWORD_LIFE_TIME      UNLIMITED\n  FAILED_LOGIN_ATTEMPTS   10\n  PASSWORD_LOCK_TIME      1;\n\n-- Mover apenas a conta de aplicacao para ele:\nALTER USER <conta_de_aplicacao> PROFILE APP_SERVICE;",
+      "olhar": "Depois de mover, confirme em dba_users que so as contas pretendidas mudaram de profile e que expiry_date virou nulo nelas.",
+      "armadilha": "PASSWORD_LIFE_TIME UNLIMITED em conta PESSOAL e desvio de conformidade e costuma ser barrado em auditoria. Aplique so a conta de servico, com justificativa registrada. E lembre: alterar o profile NAO desexpira quem ja esta EXPIRED - a conta continua precisando do ALTER USER do passo 6."
+    },
+    {
+      "titulo": "Fechar a causa",
+      "objetivo": "Conta expirada e um incidente 100% previsivel - o que resolve de verdade e o aviso antecipado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "-- a agenda dos proximos 90 dias, para virar rotina e nao surpresa:\nSELECT TO_CHAR(expiry_date,'YYYY-MM') AS mes,\n       COUNT(*) AS contas_que_vencem,\n       LISTAGG(username, ', ') WITHIN GROUP (ORDER BY expiry_date) AS quais\nFROM dba_users\nWHERE expiry_date BETWEEN SYSDATE AND SYSDATE + 90\n  AND account_status = 'OPEN'\nGROUP BY TO_CHAR(expiry_date,'YYYY-MM')\nORDER BY mes;",
+      "olhar": "Meses com muitas contas vencendo juntas denunciam contas criadas em lote (migracao, implantacao) - elas vao expirar em lote tambem. Esse e o achado que vai para a prevencao do RCA.",
+      "armadilha": "O framework ja cobre isto no check accounts_expiring. Coloque o servidor na rotina periodica de health check: o unico jeito de esse incidente nao acontecer e alguem olhar a agenda ANTES do vencimento, e nao depois que a aplicacao caiu."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

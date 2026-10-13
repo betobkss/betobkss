@@ -1,0 +1,132 @@
+{
+  "id": "redo_log_switch",
+  "ordem": 16,
+  "titulo": "Redo mal dimensionado, troca de log demais e commit lento",
+  "quando_usar": "O relatorio apontou excesso de log switches em 24h; a espera 'log file sync' ou 'log file switch (checkpoint incomplete)' esta no topo; ou a aplicacao reclama que o COMMIT ficou lento sem o SQL ter mudado.",
+  "tags": [
+    "redo",
+    "log switch",
+    "log file sync",
+    "checkpoint",
+    "commit",
+    "lgwr",
+    "redo log",
+    "archiver",
+    "desempenho"
+  ],
+  "sintomas": [
+    "commit lento",
+    "log file sync alto",
+    "log file switch (checkpoint incomplete)",
+    "cannot allocate new log",
+    "muitas trocas de log",
+    "checkpoint not complete no alert log",
+    "aplicacao trava em rajadas"
+  ],
+  "secoes": [
+    "Redo log switches (24h)",
+    "Redo",
+    "Log switch",
+    "Distribuicao de esperas (ASH)"
+  ],
+  "erros_ora": [
+    "ORA-00257",
+    "ORA-16038",
+    "ORA-00312"
+  ],
+  "fontes": [
+    "Oracle Database Performance Tuning Guide - Instance Tuning Using Performance Views, Redo Log Buffer",
+    "Oracle Database Administrator's Guide - Managing the Redo Log",
+    "Oracle Database Reference - V$LOG, V$LOG_HISTORY, V$INSTANCE_RECOVERY, V$SYSTEM_EVENT"
+  ],
+  "nota": "A regra de bolso classica e no maximo 3 a 4 trocas por hora em regime normal. Trocar demais custa caro em tres frentes ao mesmo tempo: checkpoint incompleto trava a aplicacao INTEIRA, o archiver gera muito mais arquivo (e enche o destino), e o standby recebe rajadas. Mas cuidado com a inversao de causa: redo demais as vezes nao e redo pequeno, e aplicacao gerando redo demais (commit em loop, DML sem bind, indice sobrando). Meça antes de sair redimensionando.",
+  "passos": [
+    {
+      "titulo": "Contar as trocas por hora nos ultimos dias",
+      "objetivo": "Confirmar o excesso com numero e descobrir se e constante ou se concentra em uma janela.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(first_time,'DD/MM') AS dia,\n       COUNT(*) AS trocas_no_dia,\n       ROUND(COUNT(*)/24,1) AS media_por_hora,\n       MAX(por_hora) AS pico_em_uma_hora\nFROM (\n  SELECT first_time,\n         COUNT(*) OVER (PARTITION BY TO_CHAR(first_time,'DD/MM HH24')) AS por_hora\n  FROM v$log_history\n  WHERE first_time > SYSDATE - 7\n)\nGROUP BY TO_CHAR(first_time,'DD/MM')\nORDER BY dia;",
+      "olhar": "media_por_hora acima de 4 ja pede atencao; acima de 12 (uma troca a cada 5 minutos) e problema. Compare media com pico: se a media e baixa mas o pico e altissimo, o alvo e a janela de batch, nao o dimensionamento geral.",
+      "armadilha": "Nao conclua nada de um dia isolado: carga de fechamento mensal ou uma carga pontual distorcem tudo. Olhe a serie e procure o PADRAO."
+    },
+    {
+      "titulo": "Ver o pico por hora do dia",
+      "objetivo": "Localizar a janela exata em que o redo dispara, para cruzar com o que roda nela.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT TO_CHAR(first_time,'DD/MM HH24') AS dia_hora,\n       COUNT(*) AS trocas\nFROM v$log_history\nWHERE first_time > SYSDATE - 3\nGROUP BY TO_CHAR(first_time,'DD/MM HH24')\nHAVING COUNT(*) > 4\nORDER BY trocas DESC FETCH FIRST 25 ROWS ONLY;",
+      "olhar": "As horas que aparecem aqui sao as que voce precisa investigar. Cruze com o horario dos jobs e com a carga por modulo do relatorio: quase sempre ha um batch, uma carga ou um expurgo por tras.",
+      "armadilha": "Hora com muitas trocas E TAMBEM o momento em que o archiver mais trabalha. Se o destino de archive encheu, a causa raiz provavel esta nesta janela - e o sintoma vai aparecer como ORA-00257, que parece outro problema."
+    },
+    {
+      "titulo": "Conferir o dimensionamento atual dos grupos",
+      "objetivo": "Saber com o que voce esta trabalhando: tamanho, quantidade de grupos e de membros.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT l.group#, l.thread#, l.sequence#,\n       ROUND(l.bytes/1024/1024) AS mb,\n       l.members, l.archived, l.status,\n       TO_CHAR(l.first_time,'DD/MM HH24:MI') AS inicio\nFROM v$log l\nORDER BY l.thread#, l.group#;\n\nSELECT group#, status, type, SUBSTR(member,-60) AS membro\nFROM v$logfile\nORDER BY group#, member;",
+      "olhar": "Redo de 50 MB (o padrao antigo de instalacao) em banco com carga real e a causa mais comum de troca excessiva - hoje 512 MB a 4 GB e o normal. members = 1 e desvio de conformidade: perder aquele arquivo pode custar o banco. status INVALID ou STALE em v$logfile exige acao.",
+      "armadilha": "Menos de 3 grupos deixa o LGWR esperando o archiver liberar o proximo - e a receita do 'checkpoint not complete'. Se o banco esta em ASM ou com multiplexacao pelo storage, discuta com a infraestrutura antes de contar membros."
+    },
+    {
+      "titulo": "Medir o custo real das esperas de redo",
+      "objetivo": "Separar tres problemas que se confundem: commit lento, disco de redo lento e checkpoint travando a instancia.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT event, total_waits, time_waited_micro/1000000 AS seg_total,\n       ROUND(average_wait*10,2) AS media_ms\nFROM v$system_event\nWHERE event IN ('log file sync','log file parallel write',\n                'log file switch completion',\n                'log file switch (checkpoint incomplete)',\n                'log file switch (archiving needed)',\n                'log buffer space','switch logfile command')\nORDER BY time_waited_micro DESC;",
+      "olhar": "'log file sync' alto com 'log file parallel write' BAIXO = o disco esta bem, o problema e a aplicacao dando commit demais (commit dentro de loop). Os dois altos = disco de redo lento. 'log file switch (checkpoint incomplete)' com qualquer valor relevante = redo pequeno ou poucos grupos: a instancia inteira para. 'log file switch (archiving needed)' aponta destino de archive com problema.",
+      "armadilha": "V$SYSTEM_EVENT e acumulado desde o startup: um numero grande pode ser de meses atras. Para julgar o AGORA, compare duas coletas com alguns minutos de intervalo ou use a distribuicao de esperas do ASH que o relatorio ja traz."
+    },
+    {
+      "titulo": "Ver quanto redo a aplicacao esta gerando",
+      "objetivo": "Responder se o problema e o redo pequeno ou a aplicacao gerando volume demais.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, value,\n       ROUND(value/1024/1024/1024,2) AS gb\nFROM v$sysstat\nWHERE name IN ('redo size','redo writes','redo entries',\n               'redo log space requests','redo buffer allocation retries',\n               'user commits','user rollbacks');",
+      "olhar": "Divida 'redo size' por 'user commits': se o redo por commit e minusculo, a aplicacao esta dando commit demais (cada commit forca o LGWR a escrever e esperar). 'redo log space requests' crescente confirma que a sessao esperou espaco de redo. 'redo buffer allocation retries' alto sugere log_buffer pequeno.",
+      "armadilha": "Tambem sao numeros acumulados desde o startup. E lembre: reduzir redo mexendo em NOLOGGING parece atalho e e perigoso - objeto criado NOLOGGING nao e recuperavel pelo backup e aparece em REPORT UNRECOVERABLE. Nunca use NOLOGGING para 'resolver' log switch."
+    },
+    {
+      "titulo": "Perguntar ao Oracle qual seria o tamanho ideal",
+      "objetivo": "O proprio banco calcula o tamanho de redo que atenderia ao alvo de recuperacao configurado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT target_mttr, estimated_mttr,\n       optimal_logfile_size AS mb_sugerido,\n       ckpt_block_writes\nFROM v$instance_recovery;",
+      "olhar": "optimal_logfile_size e a sugestao do Oracle em MB, com base em FAST_START_MTTR_TARGET. Use como referencia, junto com a regra pratica de dimensionar para trocar a cada 15-30 minutos no pico.",
+      "armadilha": "optimal_logfile_size vem NULO quando FAST_START_MTTR_TARGET nao esta definido - e o caso mais comum. Nao e erro da consulta; nesse cenario dimensione pela taxa de geracao de redo do passo anterior."
+    },
+    {
+      "titulo": "Achar as sessoes e os SQLs que mais geram redo",
+      "objetivo": "Se a causa e volume, atacar a origem rende muito mais que redimensionar arquivo.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT s.sid, s.username, s.program, s.module,\n       ROUND(st.value/1024/1024,2) AS redo_mb\nFROM v$sesstat st\nJOIN v$statname n ON n.statistic# = st.statistic#\nJOIN v$session  s ON s.sid = st.sid\nWHERE n.name = 'redo size' AND st.value > 0\nORDER BY st.value DESC FETCH FIRST 15 ROWS ONLY;",
+      "olhar": "Uma unica sessao respondendo pela maior parte do redo entrega o culpado na hora - normalmente um batch, uma carga ou um DELETE gigante. Pegue module/program e leve ao dono da aplicacao.",
+      "armadilha": "So enxerga sessao CONECTADA agora: o batch que rodou de madrugada nao aparece. Para historico, use a carga por modulo do relatorio ou o AWR."
+    },
+    {
+      "titulo": "Aumentar o redo (criar grupos maiores e retirar os pequenos)",
+      "objetivo": "Corrigir o dimensionamento sem parar o banco - redo log nao se redimensiona, se substitui.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme espaco no destino (ASM diskgroup ou filesystem) para conviver com os grupos NOVOS e os ANTIGOS ao mesmo tempo - eles coexistem durante a troca. 2) Grupo so pode ser removido com status INACTIVE e archived=YES; nunca tente remover o CURRENT. 3) Em RAC, cada thread tem seus grupos: faca thread por thread. 4) Combine janela: os switches forcados geram I/O e um pico de archive. 5) Registre a acao no caso. 6) Tenha o backup do controlfile em dia (a estrutura de redo fica registrada nele).",
+      "comando": "-- 1) criar os grupos novos, ja no tamanho correto (ajuste caminho e tamanho):\nALTER DATABASE ADD LOGFILE GROUP 11 SIZE 1024M;\nALTER DATABASE ADD LOGFILE GROUP 12 SIZE 1024M;\nALTER DATABASE ADD LOGFILE GROUP 13 SIZE 1024M;\n\n-- 2) forcar o ciclo ate o grupo antigo ficar INACTIVE:\nALTER SYSTEM SWITCH LOGFILE;\nALTER SYSTEM CHECKPOINT;\n\n-- 3) conferir o status ANTES de remover:\n-- SELECT group#, status, archived FROM v$log ORDER BY group#;\n\n-- 4) remover os antigos, um a um, so quando INACTIVE e archived=YES:\nALTER DATABASE DROP LOGFILE GROUP 1;",
+      "olhar": "Ao final, v$log deve mostrar apenas os grupos novos, todos com o tamanho pretendido. Depois de um dia de operacao, refaca o passo 1: a media por hora deve cair para a faixa de 3 a 4.",
+      "armadilha": "DROP LOGFILE apaga o arquivo apenas no ASM/OMF; em filesystem o arquivo FICA no disco ocupando espaco e voce precisa remover manualmente depois de conferir. E o erro classico: tentar remover o grupo CURRENT ou um ainda nao arquivado - o Oracle recusa, e insistir com o banco sob pressao e como se perde redo."
+    },
+    {
+      "titulo": "Alivio imediato quando o 'checkpoint incomplete' esta travando agora",
+      "objetivo": "Destravar a aplicacao no incidente, enquanto o redimensionamento definitivo e planejado.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Confirme que o destino de archive tem espaco - se o problema for archive cheio, forcar switch PIORA (veja o playbook de archive). 2) CHECKPOINT gera rajada de escrita de datafile: evite disparar em cima de outro pico de I/O. 3) Isto e paliativo, nao correcao: sem redimensionar, o problema volta. 4) Registre a acao no caso.",
+      "comando": "ALTER SYSTEM CHECKPOINT;\nALTER SYSTEM SWITCH LOGFILE;\nALTER SYSTEM ARCHIVE LOG CURRENT;",
+      "olhar": "Acompanhe v$log: os grupos devem sair de ACTIVE para INACTIVE conforme o checkpoint conclui. As sessoes presas em 'log file switch (checkpoint incomplete)' devem voltar a andar.",
+      "armadilha": "Nao entre em loop de SWITCH LOGFILE achando que acelera: cada troca gera mais archive e, se o destino estiver apertado, voce troca um travamento por um ORA-00257 - que para o banco por inteiro em vez de so atrasar."
+    }
+  ],
+  "verificado": {
+    "nivel": "homologacao",
+    "em": "2026-09-18"
+  }
+}

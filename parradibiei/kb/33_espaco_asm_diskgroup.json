@@ -1,0 +1,151 @@
+{
+  "id": "espaco_asm_diskgroup",
+  "ordem": 33,
+  "titulo": "Alerta de espaco - separar tablespace de diskgroup e ampliar o ASM",
+  "quando_usar": "Alerta de espaco citando tablespace ou datafile perto de 100%, em ambiente com ASM. Use ANTES de decidir se o caso e um RESIZE de tres minutos ou uma ampliacao de storage com rebalance: a mesma mensagem de alerta cobre os dois, e o custo difere em ordens de grandeza.",
+  "tags": [
+    "espaco",
+    "asm",
+    "diskgroup",
+    "tablespace",
+    "datafile",
+    "afd",
+    "rebalance",
+    "add disk",
+    "capacidade"
+  ],
+  "sintomas": [
+    "alerta de tablespace acima de 90%",
+    "datafile nao consegue mais crescer",
+    "diskgroup ASM sem espaco",
+    "autoextend falhando"
+  ],
+  "erros_ora": [
+    "ORA-01653",
+    "ORA-01654",
+    "ORA-01119",
+    "ORA-15041",
+    "ORA-15040"
+  ],
+  "secoes": [
+    "Espaco",
+    "ASM",
+    "Capacidade",
+    "Armazenamento"
+  ],
+  "fontes": [
+    "Oracle Automatic Storage Management Administrator's Guide - Altering Disk Groups",
+    "Oracle Grid Infrastructure - ASM Filter Driver (AFD) label management",
+    "Caso real (09/2026): diskgroup de 6 TB a 94,7%, ampliado para 8 TB online, sem indisponibilidade"
+  ],
+  "nota": "O alerta quase sempre chega escrito como 'tablespace X em 94%', e esse texto esconde tres problemas diferentes. Tablespace cheia com diskgroup folgado e um RESIZE. Autoextend travado no MAXSIZE e uma linha de comando. Diskgroup cheio e projeto de capacidade com rebalance. Descobrir qual deles e o seu custa duas consultas; errar custa uma janela. E lembre: ampliar o diskgroup NAO aumenta a tablespace - sao dois passos, e parar no primeiro deixa o alerta disparando.",
+  "passos": [
+    {
+      "titulo": "Separar os tres cenarios antes de qualquer coisa",
+      "objetivo": "Decidir se o caso e RESIZE, MAXSIZE ou ampliacao de storage. Sao custos e riscos completamente diferentes.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT t.tablespace_name,\n       ROUND(SUM(t.bytes)/1024/1024/1024,1)              AS total_gb,\n       ROUND(SUM(NVL(f.bytes,0))/1024/1024/1024,1)       AS livre_gb,\n       ROUND(100*(1-SUM(NVL(f.bytes,0))/SUM(t.bytes)),2) AS pct_usado\nFROM   (SELECT tablespace_name, SUM(bytes) bytes FROM dba_data_files\n        GROUP BY tablespace_name) t\n       LEFT JOIN (SELECT tablespace_name, SUM(bytes) bytes FROM dba_free_space\n                  GROUP BY tablespace_name) f\n       ON t.tablespace_name = f.tablespace_name\nGROUP  BY t.tablespace_name ORDER BY 4 DESC;\n\nSELECT name, ROUND(total_mb/1024,1) AS gb_total,\n       ROUND(free_mb/1024,1) AS gb_livres,\n       ROUND(100*free_mb/NULLIF(total_mb,0),1) AS pct_livre\nFROM   v$asm_diskgroup ORDER BY 4;",
+      "olhar": "Compare as duas saidas. Tablespace cheia + diskgroup folgado = RESIZE ou ADD DATAFILE, sem tocar no ASM. Diskgroup tambem cheio = ampliacao de storage.",
+      "armadilha": "O texto do alerta engana. 'Datafile X em 94,68%' pode ser tablespace cheia num diskgroup vazio, ou um diskgroup esgotado. Ir direto ao ALTER DATABASE DATAFILE RESIZE no segundo caso devolve ORA-01119 e o tempo esta perdido. Em CDB, confirme tambem em qual container esta a tablespace - dba_data_files so enxerga o container da sessao."
+    },
+    {
+      "titulo": "Ler os datafiles: autoextend, MAXSIZE e o teto de 32 GB",
+      "objetivo": "Muitas vezes o espaco existe e o arquivo apenas bateu num limite configurado.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT file_id, SUBSTR(file_name,1,60) AS file_name,\n       ROUND(bytes/1024/1024/1024,1)    AS gb,\n       ROUND(maxbytes/1024/1024/1024,1) AS max_gb,\n       autoextensible AS autoext,\n       ROUND(increment_by*8192/1024/1024) AS incr_mb\nFROM   dba_data_files WHERE tablespace_name = '&&tablespace' ORDER BY file_id;\n\nSELECT tablespace_name, bigfile, block_size, status, contents\nFROM   dba_tablespaces WHERE tablespace_name = '&&tablespace';",
+      "olhar": "gb igual a max_gb com autoext YES significa teto atingido - eleve o MAXSIZE. A coluna BIGFILE decide o comando final: YES usa ALTER TABLESPACE RESIZE, NO usa ADD DATAFILE.",
+      "armadilha": "Datafile smallfile com bloco de 8K para em 32 GB por limite FISICO do formato: aumentar o MAXSIZE acima disso nao adianta, e preciso ADICIONAR outro datafile. Com bloco de 16K o teto e 64 GB. Conferir o block_size antes evita um ORA-01144 no meio da janela."
+    },
+    {
+      "titulo": "Estado do diskgroup e ausencia de rebalance em andamento",
+      "objetivo": "Saber o tipo de redundancia, o tamanho da AU e se ha outra operacao ocupando o ASM.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT name, state, type, compatibility, database_compatibility,\n       allocation_unit_size/1024/1024 AS au_mb,\n       total_mb, free_mb, usable_file_mb, offline_disks\nFROM   v$asm_diskgroup WHERE name = '&&diskgroup';\n\nSELECT disk_number, name, path, header_status, mode_status, state,\n       ROUND(total_mb/1024,1) AS gb, ROUND(free_mb/1024,1) AS gb_livres\nFROM   v$asm_disk WHERE group_number =\n       (SELECT group_number FROM v$asm_diskgroup WHERE name = '&&diskgroup')\nORDER  BY disk_number;\n\nSELECT group_number, pass, state, power, sofar, est_work, est_minutes\nFROM   v$asm_operation;",
+      "olhar": "v$asm_operation tem de vir VAZIA. O type (EXTERN, NORMAL, HIGH) define se ha regra de failgroup. O tamanho dos discos atuais define o tamanho do disco novo. offline_disks maior que zero e problema anterior que precisa ser tratado primeiro.",
+      "armadilha": "Nao se adiciona disco durante outro rebalance: as duas operacoes competem e o resultado e imprevisivel. E em redundancia NORMAL ou HIGH, adicionar um disco solto sem respeitar failgroup desequilibra a protecao sem avisar."
+    },
+    {
+      "titulo": "Provar que o disco candidato esta REALMENTE livre",
+      "objetivo": "Este e o passo que evita destruir dado alheio. Em storage compartilhado, um disco 'livre' pode pertencer a outro servidor.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT /dev/sdX\nblkid /dev/sdX\npvs\nls -l /dev/mapper/\n/usr/lib/udev/scsi_id -g -u -d /dev/sdX",
+      "olhar": "blkid sem saida = nenhum filesystem. pvs sem o device = nao e LVM. ANOTE o WWID do scsi_id: e ele, e nao a letra do device, que identifica o disco com seguranca.",
+      "armadilha": "A letra do device (sdo, sdp) MUDA entre reboots e apos rescan de storage. Rotular por letra e como apagar arquivo por posicao na listagem. Confirme o WWID na mesma sessao, segundos antes do comando destrutivo. E peca confirmacao formal ao time de storage de que o LUN e novo e dedicado - em VMware, verifique tambem se nao esta anexado a outra VM com multi-writer."
+    },
+    {
+      "titulo": "Descobrir a convencao do ambiente antes de criar algo novo",
+      "objetivo": "Seguir o padrao que ja existe no servidor, em vez de impor um novo.",
+      "risco": "leitura",
+      "onde": "so",
+      "comando": "asmcmd afd_lsdsk\nasmcmd afd_dsget\nasmcmd afd_state\nls -l /dev/oracleafd/disks/",
+      "olhar": "Repare se os discos existentes apontam para PARTICOES (/dev/sdX1) ou para discos inteiros (/dev/sdX) - e siga o mesmo. O afd_dsget mostra o discovery string: se ele nao casar com o caminho do disco novo, o AFD nunca vera o device.",
+      "armadilha": "Essa convencao normalmente NAO esta documentada em lugar nenhum - so se descobre lendo o afd_lsdsk. Criar o disco novo fora do padrao funciona, mas deixa o servidor inconsistente consigo mesmo, e o proximo plantonista vai perder tempo entendendo por que um disco e diferente dos outros. Confira tambem o asm_diskstring do ASM (deve cobrir AFD:*), que e parametro diferente do discovery string do AFD."
+    },
+    {
+      "titulo": "Particionar o disco novo",
+      "objetivo": "Preparar o device no mesmo formato dos que ja funcionam.",
+      "risco": "destrutivo",
+      "onde": "so",
+      "antes_de_executar": "1) Reconferir o WWID com scsi_id IMEDIATAMENTE antes, na mesma sessao. 2) Confirmacao formal do time de storage de que o LUN e novo. 3) Registrar a acao no caso. 4) Pular este passo se a convencao do ambiente usar discos inteiros.",
+      "comando": "# conferir o WWID AGORA, nao confiar no que foi anotado antes\n/usr/lib/udev/scsi_id -g -u -d /dev/sdX\n\nparted -s /dev/sdX mklabel gpt\nparted -s -a optimal /dev/sdX mkpart primary 0% 100%\npartprobe /dev/sdX\nlsblk -o NAME,SIZE,TYPE /dev/sdX",
+      "olhar": "A particao deve aparecer como tipo 'part' com praticamente todo o tamanho do disco. Compare a posse (ls -l) com uma particao que ja funciona no diskgroup.",
+      "armadilha": "E o unico comando IRREVERSIVEL do procedimento: parted na letra errada destroi um disco em producao em menos de um segundo, sem pedir confirmacao (o -s suprime justamente isso). O intervalo entre conferir o WWID e executar o parted tem de ser de segundos, na mesma sessao - um rescan de storage no meio renomeia os devices."
+    },
+    {
+      "titulo": "Rotular o disco no AFD - como ROOT",
+      "objetivo": "Dar ao disco um nome estavel, independente da letra do device.",
+      "risco": "mudanca",
+      "onde": "so",
+      "antes_de_executar": "1) Usar o ORACLE_HOME do GRID, nao o do banco. 2) Em RAC, apos rotular no primeiro no, rodar afd_scan em TODOS os demais. 3) Registrar a acao.",
+      "comando": "# como root, com o ambiente do Grid\nexport ORACLE_HOME=<GRID_HOME>\nexport PATH=$ORACLE_HOME/bin:$PATH\n\n$ORACLE_HOME/bin/asmcmd afd_label <LABEL> /dev/sdX1\n$ORACLE_HOME/bin/asmcmd afd_lsdsk\nls -l /dev/oracleafd/disks/",
+      "olhar": "O novo rotulo deve aparecer no afd_lsdsk apontando para o device certo, e o no em /dev/oracleafd/disks/ deve nascer com a MESMA posse dos existentes.",
+      "armadilha": "Rodar como o usuario grid devolve 'No devices to be labeled' e ASMCMD-9513 - mensagem enganosa que parece ausencia de disco e e falta de privilegio: o grid normalmente NAO pertence ao grupo disk, e os devices sao root:disk 660, entao ele nem consegue abrir o arquivo para inspecionar. afd_label EXIGE root. Se a mensagem persistir como root, verifique o discovery string com afd_dsget."
+    },
+    {
+      "titulo": "Confirmar que o ASM enxerga o disco antes de adicionar",
+      "objetivo": "Garantir que o disco esta livre e com o tamanho correto do ponto de vista do ASM.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT path, header_status, group_number, mount_status,\n       os_mb, ROUND(os_mb/1024,1) AS os_gb, total_mb\nFROM   v$asm_disk WHERE path LIKE 'AFD:%' AND group_number = 0;",
+      "olhar": "header_status CANDIDATE ou PROVISIONED e group_number 0 = pronto para entrar. Compare os_mb com o total_mb dos discos que ja estao no diskgroup.",
+      "armadilha": "total_mb vem ZERO enquanto mount_status e CLOSED - isso e normal, o ASM ainda nao abriu o disco. Quem decide e a coluna os_mb. Ja header_status MEMBER ou FOREIGN e parada obrigatoria: o disco pertence a outro diskgroup ou a outro cluster, e adiciona-lo destroi o dado do dono."
+    },
+    {
+      "titulo": "Adicionar o disco ao diskgroup",
+      "objetivo": "Ampliar o espaco. O disco entra e o ASM redistribui os dados em background.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) v$asm_operation vazia. 2) Janela combinada: o rebalance gera IO pesado, ainda que a operacao seja online. 3) Registrar a acao. 4) Em NORMAL/HIGH redundancy, definir o FAILGROUP explicitamente.",
+      "comando": "ALTER DISKGROUP <diskgroup>\n  ADD DISK 'AFD:<LABEL1>' NAME <LABEL1>,\n           'AFD:<LABEL2>' NAME <LABEL2>\n  REBALANCE POWER 4;",
+      "olhar": "O total_mb do diskgroup sobe IMEDIATAMENTE - o espaco nao depende do fim do rebalance. Confirme offline_disks igual a zero logo apos o comando.",
+      "armadilha": "POWER alto acelera o rebalance e pesa no IO da producao; POWER baixo demora e pode atravessar a janela. Comece em 4 e ajuste EM EXECUCAO com ALTER DISKGROUP ... REBALANCE POWER n, sem reiniciar. Rollback: ALTER DISKGROUP ... DROP DISK, que tambem rebalanceia e so funciona enquanto os dados couberem nos discos originais."
+    },
+    {
+      "titulo": "Acompanhar o rebalance ate o fim",
+      "objetivo": "Confirmar que a redistribuicao terminou de verdade, e nao apenas que a view esvaziou.",
+      "risco": "leitura",
+      "onde": "sql",
+      "comando": "SELECT group_number, pass, state, power, sofar, est_work,\n       ROUND(100*sofar/NULLIF(est_work,0),1) AS pct,\n       est_rate AS au_por_min, est_minutes\nFROM   v$asm_operation ORDER BY group_number, pass;\n\nSELECT disk_number, name, ROUND(total_mb/1024,1) AS gb,\n       ROUND(free_mb/1024,1) AS gb_livres, state, mode_status\nFROM   v$asm_disk WHERE group_number =\n       (SELECT group_number FROM v$asm_diskgroup WHERE name = '&&diskgroup')\nORDER  BY disk_number;",
+      "olhar": "A prova de fim nao e a view vazia: e o free_mb ficar PARECIDO entre todos os discos. Use (est_work - sofar) / est_rate para calcular o tempo restante.",
+      "armadilha": "est_minutes e inutil no inicio - costuma vir 0 ou um numero absurdo enquanto o ASM nao tem amostra suficiente. Confie na tendencia do pct medido com horario anotado. O ASM 12.2 em diante mostra VARIAS linhas, uma por PASS (RESYNC, REBALANCE, COMPACT): ver uma delas em DONE nao significa que acabou."
+    },
+    {
+      "titulo": "Estender a tablespace - o passo que fecha o alerta",
+      "objetivo": "O diskgroup cresceu; a tablespace nao. Sem este passo o alerta continua disparando.",
+      "risco": "mudanca",
+      "onde": "sql",
+      "antes_de_executar": "1) Diskgroup com espaco confirmado. 2) Evitar extensao grande no meio do rebalance, para nao somar IO de escrita ao de redistribuicao. 3) Registrar a acao.",
+      "comando": "-- bigfile\nALTER TABLESPACE <ts> RESIZE <tamanho>;\n\n-- smallfile no MAXSIZE, ainda abaixo do teto do formato\nALTER DATABASE DATAFILE <file_id> AUTOEXTEND ON NEXT 512M MAXSIZE 32G;\n\n-- smallfile ja no teto: arquivo novo\nALTER TABLESPACE <ts>\n  ADD DATAFILE '+<DISKGROUP>' SIZE 32G AUTOEXTEND ON NEXT 512M MAXSIZE 32G;",
+      "olhar": "Reexecute a consulta do passo 1 e confirme que o pct_usado caiu. So entao o chamado pode ser fechado.",
+      "armadilha": "Parar no passo anterior e o erro mais comum deste procedimento: o DBA amplia o diskgroup, ve 30% de espaco livre, declara resolvido - e o alerta volta na proxima verificacao, porque a tablespace continua no mesmo tamanho. Ampliar diskgroup e estender tablespace sao dois passos distintos."
+    }
+  ],
+  "verificado": {
+    "nivel": "producao",
+    "em": "2026-09-23"
+  }
+}

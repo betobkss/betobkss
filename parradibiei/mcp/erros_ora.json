@@ -1,0 +1,540 @@
+{
+  "versao": 1,
+  "descricao": "Dicionario de erros do Oracle (ORA-, PLS-, TNS-, ...): traduz o codigo do alert log em causa, acao concreta e nota MOS. O bloco 'mensagens' mapeia o texto que o DRIVER mostra (JDBC/python-oracledb) para o codigo real, porque e a mensagem - nao o codigo - que o DBA cola na tela. Alimentado pelo radar da comunidade (MELHORIA.py --fontes).",
+  "fontes": [
+    "Oracle Database Error Messages",
+    "MOS 153788.1 - ORA-600/ORA-7445/ORA-700 Error Look-up Tool",
+    "Oracle Trace File Analyzer - eventos que disparam coleta automatica",
+    "Oracle Administrator's Guide / Backup and Recovery Guide",
+    "Oracle Error Help (docs.oracle.com/en/error-help) - texto oficial por codigo"
+  ],
+  "erros": {
+    "ORA-00020": {
+      "severidade": "crit",
+      "categoria": "disponibilidade",
+      "escalar": false,
+      "titulo": "Numero maximo de processos atingido",
+      "causa": "PROCESSES esgotado: pool de conexao mal dimensionado, vazamento de sessao ou pico real.",
+      "acao": "1) Confirme em v$resource_limit (o check resource_limits mostra a folga). 2) Veja quem conecta (activity_by_machine): normalmente um app server abriu conexoes demais. 3) Aumentar PROCESSES exige restart - planeje; antes, corrija o pool.",
+      "mos": ""
+    },
+    "ORA-00054": {
+      "severidade": "warn",
+      "categoria": "concorrencia",
+      "escalar": false,
+      "titulo": "Recurso ocupado (NOWAIT)",
+      "causa": "DDL tentou travar objeto em uso. Comum em deploy durante horario de carga.",
+      "acao": "Ache quem segura (v$locked_object + a arvore de bloqueio) e negocie a janela; ou use ALTER SESSION SET DDL_LOCK_TIMEOUT em vez de repetir o DDL.",
+      "mos": ""
+    },
+    "ORA-00060": {
+      "severidade": "warn",
+      "categoria": "concorrencia",
+      "escalar": false,
+      "titulo": "Deadlock detectado",
+      "causa": "Duas sessoes travaram em ordem invertida de recursos. O banco resolveu abortando uma - o problema e da aplicacao.",
+      "acao": "1) Leia o trace de deadlock (o alert log aponta o arquivo): ele traz os SQLs e os objetos. 2) Deadlock de TX em modo exclusivo = ordem de acesso na aplicacao; padronize a ordem. 3) Deadlock com indice/FK sem indice e classico: indexe a foreign key.",
+      "mos": "MOS 62365.1"
+    },
+    "ORA-00257": {
+      "severidade": "crit",
+      "categoria": "recuperabilidade",
+      "escalar": false,
+      "titulo": "Archiver travado - banco parado",
+      "causa": "O redo nao consegue ser arquivado (destino cheio, com erro, ou FRA no limite). Toda transacao para quando os grupos de redo dao a volta.",
+      "acao": "1) EMERGENCIA: confirme o destino em v$archive_dest_status e o uso da FRA. 2) Libere espaco (backup archivelog delete input) ou amplie DB_RECOVERY_FILE_DEST_SIZE. 3) NUNCA apague archivelog pelo SO sem crosscheck no RMAN - isso quebra a cadeia de restore. 4) Depois trate a causa: backup de archive parado ou retencao mal dimensionada.",
+      "mos": "MOS 2015371.1"
+    },
+    "ORA-00600": {
+      "severidade": "crit",
+      "categoria": "bug",
+      "escalar": true,
+      "titulo": "Erro interno do banco",
+      "causa": "Excecao interna do kernel Oracle. Os argumentos entre colchetes ([kkqctdrvsq] etc.) identificam o ponto exato do codigo e sao o que separa um bug conhecido de um novo.",
+      "acao": "1) Nao reinicie por reflexo: o incidente ja esta no ADR. 2) Pegue o primeiro argumento e a versao exata e consulte o ORA-600 Look-up Tool (MOS 153788.1) - a maioria e bug conhecido com patch. 3) Colete o pacote do incidente (adrci ou tfactl diagcollect) e abra SR. 4) Se repetir no mesmo objeto, valide corrupcao (RMAN VALIDATE).",
+      "mos": "MOS 153788.1"
+    },
+    "ORA-01000": {
+      "severidade": "warn",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "titulo": "Limite de cursores abertos",
+      "causa": "Aplicacao nao fecha cursores (vazamento) ou OPEN_CURSORS baixo para a carga.",
+      "acao": "1) Veja o topo de v$open_cursor por sessao: se um modulo cresce sem parar, e vazamento na aplicacao. 2) Subir OPEN_CURSORS sem corrigir o vazamento so adia o erro.",
+      "mos": ""
+    },
+    "ORA-01017": {
+      "severidade": "warn",
+      "categoria": "seguranca",
+      "escalar": false,
+      "titulo": "Usuario ou senha invalidos",
+      "causa": "A rede chegou ao banco e a CREDENCIAL foi recusada. Se aparecer em rajada e no MESMO usuario, quase sempre e senha trocada/expirada e nao ataque - mas repeticao consome FAILED_LOGIN_ATTEMPTS e termina bloqueando a conta (ORA-28000).",
+      "acao": "1) Veja de qual maquina e usuario vem (listener log / auditoria) antes de resetar nada. 2) Cheque ACCOUNT_STATUS e LOCK_DATE em DBA_USERS. 3) Rajada de um APP_SERVER indica deploy com senha antiga - corrija na origem, senao a conta bloqueia sozinha. 4) Senha de servico expirando e o que o check accounts_expiring antecipa.",
+      "mos": ""
+    },
+    "ORA-01031": {
+      "severidade": "warn",
+      "categoria": "seguranca",
+      "escalar": false,
+      "titulo": "Privilegio insuficiente",
+      "causa": "O usuario da sessao nao tem o privilegio exigido pelo comando. Em PL/SQL, lembre que privilegio herdado por ROLE nao vale dentro de bloco com direitos do DEFINER.",
+      "acao": "Confirme o privilegio real: SELECT * FROM session_privs / dba_sys_privs / dba_tab_privs. Se o comando esta dentro de package ou procedure, o GRANT precisa ser DIRETO ao owner, nao via role.",
+      "mos": ""
+    },
+    "ORA-01092": {
+      "severidade": "crit",
+      "categoria": "disponibilidade",
+      "escalar": true,
+      "titulo": "Instancia terminou de forma anormal",
+      "causa": "O banco abortou. A causa verdadeira e o erro que aparece ANTES desta linha no alert log.",
+      "acao": "Suba no alert log ate o primeiro erro do bloco: ele e a causa. Colete o pacote de incidente antes de subir de novo.",
+      "mos": ""
+    },
+    "ORA-01110": {
+      "severidade": "crit",
+      "categoria": "integridade",
+      "escalar": false,
+      "titulo": "Erro em datafile",
+      "causa": "Acompanha outro erro (corrupcao, arquivo ausente, permissao) e identifica o datafile afetado.",
+      "acao": "Trate o erro que veio junto; use este numero de arquivo para localizar o objeto e decidir entre recover e restore.",
+      "mos": ""
+    },
+    "ORA-01119": {
+      "severidade": "crit",
+      "categoria": "espaco",
+      "escalar": false,
+      "titulo": "Falha ao criar arquivo de banco de dados",
+      "causa": "O banco nao conseguiu criar o datafile/tempfile. Costuma ser falta de espaco no filesystem ou diskgroup, permissao do usuario do Oracle no caminho, ou caminho inexistente - e vem acompanhado do erro do SO (ORA-27040 e afins).",
+      "acao": "1) Leia o erro do SO na linha seguinte: ele diz se foi espaco ou permissao. 2) Confira espaco no destino (df -h / v$asm_diskgroup) e DB_CREATE_FILE_DEST. 3) Se foi autoextend de tablespace que falhou, a transacao da aplicacao caiu junto - trate como incidente de espaco, nao de configuracao.",
+      "mos": ""
+    },
+    "ORA-01403": {
+      "severidade": "info",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "secundario": true,
+      "titulo": "NO_DATA_FOUND (SELECT INTO sem linhas)",
+      "causa": "Um SELECT INTO nao encontrou linha. Em PL/SQL isso e uma EXCECAO NORMAL e frequentemente esperada - muito codigo a usa como controle de fluxo. Tambem aparece dentro de mensagens de ferramenta (o proprio SQL Health Check registra 'ORA-01403: no data found' quando nao acha o texto de um SQL no AWR).",
+      "acao": "Nao trate como incidente por si so. Vale investigar apenas se vier junto de falha funcional relatada - e ai o alvo e o codigo que nao previu o caso vazio, nao o banco.",
+      "mos": ""
+    },
+    "ORA-01555": {
+      "severidade": "warn",
+      "categoria": "undo",
+      "escalar": false,
+      "titulo": "Snapshot too old",
+      "causa": "O undo necessario para a leitura consistente foi sobrescrito: a consulta durou mais que a retencao efetiva de undo.",
+      "acao": "1) Compare a duracao da consulta (maxquerylen) com tuned_undoretention em v$undostat. 2) Se a consulta dura mais que a retencao, aumentar undo apenas adia: ataque a consulta. 3) Se a retencao encolheu por falta de espaco, amplie a tablespace de undo. 4) RETENTION GUARANTEE so com ciencia de que DML pode falhar.",
+      "mos": "MOS 1004510.6"
+    },
+    "ORA-01578": {
+      "severidade": "crit",
+      "categoria": "integridade",
+      "escalar": true,
+      "titulo": "Bloco corrompido (corrupcao fisica)",
+      "causa": "Bloco com checksum invalido. Origem tipica: falha de storage/caminho de I/O; as vezes bug.",
+      "acao": "1) Identifique o objeto por file#/block# em dba_extents. 2) Recupere com RMAN BLOCKRECOVER (precisa de backup valido). 3) Se for indice, recriar resolve. 4) Rode RMAN VALIDATE DATABASE para saber se ha mais blocos. 5) Acione a infraestrutura: corrupcao fisica raramente vem sozinha.",
+      "mos": "MOS 836658.1"
+    },
+    "ORA-01652": {
+      "severidade": "warn",
+      "categoria": "espaco",
+      "escalar": false,
+      "titulo": "Nao estendeu segmento temporario",
+      "causa": "TEMP insuficiente para sort/hash - ou uma unica consulta consumindo tudo.",
+      "acao": "1) Antes de ampliar, ache o consumidor (v$sort_usage/v$tempseg_usage): quase sempre e um plano ruim gerando sort gigante. 2) Amplie a TEMP se o consumo for legitimo.",
+      "mos": ""
+    },
+    "ORA-01653": {
+      "severidade": "warn",
+      "categoria": "espaco",
+      "escalar": false,
+      "titulo": "Nao estendeu tabela",
+      "causa": "Tablespace sem espaco e sem autoextend (ou no MAXSIZE).",
+      "acao": "Adicione datafile ou ligue autoextend com MAXSIZE. Verifique tambem se ha datafile com autoextend desligado (o check datafiles_noautoext responde).",
+      "mos": ""
+    },
+    "ORA-01654": {
+      "severidade": "warn",
+      "categoria": "espaco",
+      "escalar": false,
+      "titulo": "Nao estendeu indice",
+      "causa": "Tablespace do indice sem espaco.",
+      "acao": "Mesma acao do ORA-01653, na tablespace do indice.",
+      "mos": ""
+    },
+    "ORA-02063": {
+      "severidade": "info",
+      "categoria": "rede",
+      "escalar": false,
+      "secundario": true,
+      "titulo": "Pilha de dblink: o erro veio do banco remoto",
+      "causa": "'preceding <n> lines from <LINK>'. Nao e um erro: marca que as linhas anteriores foram geradas no banco do OUTRO lado do dblink. Aparece sempre que um erro remoto atravessa o link.",
+      "acao": "O diagnostico esta na linha citada, nao aqui. E ela tambem responde ONDE investigar: o erro e do banco remoto, entao o alert log e os traces a olhar sao os de la.",
+      "mos": ""
+    },
+    "ORA-03113": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Fim de arquivo no canal de comunicacao",
+      "causa": "A sessao caiu: pode ser processo morto no servidor (veja ORA-07445/ORA-00600 no mesmo horario), firewall cortando conexao ociosa, ou queda da instancia.",
+      "acao": "Correlacione pelo horario no alert log: se houver erro interno junto, a causa e o erro interno - o 3113 e so o sintoma no cliente.",
+      "mos": ""
+    },
+    "ORA-03136": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Conexao de entrada expirou antes de autenticar",
+      "causa": "O cliente abriu o socket e nao completou a autenticacao dentro de INBOUND_CONNECT_TIMEOUT (sqlnet.ora / listener.ora). Quase nunca e o banco: e latencia de rede, firewall cortando a sessao no meio do handshake, pool de conexao abrindo em rajada, ou host do cliente em swap.",
+      "acao": "1) Confirme se aparece em rajada (varios no mesmo minuto) - rajada aponta pool/deploy, ocorrencia isolada aponta rede. 2) Confira SQLNET.INBOUND_CONNECT_TIMEOUT e INBOUND_CONNECT_TIMEOUT_<listener>; o padrao 60s e curto para cliente distante. 3) Veja o listener log no mesmo horario. 4) Aumentar o timeout esconde o sintoma: trate a origem antes.",
+      "mos": ""
+    },
+    "ORA-04021": {
+      "severidade": "warn",
+      "categoria": "concorrencia",
+      "escalar": false,
+      "titulo": "Timeout esperando lock em objeto (library cache)",
+      "causa": "Uma sessao esperou o lock de library cache de um objeto e desistiu. Tipico de DDL/recompilacao concorrendo com execucao do mesmo objeto - deploy no meio do dia e a causa classica.",
+      "acao": "1) Descubra quem segura: gv$session com evento 'library cache lock'/'library cache pin' e o objeto em gv$db_object_cache. 2) Se foi deploy, a fila e consequencia: pare de recompilar em horario de carga. 3) Nao suba o timeout - ele existe para a sessao nao ficar presa para sempre.",
+      "mos": ""
+    },
+    "ORA-04030": {
+      "severidade": "crit",
+      "categoria": "memoria",
+      "escalar": false,
+      "titulo": "Sem memoria de processo (PGA)",
+      "causa": "O processo servidor nao conseguiu alocar memoria do SO: PGA_AGGREGATE_TARGET alto demais para a RAM, limite de SO (ulimit) ou consulta com sort/hash gigante.",
+      "acao": "1) Compare SGA+PGA de TODAS as instancias com a RAM do host (o check host_osstat mostra a memoria livre). 2) Verifique ulimit e HugePages. 3) Ache a consulta que estourou (o trace traz o SQL) e ataque o plano - normalmente e hash join sem indice.",
+      "mos": "MOS 233869.1"
+    },
+    "ORA-04031": {
+      "severidade": "crit",
+      "categoria": "memoria",
+      "escalar": false,
+      "titulo": "Sem memoria contigua no shared pool",
+      "causa": "Shared pool fragmentado ou pequeno. Causa numero um: SQL sem bind variable, que enche a library cache de cursores quase identicos.",
+      "acao": "1) Confirme a origem: SQL literal em v$sql (FORCE_MATCHING_SIGNATURE repetida). 2) Corrija na aplicacao (bind) - e a unica solucao definitiva; CURSOR_SHARING=FORCE e paliativo com efeito colateral em planos. 3) Avalie SGA_TARGET/SHARED_POOL_SIZE e o uso de HugePages. 4) Flush do shared pool derruba TODOS os planos: use so como emergencia declarada.",
+      "mos": "MOS 396940.1"
+    },
+    "ORA-04052": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Erro ao consultar objeto remoto (dblink)",
+      "causa": "A compilacao/execucao referenciou objeto em outro banco por dblink e nao conseguiu resolve-lo: link fora, credencial do link invalida, objeto inexistente no destino ou sem grant.",
+      "acao": "1) Teste o link isolado (SELECT 1 FROM dual@LINK). 2) Confira se o objeto existe e tem grant no DESTINO, nao na origem. 3) O erro real do outro lado vem na linha ORA-02063 logo abaixo - e ele que diz o motivo.",
+      "mos": ""
+    },
+    "ORA-04063": {
+      "severidade": "warn",
+      "categoria": "objetos",
+      "escalar": false,
+      "titulo": "Objeto tem erros de compilacao",
+      "causa": "A aplicacao chamou um objeto INVALID que nao consegue recompilar sozinho - dependencia removida, privilegio revogado ou erro de codigo.",
+      "acao": "Leia o erro real em DBA_ERRORS para o objeto e trate a causa. Recompilar de novo sem corrigir a dependencia nao resolve. Ver o playbook 'objetos_invalidos'.",
+      "mos": ""
+    },
+    "ORA-04068": {
+      "severidade": "info",
+      "categoria": "objetos",
+      "escalar": false,
+      "titulo": "Estado do package foi descartado",
+      "causa": "O package foi recompilado enquanto a sessao mantinha estado dele. E o comportamento ESPERADO apos recompilacao, nao uma falha do banco.",
+      "acao": "A proxima chamada ja funciona. Se a aplicacao nao trata, ela precisa reconectar - por isso recompilacao em massa pede janela. Ver o playbook 'objetos_invalidos'.",
+      "mos": ""
+    },
+    "ORA-06512": {
+      "severidade": "info",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "secundario": true,
+      "titulo": "Pilha PL/SQL: onde o erro foi levantado",
+      "causa": "'at line N' / 'at \"OWNER.OBJETO\", line N'. Nao e um erro: e o FRAME da pilha que localiza quem levantou o erro de cima. Um unico incidente produz varias destas linhas, uma por nivel de chamada.",
+      "acao": "Use como endereco, nao como diagnostico: o que falhou e o codigo da linha ACIMA na pilha. O par tipico e ORA-20000 (o que) + ORA-06512 (onde).",
+      "mos": ""
+    },
+    "ORA-06550": {
+      "severidade": "warn",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "titulo": "Erro de compilacao PL/SQL",
+      "causa": "O bloco PL/SQL nao compilou: sintaxe, identificador inexistente ou tipo incompativel. Nao chegou a executar - portanto nada no banco mudou por causa dele.",
+      "acao": "1) A propria mensagem traz linha e coluna: o defeito e no codigo enviado, nao no banco. 2) Se o bloco vinha de job/ferramenta, o texto foi montado dinamicamente - logue o SQL gerado. 3) Nao ha o que tunar aqui: e defeito de codigo.",
+      "mos": ""
+    },
+    "ORA-07445": {
+      "severidade": "crit",
+      "categoria": "bug",
+      "escalar": true,
+      "titulo": "Excecao de processo no SO (core dump)",
+      "causa": "O processo servidor morreu por sinal do SO (SIGSEGV/SIGBUS). Costuma ser bug, corrupcao de memoria ou biblioteca/patch incompativel.",
+      "acao": "1) Colete o trace e o core do ADR (tfactl diagcollect ou adrci ips). 2) Busque a funcao que aparece no trace no MOS 153788.1. 3) Verifique se houve patch/upgrade recente (o check changes_patches responde isso). 4) Abra SR com o pacote.",
+      "mos": "MOS 153788.1"
+    },
+    "ORA-08103": {
+      "severidade": "crit",
+      "categoria": "integridade",
+      "escalar": true,
+      "titulo": "Objeto nao existe mais / corrupcao logica",
+      "causa": "O segmento mudou embaixo da consulta (DDL concorrente) ou ha corrupcao logica no cabecalho do segmento.",
+      "acao": "1) Descarte DDL concorrente (o check changes_ddl mostra). 2) Se nao houve DDL, valide o objeto: ANALYZE TABLE ... VALIDATE STRUCTURE CASCADE. 3) Persistindo, e caso de SR com o trace.",
+      "mos": "MOS 1546570.1"
+    },
+    "ORA-12012": {
+      "severidade": "warn",
+      "categoria": "jobs",
+      "escalar": false,
+      "titulo": "Erro na execucao automatica de job",
+      "causa": "Um job do scheduler falhou. O erro real esta em ADDITIONAL_INFO.",
+      "acao": "Veja DBA_SCHEDULER_JOB_RUN_DETAILS (o check scheduler_failures ja traz). Job de manutencao parado (stats, purga) vira causa raiz de problema futuro.",
+      "mos": ""
+    },
+    "ORA-12154": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Nao resolveu o identificador de conexao",
+      "causa": "TNS alias inexistente ou TNS_ADMIN apontando para outro tnsnames.",
+      "acao": "Confirme o alias e o TNS_ADMIN efetivo do cliente. Erro de cliente, nao do banco.",
+      "mos": ""
+    },
+    "ORA-12514": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Listener nao conhece o service",
+      "causa": "Service_name errado ou instancia ainda nao registrada no listener.",
+      "acao": "lsnrctl services para ver os services registrados; em RAC/PDB confira o nome exato do service. Apos startup o registro pode levar ate 60s.",
+      "mos": ""
+    },
+    "ORA-12541": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Sem listener",
+      "causa": "Listener parado, porta errada ou firewall.",
+      "acao": "lsnrctl status no servidor; confirme porta e host. Se o listener esta ativo, suspeite de firewall/rota.",
+      "mos": ""
+    },
+    "ORA-12547": {
+      "severidade": "warn",
+      "categoria": "rede",
+      "escalar": false,
+      "titulo": "Perda de conexao",
+      "causa": "Conexao interrompida (frequentemente permissao/binario do Oracle Home ou limite do SO).",
+      "acao": "Verifique permissoes do executavel oracle e limites do SO; em conexao local, ORACLE_HOME/ORACLE_SID.",
+      "mos": ""
+    },
+    "ORA-14552": {
+      "severidade": "warn",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "titulo": "DDL, commit ou rollback dentro de uma consulta",
+      "causa": "Uma funcao chamada de dentro de um SELECT (ou DML) tentou fazer DDL, commit ou rollback - o que a Oracle nao permite nesse contexto. Neste framework o caso conhecido e o `sqlmon_top`, que roda `SELECT DBMS_SQLTUNE.REPORT_SQL_MONITOR(...) FROM dual`: a geracao do relatorio faz trabalho transacional interno e, chamada dentro de uma consulta - ainda mais numa sessao com SET TRANSACTION READ ONLY, que a coleta sempre abre -, pode levantar este erro. Nao aconteceu nos 25 servidores da bateria de 13/09, so no mais carregado deles.",
+      "acao": "1) Se veio da coleta: o check sqlmon foi pulado e o `sqlmon.txt` nao existe - a secao de SQL Monitor sai vazia do relatorio e NAO significa que nao ha SQL custoso. 2) Se veio da aplicacao: o alvo e a funcao chamada no SELECT, nao o banco - mova o DDL/commit para fora da consulta. 3) A forma alternativa de gerar o relatorio e num bloco PL/SQL com variavel de saida, em vez de dentro de um SELECT.",
+      "mos": ""
+    },
+    "ORA-15041": {
+      "severidade": "crit",
+      "categoria": "espaco",
+      "escalar": false,
+      "titulo": "Diskgroup ASM sem espaco",
+      "causa": "Diskgroup cheio - considerando a redundancia, o espaco util e menor que o bruto.",
+      "acao": "Adicione discos ao diskgroup (rebalance) ou libere. Atencao ao USABLE_FILE_MB: com NORMAL redundancy e preciso manter espaco para rebuild de uma falha.",
+      "mos": ""
+    },
+    "ORA-16038": {
+      "severidade": "crit",
+      "categoria": "recuperabilidade",
+      "escalar": false,
+      "titulo": "Nao conseguiu arquivar o redo log",
+      "causa": "Grupo de redo nao arquivado - quase sempre acompanha ORA-00257 (destino cheio ou invalido).",
+      "acao": "Mesma sequencia do ORA-00257: liberar destino, reabilitar (LOG_ARCHIVE_DEST_STATE_n=ENABLE) e forcar ALTER SYSTEM ARCHIVE LOG ALL.",
+      "mos": ""
+    },
+    "ORA-16456": {
+      "severidade": "warn",
+      "categoria": "disponibilidade",
+      "escalar": false,
+      "titulo": "Switchover para standby em andamento ou concluido",
+      "causa": "A sessao tentou operar num banco que esta trocando de papel (switchover/failover do Data Guard). Durante a troca o primario e derrubado e volta como standby, entao as sessoes abertas caem com este erro. E comportamento ESPERADO durante switchover - nao e defeito.",
+      "acao": "1) Confirme se havia switchover planejado no horario (v$database.switchover_status, log do broker). 2) Se nao havia, foi failover automatico: investigue por que o primario caiu. 3) Aplicacao que precisa sobreviver a troca exige TAF/Application Continuity configurado - aparecer aqui e sinal de cliente sem failover.",
+      "mos": ""
+    },
+    "ORA-16957": {
+      "severidade": "warn",
+      "categoria": "performance",
+      "escalar": false,
+      "titulo": "SQL abortado por limite de tempo (Resource Manager)",
+      "causa": "O Resource Manager matou a consulta por exceder o limite do consumer group.",
+      "acao": "Confirme o plano de recursos ativo e o grupo do usuario. Se o limite for legitimo, o caminho e tunar a consulta, nao afrouxar o plano.",
+      "mos": ""
+    },
+    "ORA-19809": {
+      "severidade": "crit",
+      "categoria": "recuperabilidade",
+      "escalar": false,
+      "titulo": "Limite da recovery area excedido",
+      "causa": "A FRA atingiu DB_RECOVERY_FILE_DEST_SIZE. Se nada for reciclavel, o banco para.",
+      "acao": "1) Veja o que ocupa: v$flash_recovery_area_usage. 2) Se ha muito reciclavel, o backup de archivelog nao esta rodando - corrija o job. 3) Amplie DB_RECOVERY_FILE_DEST_SIZE como medida imediata. 4) Confirme a politica de retencao do RMAN.",
+      "mos": ""
+    },
+    "ORA-19815": {
+      "severidade": "warn",
+      "categoria": "recuperabilidade",
+      "escalar": false,
+      "titulo": "Aviso: recovery area quase cheia",
+      "causa": "Aviso preventivo da FRA. E o ultimo alerta antes do ORA-19809/ORA-00257.",
+      "acao": "Trate agora, ainda em manutencao: rode o backup de archivelog e confirme o espaco reciclavel.",
+      "mos": ""
+    },
+    "ORA-20000": {
+      "severidade": "warn",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "titulo": "Erro definido pela aplicacao (faixa 20000-20999)",
+      "causa": "Codigo da faixa que a Oracle RESERVA para RAISE_APPLICATION_ERROR: nunca e levantado pelo kernel. O -20000 em particular e o que o DBMS_STATS usa para reclamar de estatistica (objeto inexistente, sem privilegio, tabela de stats invalida). A mensagem que acompanha e a unica fonte do significado.",
+      "acao": "1) Leia a MENSAGEM, nao o codigo: ele nao tem semantica propria. 2) Se vier de job de coleta de estatisticas, e o DBMS_STATS - cheque objeto e privilegio. 3) A linha ORA-06512 logo abaixo diz o procedimento e a linha exata que levantou.",
+      "mos": ""
+    },
+    "ORA-20999": {
+      "severidade": "warn",
+      "categoria": "aplicacao",
+      "escalar": false,
+      "titulo": "Erro definido pela aplicacao (faixa 20000-20999)",
+      "causa": "Mesma faixa reservada ao RAISE_APPLICATION_ERROR - nao e erro do kernel. O APEX usa este codigo para 'Failed to parse SQL query', o que traz o erro de verdade embutido na mensagem (tipicamente um ORA-06550/ORA-00936 do SQL montado em tempo de execucao).",
+      "acao": "1) Leia a mensagem inteira: o erro real vem dentro dela. 2) Sendo APEX, o alvo e a consulta montada pela regiao/processo, nao o banco. 3) A faixa e da aplicacao: nao ha patch nem parametro de banco a mexer.",
+      "mos": ""
+    },
+    "ORA-27300": {
+      "severidade": "crit",
+      "categoria": "infra",
+      "escalar": false,
+      "titulo": "Erro de chamada de sistema do SO",
+      "causa": "O SO negou uma operacao ao Oracle (memoria, semaforos, limites, disco).",
+      "acao": "Leia a mensagem do SO que acompanha (vem junto): normalmente aponta limite de kernel (semmni/shmmax), memoria ou disco. E acao de sysadmin, com evidencia do banco.",
+      "mos": ""
+    },
+    "ORA-27301": {
+      "severidade": "crit",
+      "categoria": "infra",
+      "escalar": false,
+      "titulo": "Erro de recurso do SO",
+      "causa": "Falta de recurso no SO (memoria/semaforo) reportada ao Oracle.",
+      "acao": "Mesma linha do ORA-27300: parametros de kernel e memoria do host. Compare com a memoria livre coletada em host_osstat.",
+      "mos": ""
+    },
+    "ORA-28001": {
+      "severidade": "crit",
+      "categoria": "seguranca",
+      "escalar": false,
+      "titulo": "Senha expirada",
+      "causa": "A senha da conta venceu pelo profile. E 100% previsivel: a data esta em DBA_USERS.",
+      "acao": "1) Troque a senha em janela combinada com a aplicacao (ela tambem precisa mudar do lado dela). 2) Mova contas de servico para profile com PASSWORD_LIFE_TIME UNLIMITED, registrando a excecao de seguranca. 3) O check accounts_expiring evita a reincidencia.",
+      "mos": ""
+    },
+    "ORA-29285": {
+      "severidade": "warn",
+      "categoria": "jobs",
+      "escalar": false,
+      "titulo": "Erro de escrita em arquivo (UTL_FILE)",
+      "causa": "Um bloco PL/SQL escrevendo por UTL_FILE falhou. Na pratica: diretorio cheio, permissao do usuario do Oracle no caminho do DIRECTORY, ou linha maior que o tamanho declarado no FOPEN.",
+      "acao": "1) Veja o espaco e a permissao do caminho em ALL_DIRECTORIES. 2) Se o job grava relatorio/extracao, a rotina de negocio ficou sem saida - trate como job falhando, nao como erro de banco. 3) Confira o max_linesize do FOPEN contra a linha real.",
+      "mos": ""
+    },
+    "ORA-29740": {
+      "severidade": "crit",
+      "categoria": "rac",
+      "escalar": true,
+      "titulo": "Evicao de instancia (RAC)",
+      "causa": "No expulso do cluster por falha de interconnect, heartbeat de voting disk ou hang.",
+      "acao": "1) Correlacione com os logs do CRS/ocssd no mesmo horario. 2) Verifique a rede de interconnect (perda de pacote, MTU) e a latencia do storage do voting disk. 3) Leve o pacote do TFA ao SR: evicao raramente se resolve so no banco.",
+      "mos": "MOS 219361.1"
+    },
+    "PLS-00201": {
+      "severidade": "warn",
+      "categoria": "seguranca",
+      "escalar": false,
+      "titulo": "Identificador nao declarado",
+      "causa": "O nome nao existe PARA ESTA SESSAO. Quase sempre e privilegio, nao erro de digitacao: pacotes de SYS (UTL_RECOMP, UTL_FILE, DBMS_LOCK) nao tem GRANT publico, e o usuario simplesmente nao os enxerga. Dentro de PL/SQL com direitos do DEFINER, privilegio vindo de ROLE tambem nao vale.",
+      "acao": "1) Confirme quem voce e: SELECT USER, SYS_CONTEXT('USERENV','ISDBA') FROM dual. 2) Para pacote de SYS, conecte como SYSDBA ou peca GRANT EXECUTE DIRETO (nao por role). 3) UTL_RECOMP em particular: prefira @?/rdbms/admin/utlrp.sql como SYSDBA, que e o caminho suportado.",
+      "mos": ""
+    }
+  },
+  "mensagens": [
+    {
+      "padrao": "no more data to read from socket",
+      "codigos": [
+        "ORA-03113"
+      ],
+      "origem": "JDBC (SQL Developer, DBeaver)",
+      "nota": "O processo servidor morreu ou a conexao foi cortada no meio do comando. O JDBC nunca imprime o ORA-03113: mostra so esta frase."
+    },
+    {
+      "padrao": "end-of-file on communication channel",
+      "codigos": [
+        "ORA-03113"
+      ],
+      "origem": "SQL*Plus",
+      "nota": "Texto oficial do ORA-03113."
+    },
+    {
+      "padrao": "closed connection",
+      "codigos": [
+        "ORA-03113"
+      ],
+      "origem": "JDBC",
+      "nota": "Mesma familia do 'no more data': sessao encerrada do outro lado."
+    },
+    {
+      "padrao": "connection reset",
+      "codigos": [
+        "ORA-03113"
+      ],
+      "origem": "JDBC / sistema operacional",
+      "nota": "RST no TCP. Suspeite de firewall ou de morte do processo servidor antes de culpar o banco."
+    },
+    {
+      "padrao": "socket read timed out",
+      "codigos": [
+        "ORA-03136"
+      ],
+      "origem": "JDBC",
+      "nota": "Timeout de leitura no cliente; o par no servidor e o inbound connect timeout."
+    },
+    {
+      "padrao": "dpy-4011",
+      "codigos": [
+        "ORA-03113"
+      ],
+      "origem": "python-oracledb (thin)",
+      "nota": "Equivalente do 'no more data to read from socket' no driver usado pela coleta."
+    },
+    {
+      "padrao": "the network adapter could not establish the connection",
+      "codigos": [
+        "ORA-12541"
+      ],
+      "origem": "JDBC",
+      "nota": "Nao chegou no listener: host/porta errados, listener parado ou firewall."
+    },
+    {
+      "padrao": "listener does not currently know of service",
+      "codigos": [
+        "ORA-12514"
+      ],
+      "origem": "JDBC / SQL*Plus",
+      "nota": "Chegou no listener, mas o servico nao esta registrado."
+    },
+    {
+      "padrao": "must be declared",
+      "codigos": [
+        "PLS-00201"
+      ],
+      "origem": "PL/SQL",
+      "nota": "O casamento e por substring literal, nao regex: o nome do identificador varia e fica fora do padrao."
+    }
+  ]
+}
