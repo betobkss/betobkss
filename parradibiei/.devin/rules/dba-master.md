@@ -123,6 +123,49 @@ um backup COLD derrubara o banco sem religar; o alert log dizia
 DATABASE ... SAVE STATE` falha com ORA-16000 - e e desnecessario, o estado das
 PDBs e herdado do primary via redo.
 
+## Licoes multi-plataforma (consolidacao de 13/10/2026)
+
+Casos do dia: INC071974523 (MongoDB), INC071979528 (Oracle 9i/Solaris),
+INC071976177 (SQL Server). Quatro licoes que valem regra:
+
+**MongoDB: COLLSCAN no log decide o indice antes de qualquer hipotese.** Em
+lentidao Mongo, o `Slow query` no mongod.log ja traz `ns`, `planSummary`,
+`docsExamined` e `queryHash` — `planSummary: COLLSCAN` + `docsExamined >>
+nReturned` = indice faltando, sem precisar de credencial nem de profiler.
+`maxTimeMS` estourando na app e o sintoma tipico. Ops Manager instala os
+binarios fora do PATH (`/var/lib/mongodb-mms-automation/mongodb-*/bin/`) e a
+porta real vem do `automation-mongod.conf`, nunca 27017 assumida. Em replica
+set gerenciado, `createIndex` no primary propaga sozinho — ainda assim pede
+`getIndexes()` antes, `explain("executionStats")` depois, e horario fora de
+pico. Sem senha, a coleta via log continua possivel — nao pare o caso por
+falta de credencial.
+
+**Listener Oracle: o `Alias` do `lsnrctl status` tem de bater com o nome
+declarado no listener.ora.** No INC071979528 a porta 1521 respondia com
+"supports no services" — nao era servico sumido: era o listener **errado**
+(default `LISTENER`, subido por script) segurando a porta do `LISTENER9I`
+declarado com SID_LIST completo. Sequencia: `lsnrctl status` mostra o
+**Alias**; compare com os nomes em `listener.ora` (`grep -i '=.*DESCRIPTION'`
+ou leitura direta); o processo certo aparece em `ps -ef | grep tnslsnr`.
+Resolver = `lsnrctl stop` do errado + `start` do declarado — e ajustar o
+script de boot para nao repetir.
+
+**SQL Server log cheio: leia `msdb.dbo.backupset` ANTES de mitigar.** O erro
+9002 com `LOG_BACKUP` diz que falta truncar — mas o "como alguem truncou" vale
+mais que o truncamento. `BACKUP LOG ... TO 'NUL'` destrava e **destroi a
+cadeia de recuperacao point-in-time** — e mitigacao que vira perda de
+recuperabilidade. Sequencia: `recovery_model_desc` + `log_reuse_wait_desc`,
+TOP backups reais (type L), e so entao: backup de log para destino real (ou
+full se a cadeia ja quebrou), depois `SHRINKFILE`. Causa raiz quase sempre e
+agenda de log backup inexistente — TSM/TDP que so leva full diario.
+`log_reuse_wait=NOTHING` depois do erro = alguem ja truncou; pergunte como.
+
+**Ambiente legado muda a sintaxe, nao o metodo.** Solaris/9i e SQL Server
+2008: `grep` sem `-A/-B/-E` (use `-in` e leitura direta), join sem `USING`
+(use `ON`), sem `oratab`, sem `json` nas funcoes. Escreva o denominador comum
+minimo ou peca a versao antes. O `lsnrctl`/SQL*Plus 9i funcionam igual — so a
+gramatica do shell envelhece.
+
 ## Criticidade define a conduta (preferencia do usuario, 23/09/2026)
 O rigor e proporcional ao ambiente. **Descubra a criticidade ANTES de propor
 qualquer acao** - `AMBIENTES.py <AMBIENTE>` ja mostra na primeira linha, e o
