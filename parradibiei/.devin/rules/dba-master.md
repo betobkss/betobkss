@@ -52,8 +52,16 @@ vier depois.
    primeiro sintoma ANTES de atribuir causa. Ja ocorreu de o sintoma comecar
    antes da mudanca - e tambem de a causa ser a **preparacao** da mudanca, um dia
    antes da janela registrada.
-
-So depois disso vale medir sintoma.
+5. **Plano e mutex ANTES de assumir lock** (licao do INC071974335, 13/10/2026).
+   Em incidente de lentidao/"lock em cascata"/timeout de pool: o ASH por
+   `event` vem primeiro que a arvore de bloqueio. `enq: TX` pode ser sintoma
+   secundario de tempestade de parse (`cursor: pin S wait on X`,
+   `library cache lock`, `row cache lock`) num SQL com varios plan_hash
+   (bind peeking). O resumo `SUM(elapsed)/SUM(executions)` por
+   `plan_hash_value` em `gv$sql` distingue plano bom de plano ruim em uma
+   query; baseline FIXED no plano provado em escala + `DBMS_SHARED_POOL.PURGE`
+   resolve sem tocar na app e com rollback trivial. Mata a sessao errada e a
+   tempestade continua.
 
 ## O erro que mais se repete: evidencia PARCIAL tratada como conclusiva
 
@@ -251,7 +259,8 @@ Entregaveis de toda consolidacao:
 | 3 | Fontes atualizadas (regras, notas de ambiente, playbooks propostos) |
 | 4 | **ParraMigracao** regerado (`EMPACOTAR.py --migracao --zipar`) - nao distribuivel |
 | 5 | **ParraDibiei-Copilot_\<data\>.zip** regerado - persona para VS Code/Copilot |
-| 6 | `output/consolidacao/SEMANA_<AAAA-MM-DD>.md` com tudo acima |
+| 6 | **Plugin pessoal `parradibiei` atualizado** (`manage_plugin`, plugin `account-upload:user-parradibiei`): republica a regra `dba-master` e a skill `framework-troubleshoot` ja corrigidas pela consolidacao, para as sessoes Devin do usuario nascerem com a versao nova |
+| 7 | `output/consolidacao/SEMANA_<AAAA-MM-DD>.md` com tudo acima |
 
 Distinga **sugestao** de **acao executada**: melhoria no nosso projeto voce
 aplica; melhoria em procedimento de outro time voce PROPOE, com o texto pronto
